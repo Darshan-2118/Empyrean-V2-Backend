@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Celery
+celerybeat-schedule/
+
+# Logs
+*.log
+logs/
+
+# Migration
+# (migration version files ARE tracked — alembic history needs them on clone)
+
+# Deployment
+deploy/*.pem
+deploy/*.key
