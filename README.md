@@ -8,14 +8,12 @@ This repo is made for the Backend part of the Empyrean application (IoT Air Qual
 
 - **API Server:** Quart (async Flask) — REST endpoints, JWT auth, WebSocket push
 - **Task Queue:** Celery + Redis — async fuzzy inference, anomaly detection, scheduled aggregation, alerting
-- **Primary Database:** TimescaleDB (PostgreSQL) — time-series storage, hypertable partitioning, continuous aggregates
+- **Primary Database:** PostgreSQL 18 (TimescaleDB planned) — time-series storage, hypertable partitioning
 - **Cache / Broker:** Redis — latest-reading cache, rate limiting, Celery broker
 - **MQTT Broker:** Eclipse Mosquitto (TLS/MQTTS) — device ingestion, config push, alert broadcast
 - **ML Engine:** Scikit-learn + Pandas — AQI forecasting (linear regression), Z-score anomaly detection
 - **Auth:** JWT (RS256) — 15-min access tokens, 7-day refresh tokens
 - **Process Management:** all services run as local processes (or systemd units) on a single host — see Running Locally / Production below
-- **CI/CD:** GitHub Actions
-
 ## Architecture Overview
 
 The backend sits between the MQTT-publishing sensor nodes and the React frontend, and is composed of four cooperating services, all running on a single machine:
@@ -35,7 +33,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | 4 | The valid reading is dispatched to a Celery worker via the Redis queue. |
 | 5 | The worker runs Tsukamoto Fuzzy Inference on (Temperature, Humidity, PM2.5) to produce a 0–100 fuzzy score. |
 | 6 | The worker computes the EPA AQI from PM2.5/PM10 and runs a Z-score anomaly check. |
-| 7 | The enriched record is inserted into the `sensor_readings` hypertable in TimescaleDB. |
+| 7 | The enriched record is inserted into the `sensor_readings` table in PostgreSQL (will become a TimescaleDB hypertable later). |
 | 8 | The `readings:latest:{node_id}` Redis key is updated (TTL 60s), invalidating the stale cache. |
 | 9 | Celery Beat checks AQI thresholds every 60s; on breach, an alert row is written and pushed to connected clients over WebSocket. |
 | 10 | The frontend polls `GET /api/v1/readings/latest` every 5s, hitting the Redis cache for a sub-10ms response. Note: the response is a flat `{ "nodes": [...] }` array with `lat`/`lon` fields, not GeoJSON — the frontend maps this into GeoJSON client-side for Leaflet if needed. |
@@ -53,21 +51,38 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | Cache | Redis | Latest-reading cache, rate limiting, Celery broker |
 | ML Engine | Scikit-learn + Pandas | ARIMA/linear regression forecasting, Z-score anomaly detection, preprocessing |
 
-## Project Structure (suggested)
+## Project Structure
 
 ```
 backend/
-├── api/                # Quart route handlers (auth, readings, nodes, alerts, forecast, export, profile, admin)
-├── fuzzy/
-│   └── tsukamoto.py     # Tsukamoto fuzzy inference engine implementation
-├── tasks/               # Celery worker + beat task definitions
-├── models/               # DB models / schemas
-├── mqtt/                # MQTT consumer & payload validation
-├── ws/                   # WebSocket alert broadcasting
-├── migrations/           # DB migrations
-├── tests/                 # pytest suite
+├── api/                    # Quart route handlers (auth, readings, nodes, alerts, forecast, export, profile, admin)
+├── fuzzy/                  # Tsukamoto fuzzy inference engine
+├── tasks/                  # Celery worker + beat task definitions
+├── models/
+│   ├── __init__.py         # Re-exports all models + base utilities
+│   ├── base.py             # SQLAlchemy engine, session factories, get_db(), error handling, retry logic
+│   ├── user.py             # User model (both admin & regular users)
+│   ├── refresh_token.py    # RefreshToken model (server-side JWT storage, revocation, rotation)
+│   ├── node.py             # Node model (ESP32 sensor devices, location tracking)
+│   ├── reading.py          # SensorReading model (core time-series data, composite PK)
+│   ├── aggregate.py        # HourlyAgg model (pre-computed hourly summaries)
+│   ├── alert.py            # Alert model (threshold-breach notifications)
+│   └── setting.py          # SystemSetting model (configurable system knobs)
+├── mqtt/                   # MQTT consumer & payload validation
+├── ws/                     # WebSocket alert broadcasting
+├── migrations/
+│   ├── env.py              # Alembic environment (wired to models)
+│   └── versions/
+│       └── xxx_initial_schema.py   # Initial schema migration (7 tables + indexes)
+├── tests/                  # pytest suite
+├── config/__init__.py      # App configuration (env-based, Dev/Prod)
+├── app.py                  # Quart application factory
+├── celery_app.py           # Celery application instance
+├── seed.py                 # Dev seed script (admin user, defaults, sample node)
+├── check_health.py         # Health check script (validates entire stack)
 ├── requirements.txt
-└── .env.example
+├── .env                    # Local credentials (gitignored)
+└── .env.example            # Template env vars (safe to commit)
 ```
 
 ## Tsukamoto Fuzzy Inference Engine
@@ -162,22 +177,105 @@ QoS level 1 (at least once) is used for all device publishes.
 
 ## Database Schema
 
-### TimescaleDB — `sensor_readings` (hypertable, 7-day chunks)
-Columns: `time`, `node_id`, `lat`, `lon`, `temperature`, `humidity`, `pressure`, `voc_ohm`, `mq135_ppm`, `pm1`, `pm25`, `pm10`, `fuzzy_score`, `aqi`, `aqi_category`, `is_anomaly`, `battery_v`.
+Seven tables implemented via SQLAlchemy 2.0 + Alembic migrations:
 
-- Hypertable creation: `create_hypertable('sensor_readings', 'time', chunk_time_interval => INTERVAL '7 days')`
-- Compression enabled after 30 days via `add_compression_policy`
-- Retention: raw readings auto-dropped after 1 year; aggregates retained indefinitely
-- `aqi_category` is `VARCHAR(40)` (not `VARCHAR(20)`) to safely fit the longest EPA category name, "Unhealthy for Sensitive Groups" (30 chars). The 6 standard categories are: Good, Moderate, Unhealthy for Sensitive Groups, Unhealthy, Very Unhealthy, Hazardous.
+### `users` — who logs in
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER PK` | Auto-increment identity |
+| `username` | `VARCHAR(50) UNIQUE` | Login name |
+| `email` | `VARCHAR(255) UNIQUE` | Notifications / password resets |
+| `password_hash` | `VARCHAR(255)` | bcrypt hash |
+| `role` | `VARCHAR(20)` | `'admin'` or `'user'` |
+| `notification_prefs` | `JSONB` | Flexible prefs (e.g. email on critical) |
+| `is_active` | `BOOLEAN` | Soft-disable without deleting |
+| `last_login_at` | `TIMESTAMPTZ` | Audit trail |
+| `created_at` | `TIMESTAMPTZ` | Auto-set |
+| `updated_at` | `TIMESTAMPTZ` | Auto-updated |
 
-### `hourly_agg` (Continuous Aggregate)
-Refreshes hourly. Stores `time_bucket('1 hour')`, `node_id`, `avg_temp`, `avg_humidity`, `avg_pm25`, `avg_pm10`, `max_aqi`, `min_aqi`, `avg_aqi`, `reading_count`. Used for large-range history queries.
+### `refresh_tokens` — session management
+Server-side storage enabling logout (set `revoked = True`) and refresh-token rotation.
 
-### `nodes`
-`node_id` (PK), `name`, `location_name`, `firmware_version`, `registered_at`, `last_seen`, `active`.
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER PK` | |
+| `user_id` | `INTEGER FK → users` | ON DELETE CASCADE |
+| `token_hash` | `VARCHAR(255)` | Hashed token (never store raw) |
+| `expires_at` | `TIMESTAMPTZ` | Matches JWT claim |
+| `created_at` | `TIMESTAMPTZ` | |
+| `revoked` | `BOOLEAN` | TRUE on logout/rotation |
 
-### `alerts`
-`alert_id` (PK, UUID), `node_id` (FK), `parameter`, `value`, `threshold`, `severity`, `triggered_at`, `acknowledged_at`, `acknowledged_by`.
+Indexed on `(user_id)` and `(token_hash)`.
+
+### `nodes` — sensor devices
+| Column | Type | Notes |
+|--------|------|-------|
+| `node_id` | `VARCHAR(50) PK` | Device ID (e.g. `ESP32-01`) |
+| `name` | `VARCHAR(100)` | Human-friendly label |
+| `location_name` | `VARCHAR(200)` | Text description |
+| `lat` / `lon` | `DOUBLE PRECISION` | For map display |
+| `firmware_version` | `VARCHAR(50)` | Debugging aid |
+| `reading_interval` | `INTEGER` | Seconds between readings (default 30) |
+| `is_active` | `BOOLEAN` | Soft-retire a node |
+| `registered_at` | `TIMESTAMPTZ` | |
+| `last_seen` | `TIMESTAMPTZ` | Updated by heartbeat |
+
+### `sensor_readings` — the core data
+**Note:** Currently a regular PostgreSQL table. Will be converted to a TimescaleDB hypertable (partitioned by `time`, 7-day chunks) once the extension is installed.
+
+| Column | Type | Range | Notes |
+|--------|------|-------|-------|
+| `time` | `TIMESTAMPTZ` (PK) | — | Partition column |
+| `node_id` | `VARCHAR(50)` (PK, FK → nodes) | — | Which node |
+| `temperature` | `REAL` | 0–50 °C | |
+| `humidity` | `REAL` | 0–100% | |
+| `pressure` | `REAL` | 900–1100 hPa | |
+| `voc_ohm` | `REAL` | — | BME680 raw resistance |
+| `mq135_ppm` | `REAL` | 0–1000+ | MQ135 PPM |
+| `pm1` / `pm25` / `pm10` | `REAL` | Various | Particulate matter |
+| `battery_v` | `REAL` | 0–5 V | Node health |
+| `fuzzy_score` | `REAL` | 0–100 | Tsukamoto fuzzy score |
+| `aqi` | `SMALLINT` | 0–500+ | EPA AQI from PM2.5/PM10 |
+| `aqi_category` | `VARCHAR(40)` | — | "Good", "Moderate", etc. |
+| `is_anomaly` | `BOOLEAN` | — | Z-score anomaly flag |
+
+Performance indexes: `(node_id, time DESC)` and `(time DESC)`.
+
+### `hourly_agg` — pre-computed summaries
+Currently a regular materialized view (will become a TimescaleDB continuous aggregate later).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `bucket` | `TIMESTAMPTZ` (PK) | Hour start |
+| `node_id` | `VARCHAR(50)` (PK, FK → nodes) | |
+| `avg_temperature` / `avg_humidity` / `avg_pm25` / `avg_pm10` | `REAL` | Hourly averages |
+| `max_aqi` / `min_aqi` / `avg_aqi` | `SMALLINT` / `REAL` | AQI stats |
+| `anomaly_count` | `INTEGER` | Anomalies that hour |
+| `reading_count` | `INTEGER` | Total readings |
+
+### `alerts` — threshold-breach notifications
+| Column | Type | Notes |
+|--------|------|-------|
+| `alert_id` | `INTEGER PK` | Auto-increment |
+| `node_id` | `VARCHAR(50) FK → nodes` | ON DELETE CASCADE |
+| `parameter` | `VARCHAR(50)` | e.g. `'pm25'`, `'aqi'` |
+| `value` / `threshold` | `REAL` | Actual vs. limit |
+| `severity` | `VARCHAR(20)` | `'warning'` or `'critical'` |
+| `message` | `TEXT` | Human-readable |
+| `triggered_at` | `TIMESTAMPTZ` | |
+| `acknowledged_at` | `TIMESTAMPTZ` | NULL = unacknowledged |
+| `acknowledged_by` | `INTEGER FK → users` | ON DELETE SET NULL |
+
+### `system_settings` — configurable knobs
+| Column | Type | Notes |
+|--------|------|-------|
+| `key` | `VARCHAR(100) PK` | e.g. `'aqi_warning_threshold'` |
+| `value` | `TEXT` | Stored as text, cast when needed |
+| `description` | `VARCHAR(255)` | Human explanation |
+| `updated_at` | `TIMESTAMPTZ` | |
+| `updated_by` | `INTEGER FK → users` | ON DELETE SET NULL |
+
+Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=150`, `alerts_enabled=true`
 
 ## Redis Key Schema
 
@@ -218,7 +316,7 @@ TTLs are tuned per data volatility, not a single blanket value: live readings ne
 
 | Variable | Example | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://user:pass@localhost:5432/airquality` | TimescaleDB connection string |
+| `DATABASE_URL` | `postgresql://postgres:root@localhost:5432/Empyren` | PostgreSQL connection string (use `.env`, NOT tracked in git) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
 | `MQTT_BROKER_HOST` | `localhost` | MQTT broker hostname |
 | `MQTT_BROKER_PORT` | `8883` | MQTT TLS port |
@@ -240,34 +338,93 @@ All services run as local processes on one host — no containers. Use a process
 | `timescaledb` | native PostgreSQL + TimescaleDB extension | 5432 | Primary database |
 | `redis` | native install / systemd service | 6379 | Cache + Celery broker |
 
-## Running Locally
+## Getting Started
+
+### Prerequisites
+- **Python** 3.12+
+- **PostgreSQL** 17+ (18 recommended)
+- **Redis** (for Celery broker + cache)
+
+### Setup
 
 ```bash
-# copy and fill in environment variables
-cp .env.example .env
+# 1. Clone and enter the repo
+git clone <repo-url>
+cd Empyrean-V2-Backend
 
-# create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate
+# 2. Create and activate virtual environment
+python -m venv venv
+source venv/Scripts/activate    # Windows Git Bash
+# or: venv\Scripts\activate     # Windows cmd
+# or: source venv/bin/activate  # Linux/Mac
 
-# install dependencies
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# make sure Redis, TimescaleDB (PostgreSQL), and Mosquitto are installed and running locally
-# (e.g. `sudo systemctl start redis-server postgresql mosquitto` on Debian/Ubuntu)
+# 4. Configure environment
+#    Copy .env.example → .env and fill in your credentials:
+#    DATABASE_URL=postgresql://postgres:your_password@localhost:5432/Empyren
+cp .env.example .env
+# Edit .env with your actual database credentials
 
-# run DB migrations
-alembic upgrade head   # or your migration tool of choice
+# 5. Create the database (if it doesn't exist)
+psql -U postgres -c "CREATE DATABASE \"Empyren\";"
 
-# start the API server
+# 6. Run migrations
+alembic upgrade head
+
+# 7. Seed initial data (admin user, defaults, sample node)
+python seed.py
+
+# 8. Verify everything is working
+python check_health.py
+
+# 9. Start the API server
 hypercorn app:app --bind 0.0.0.0:8000
 
-# in separate terminals, start the Celery worker and beat scheduler
+# (in separate terminals) Start Celery worker and beat
 celery -A tasks worker --loglevel=info
 celery -A tasks beat --loglevel=info
 ```
 
 The API will be available at `http://localhost:8000/api/v1/`.
+
+### Health Check
+
+Run `python check_health.py` at any time to verify:
+- Python environment and model imports
+- PostgreSQL connection and database version
+- All 7 tables and required indexes exist
+- Alembic migration is applied
+- Seed data is present (admin user, default settings, sample node)
+- Quart app factory loads without errors
+
+### Database Migrations
+
+```bash
+# Create a new migration after model changes
+alembic revision --autogenerate -m "description_of_change"
+
+# Apply pending migrations
+alembic upgrade head
+
+# Roll back one step
+alembic downgrade -1
+```
+
+### Seed Data
+
+The `seed.py` script is idempotent — running it multiple times is safe:
+
+```
+Created admin user: admin / admin123
+Created setting: aqi_warning_threshold = 100
+Created setting: aqi_critical_threshold = 150
+Created setting: alerts_enabled = true
+Created sample node: ESP32-01
+```
+
+Default admin credentials: `admin` / `admin123` (change in production).
 
 ### Production
 
@@ -289,13 +446,6 @@ WantedBy=multi-user.target
 ```
 
 Mirror this pattern for `celery-worker.service` and `celery-beat.service`. Put TLS termination for the REST API (HTTPS) in front via nginx or Caddy on the same host.
-
-## CI/CD (GitHub Actions)
-
-1. On push to `main`: run `pytest` for fuzzy inference, API routes, and DB queries.
-2. On passing tests: build a deployable artifact (e.g. a tarball or wheel) — no container image.
-3. On tagged release: deploy to the production host via SSH (e.g. `rsync` the artifact + `systemctl restart` the services above).
-4. Secrets (`DB_URL`, `JWT_SECRET`, `MQTT_CERT`) are managed via GitHub Secrets.
 
 ## Scalability & Maintainability Notes
 

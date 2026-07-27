@@ -4,11 +4,8 @@ Alembic environment configuration.
 Loads the app config for the database URL and makes ``Base.metadata``
 available for auto-detection of schema changes.
 
-Once models are created in Phase 2, replace the ``target_metadata = None``
-line below with::
-
-    from models import Base
-    target_metadata = Base.metadata
+All model classes are loaded from ``models`` so that Alembic can detect
+any new tables, column changes, or index modifications automatically.
 """
 
 import sys
@@ -24,13 +21,9 @@ from config import get_config  # noqa: E402
 
 cfg = get_config()
 
-# ── IMPORTANT ──────────────────────────────────────────────────────────────
-# Phase 2 (models): replace the next two lines with:
-#
-#     from models import Base
-#     target_metadata = Base.metadata
-# ────────────────────────────────────────────────────────────────────────────
-target_metadata = None
+# ── Model metadata for auto-detection ────────────────────────────────────────
+from models import Base  # noqa: E402
+target_metadata = Base.metadata
 
 # ── Alembic config ─────────────────────────────────────────────────────────
 alembic_config = context.config
