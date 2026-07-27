@@ -16,20 +16,25 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [x] **Create `celery_app.py`** — Celery application instance with Redis broker config
 - [x] **Set up Alembic** — `alembic.ini` + `migrations/` directory for DB schema versioning
 - [x] **Set up logging** — structured logging config for all services
-- [x] **Set up CI/CD** — GitHub Actions workflow (test on push, deploy on tag)
+- [x] ~~**Set up CI/CD** — GitHub Actions workflow (test on push, deploy on tag)~~ _(removed — not needed for this project)_
 
 ---
 
-## Phase 2: Database Models & Migrations
+## Phase 2: Database Configuration, Models & Migrations
 
-- [ ] **Create SQLAlchemy base** — `models/__init__.py` with declarative base and metadata
-- [ ] **User/Auth model** — `models/user.py` (id, username, email, password_hash, role, created_at)
-- [ ] **Nodes model** — `models/node.py` (node_id, name, location_name, firmware_version, registered_at, last_seen, active, lat, lon)
-- [ ] **Sensor Readings model** — `models/reading.py` (time, node_id, lat, lon, temperature, humidity, pressure, voc_ohm, mq135_ppm, pm1, pm25, pm10, fuzzy_score, aqi, aqi_category, is_anomaly, battery_v) — TimescaleDB hypertable
-- [ ] **Hourly Aggregate model** — `models/aggregate.py` (time_bucket, node_id, avg_temp, avg_humidity, avg_pm25, avg_pm10, max_aqi, min_aqi, avg_aqi, reading_count) — continuous aggregate view
-- [ ] **Alerts model** — `models/alert.py` (alert_id UUID, node_id FK, parameter, value, threshold, severity, triggered_at, acknowledged_at, acknowledged_by)
-- [ ] **Create Alembic migrations** — initial schema, hypertable creation, compression policy, retention policy, continuous aggregate, indexes
-- [ ] **Seed script** — `seed.py` for dev/test data (admin user, sample nodes, sample readings)
+- [x] **DB connection & session setup** — `models/base.py` — configure SQLAlchemy engine, session factory, connection pooling (asyncpg for async, psycopg2 for sync/Celery)
+- [x] **Create SQLAlchemy base** — `models/__init__.py` with declarative base and metadata
+- [x] **User model** — `models/user.py` (id, username, email, password_hash, role, notification_prefs, is_active, last_login_at, created_at, updated_at)
+- [x] **Refresh Token model** — `models/refresh_token.py` (id, user_id FK, token_hash, expires_at, created_at, revoked)
+- [x] **Nodes model** — `models/node.py` (node_id PK, name, location_name, lat, lon, firmware_version, reading_interval, is_active, registered_at, last_seen)
+- [x] **Sensor Readings model** — `models/reading.py` (time, node_id FK, temperature, humidity, pressure, voc_ohm, mq135_ppm, pm1, pm25, pm10, battery_v, fuzzy_score, aqi, aqi_category, is_anomaly) — regular table (TimescaleDB hypertable later)
+- [x] **Hourly Aggregate model** — `models/aggregate.py` (bucket, node_id, avg_temperature, avg_humidity, avg_pm25, avg_pm10, max_aqi, min_aqi, avg_aqi, anomaly_count, reading_count) — regular materialized view (continuous aggregate later)
+- [x] **Alerts model** — `models/alert.py` (alert_id PK, node_id FK, parameter, value, threshold, severity, message, triggered_at, acknowledged_at, acknowledged_by FK)
+- [x] **System Settings model** — `models/setting.py` (key PK, value, description, updated_at, updated_by FK)
+- [x] **Create Alembic migrations** — initial schema with all 7 tables, indexes on refresh_tokens and sensor_readings
+- [x] **Seed script** — `seed.py` for dev/test data (admin user, default settings, sample nodes)
+- [x] **Health check script** — `check_health.py` validates entire stack
+- [x] **Code review** — fixed asyncio deprecation, CWD path bugs, model-migration drift
 
 ---
 
@@ -192,8 +197,8 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 | Milestone | Description | Depends On |
 |-----------|-------------|------------|
-| **M1: Foundation** | Project scaffolding, config, DB models, migrations | — |
-| **M2: Auth** | Registration, login, JWT, profile management | M1 |
+| **M1: Foundation** | Project scaffolding, config, DB config, models, migrations ✅ | — |
+| **M2: Auth** | Registration, login, JWT, profile management 🔜 | M1 |
 | **M3: Ingestion** | MQTT consumer, payload validation, reading intake | M1 |
 | **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation | M2, M3 |
 | **M5: API Layer** | Readings, nodes, alerts, forecast, export endpoints | M2, M4 |
