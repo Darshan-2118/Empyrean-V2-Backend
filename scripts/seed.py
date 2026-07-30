@@ -8,17 +8,15 @@ Creates:
 
 Usage::
 
-    python seed.py
+    python scripts/seed.py
 """
 
 import logging
 import sys
 from pathlib import Path
 
-import bcrypt
-
-# Make sure the project root is importable (works regardless of CWD)
-_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+# Make the project root importable (works regardless of CWD)
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _PROJECT_ROOT)
 
 from models import (
@@ -27,6 +25,7 @@ from models import (
     User,
     get_sync_db,
 )
+from models.helpers import hash_password
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,11 +41,10 @@ def seed():
         if existing_admin:
             logger.info("Admin user already exists — skipping.")
         else:
-            pw_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt(rounds=12))
             admin = User(
                 username="admin",
                 email="admin@empyrean.local",
-                password_hash=pw_hash.decode("utf-8"),
+                password_hash=hash_password("admin123"),
                 role="admin",
                 is_active=True,
                 notification_prefs={"email_on_critical": True},

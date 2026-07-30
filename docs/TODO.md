@@ -7,12 +7,12 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 1: Project Scaffolding & Core Infrastructure
 
-- [x] **Initialize project structure** — create all directories: `api/`, `fuzzy/`, `tasks/`, `models/`, `mqtt/`, `ws/`, `migrations/`, `tests/`, `config/`
+- [x] **Initialize project structure** — create all directories: `api/`, `fuzzy/`, `tasks/`, `models/`, `mqtt/`, `api/ws/`, `migrations/`, `tests/`, `config/`
 - [x] **Create `.gitignore`** — Python, venv, `.env`, `__pycache__`, `.DS_Store`, etc.
 - [x] **Create `requirements.txt`** — list all dependencies (Quart, Quart-CORS, SQLAlchemy, asyncpg, psycopg2, alembic, celery[redis], redis, paho-mqtt, PyJWT, bcrypt, scikit-learn, pandas, pydantic, pytest, etc.)
 - [x] **Create `.env.example`** — template for all environment variables (DATABASE_URL, REDIS_URL, MQTT_BROKER_HOST, JWT_SECRET, etc.)
 - [x] **Create `app.py`** — Quart application factory, register blueprints, CORS config, error handlers
-- [x] **Create `config.py`** — load env vars, app configuration classes (Dev/Prod)
+- [x] **Create `config/__init__.py`** — load env vars via pydantic-settings, app configuration classes (Dev/Prod)
 - [x] **Create `celery_app.py`** — Celery application instance with Redis broker config
 - [x] **Set up Alembic** — `alembic.ini` + `migrations/` directory for DB schema versioning
 - [x] **Set up logging** — structured logging config for all services
@@ -32,8 +32,8 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [x] **Alerts model** — `models/alert.py` (alert_id PK, node_id FK, parameter, value, threshold, severity, message, triggered_at, acknowledged_at, acknowledged_by FK)
 - [x] **System Settings model** — `models/setting.py` (key PK, value, description, updated_at, updated_by FK)
 - [x] **Create Alembic migrations** — initial schema with all 7 tables, indexes on refresh_tokens and sensor_readings
-- [x] **Seed script** — `seed.py` for dev/test data (admin user, default settings, sample nodes)
-- [x] **Health check script** — `check_health.py` validates entire stack
+- [x] **Seed script** — `scripts/seed.py` for dev/test data (admin user, default settings, sample nodes)
+- [x] **Health check script** — `scripts/check_health.py` validates entire stack
 - [x] **Code review** — fixed asyncio deprecation, CWD path bugs, model-migration drift
 
 ---
@@ -131,7 +131,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [ ] **Alert creation logic** — triggered by Celery Beat when AQI exceeds thresholds
 
 ### WebSocket
-- [ ] **WebSocket connection manager** — `ws/manager.py` — track connected clients, handle lifecycle
+- [ ] **WebSocket connection manager** — `api/ws/manager.py` — track connected clients, handle lifecycle
 - [ ] **Alert broadcasting** — bridge MQTT `air/alerts` topic to WebSocket clients
 - [ ] **WebSocket auth** — authenticate WebSocket connections via JWT
 

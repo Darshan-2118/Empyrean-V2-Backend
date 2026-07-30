@@ -5,6 +5,7 @@ from quart import Quart, jsonify
 from quart_cors import cors
 
 from config import get_config
+from models.base import dispose_engines
 
 
 def create_app() -> Quart:
@@ -25,63 +26,43 @@ def create_app() -> Quart:
     app.config.from_object(cfg)
     app.secret_key = cfg.SECRET_KEY
 
+    # --- DB lifecycle hooks ---
+    @app.before_serving
+    async def check_db():
+        """Verify the database is reachable before serving requests."""
+        from sqlalchemy import text as sa_text
+        from models.base import async_engine
+
+        async with async_engine.connect() as conn:
+            await conn.execute(sa_text("SELECT 1"))
+        logger.info("Database connection verified.")
+
+    @app.after_serving
+    async def shutdown_db():
+        """Dispose connection pools on app shutdown."""
+        await dispose_engines()
+
     # --- CORS ---
-    _app = cors(app, allow_origin=cfg.CORS_ORIGINS, allow_credentials=True)
+    _app = cors(app, allow_origin=cfg.cors_origins_list, allow_credentials=True)
 
-    # --- Error handlers ---
-    @_app.errorhandler(400)
-    async def bad_request(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Bad Request",
-            "status": 400,
-            "detail": str(e),
-        }), 400, {"Content-Type": "application/problem+json"}
+    # --- Error handlers (RFC 7807 problem+json) ---
+    def _problem_json(status: int, title: str, detail: str | None = None):
+        """Factory: return an RFC 7807 error handler."""
+        async def handler(e):
+            return jsonify({
+                "type": "about:blank",
+                "title": title,
+                "status": status,
+                "detail": detail or str(e),
+            }), status, {"Content-Type": "application/problem+json"}
+        return handler
 
-    @_app.errorhandler(401)
-    async def unauthorized(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Unauthorized",
-            "status": 401,
-            "detail": "Authentication is required",
-        }), 401, {"Content-Type": "application/problem+json"}
-
-    @_app.errorhandler(403)
-    async def forbidden(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Forbidden",
-            "status": 403,
-            "detail": "You do not have permission to access this resource",
-        }), 403, {"Content-Type": "application/problem+json"}
-
-    @_app.errorhandler(404)
-    async def not_found(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Not Found",
-            "status": 404,
-            "detail": "The requested resource was not found",
-        }), 404, {"Content-Type": "application/problem+json"}
-
-    @_app.errorhandler(422)
-    async def unprocessable(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Unprocessable Entity",
-            "status": 422,
-            "detail": str(e),
-        }), 422, {"Content-Type": "application/problem+json"}
-
-    @_app.errorhandler(429)
-    async def too_many_requests(e):
-        return jsonify({
-            "type": "about:blank",
-            "title": "Too Many Requests",
-            "status": 429,
-            "detail": "Rate limit exceeded. Please slow down.",
-        }), 429, {"Content-Type": "application/problem+json"}
+    _app.errorhandler(400)(_problem_json(400, "Bad Request"))
+    _app.errorhandler(401)(_problem_json(401, "Unauthorized", "Authentication is required"))
+    _app.errorhandler(403)(_problem_json(403, "Forbidden", "You do not have permission to access this resource"))
+    _app.errorhandler(404)(_problem_json(404, "Not Found", "The requested resource was not found"))
+    _app.errorhandler(422)(_problem_json(422, "Unprocessable Entity"))
+    _app.errorhandler(429)(_problem_json(429, "Too Many Requests", "Rate limit exceeded. Please slow down."))
 
     @_app.errorhandler(500)
     async def internal_error(e):

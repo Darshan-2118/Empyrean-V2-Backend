@@ -1,62 +1,95 @@
-import os
-from dotenv import load_dotenv
+"""Application configuration via pydantic-settings.
 
-load_dotenv()
+All values are read from ``.env`` automatically, with sensible defaults.
+Type coercion (int, bool, etc.) is handled by pydantic.
+"""
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Config:
-    """Base configuration."""
-    APP_ENV = os.getenv("APP_ENV", "development")
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+class Config(BaseSettings):
+    """Configuration loaded from environment / .env file."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # App
+    APP_ENV: str = "development"
+    SECRET_KEY: str = "dev-secret-key"
+    LOG_LEVEL: str = "INFO"
 
     # Database
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/airquality")
+    DATABASE_URL: str = "postgresql://user:pass@localhost:5432/airquality"
 
     # Redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # MQTT
-    MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "localhost")
-    MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "8883"))
-    MQTT_TLS_CERT = os.getenv("MQTT_TLS_CERT", "")
-    MQTT_TLS_KEY = os.getenv("MQTT_TLS_KEY", "")
-    MQTT_CA_CERTS = os.getenv("MQTT_CA_CERTS", "")
+    MQTT_BROKER_HOST: str = "localhost"
+    MQTT_BROKER_PORT: int = 1883
+    MQTT_USE_TLS: bool = False
+    MQTT_TLS_CERT: str = ""
+    MQTT_TLS_KEY: str = ""
+    MQTT_CA_CERTS: str = ""
 
     # JWT
-    JWT_SECRET = os.getenv("JWT_SECRET", "dev-jwt-secret")
-    JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-    JWT_ACCESS_TOKEN_EXPIRY_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", "15"))
-    JWT_REFRESH_TOKEN_EXPIRY_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRY_DAYS", "7"))
+    JWT_SECRET: str = "dev-jwt-secret"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRY_MINUTES: int = 15
+    JWT_REFRESH_TOKEN_EXPIRY_DAYS: int = 7
 
     # AQI Thresholds
-    AQI_WARNING_THRESHOLD = int(os.getenv("AQI_WARNING_THRESHOLD", "100"))
-    AQI_CRITICAL_THRESHOLD = int(os.getenv("AQI_CRITICAL_THRESHOLD", "150"))
+    AQI_WARNING_THRESHOLD: int = 100
+    AQI_CRITICAL_THRESHOLD: int = 150
 
     # Data Retention
-    DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "365"))
+    DATA_RETENTION_DAYS: int = 365
 
-    # CORS
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    # CORS — comma-separated origins stored as a string, accessed as a list
+    CORS_ORIGINS: str = "http://localhost:3000"
+
+    # ── Derived properties ────────────────────────────────────────────────
+
+    @property
+    def DEBUG(self) -> bool:
+        """Auto-debug in development mode."""
+        return self.APP_ENV == "development"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """CORS origins as a list (split on comma)."""
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    # ── Validators ────────────────────────────────────────────────────────
+
+    @field_validator("LOG_LEVEL")
+    @classmethod
+    def _validate_log_level(cls, v: str) -> str:
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        upper = v.upper()
+        if upper not in allowed:
+            raise ValueError(f"LOG_LEVEL must be one of {allowed}, got {v!r}")
+        return upper
 
 
 class DevelopmentConfig(Config):
-    """Development configuration."""
-    DEBUG = True
+    """Development — debug defaults."""
+    APP_ENV: str = "development"
 
 
 class ProductionConfig(Config):
-    """Production configuration."""
-    DEBUG = False
+    """Production — debug is always off."""
+    APP_ENV: str = "production"
 
 
-config_map = {
+_config_map = {
     "development": DevelopmentConfig,
     "production": ProductionConfig,
 }
 
 
 def get_config() -> Config:
-    env = os.getenv("APP_ENV", "development")
-    cls = config_map.get(env, DevelopmentConfig)
+    """Return the right config class for the current environment."""
+    env = Config().APP_ENV  # fresh load to get the actual env
+    cls = _config_map.get(env, DevelopmentConfig)
     return cls()
