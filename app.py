@@ -79,23 +79,23 @@ def create_app() -> Quart:
     async def health():
         return jsonify({"status": "ok", "environment": cfg.APP_ENV})
 
-    # --- Blueprint registration (to be filled in later phases) ---
-    # from api.auth import auth_bp
+    # --- Blueprint registration (incremental — more added in later phases) ---
+    from api.auth import auth_bp
+    from api.profile import profile_bp
     # from api.readings import readings_bp
     # from api.nodes import nodes_bp
     # from api.alerts import alerts_bp
     # from api.forecast import forecast_bp
     # from api.export import export_bp
-    # from api.profile import profile_bp
     # from api.admin import admin_bp
 
-    # _app.register_blueprint(auth_bp, url_prefix="/api/v1/auth")
+    _app.register_blueprint(auth_bp, url_prefix="/api/v1/auth")
+    _app.register_blueprint(profile_bp, url_prefix="/api/v1/profile")
     # _app.register_blueprint(readings_bp, url_prefix="/api/v1/readings")
     # _app.register_blueprint(nodes_bp, url_prefix="/api/v1/nodes")
     # _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
     # _app.register_blueprint(forecast_bp, url_prefix="/api/v1/forecast")
     # _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
-    # _app.register_blueprint(profile_bp, url_prefix="/api/v1/profile")
     # _app.register_blueprint(admin_bp, url_prefix="/api/v1/admin")
 
     return _app

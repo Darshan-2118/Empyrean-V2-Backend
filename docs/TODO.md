@@ -41,22 +41,22 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 ## Phase 3: Authentication & User Management
 
 ### Auth Endpoints
-- [ ] **POST `/api/v1/auth/register`** — user registration (username, email, password, optional profile fields)
-- [ ] **POST `/api/v1/auth/login`** — authenticate, return JWT access + refresh tokens
-- [ ] **POST `/api/v1/auth/refresh`** — exchange refresh token for new access token
-- [ ] **POST `/api/v1/auth/logout`** — invalidate refresh token
+- [x] **POST `/api/v1/auth/register`** — user registration (auto-login — returns JWT tokens immediately)
+- [x] **POST `/api/v1/auth/login`** — authenticate, return JWT access + refresh tokens
+- [x] **POST `/api/v1/auth/refresh`** — exchange refresh token for new access token (token rotation — revokes old)
+- [x] **POST `/api/v1/auth/logout`** — invalidate refresh token (returns 204, no info leakage)
 
 ### JWT Middleware
-- [ ] **JWT encoding/decoding utility** — RS256 signing, token validation, expiry checks
-- [ ] **Auth decorator** — `@jwt_required` decorator for protected routes
-- [ ] **Admin-only decorator** — `@admin_required` for admin endpoints
-- [ ] **Refresh token rotation** — secure refresh token handling
+- [x] **JWT encoding/decoding utility** — HS256 token creation, validation, expiry checks (`api/jwt.py`)
+- [x] **Auth decorator** — `@jwt_required` decorator for protected routes
+- [x] **Admin-only decorator** — `@admin_required` for admin endpoints
+- [x] **Refresh token rotation** — secure refresh token handling (revoke old → issue new)
 
 ### Profile Endpoints
-- [ ] **GET `/api/v1/profile`** — get own profile
-- [ ] **PATCH `/api/v1/profile`** — update username/email/health condition/notification prefs
-- [ ] **POST `/api/v1/profile/change-password`** — change password (bcrypt)
-- [ ] **DELETE `/api/v1/profile`** — delete own account
+- [x] **GET `/api/v1/profile`** — get own profile
+- [x] **PATCH `/api/v1/profile`** — update username/email/notification prefs
+- [x] **POST `/api/v1/profile/change-password`** — change password (bcrypt verify + rehash)
+- [x] **DELETE `/api/v1/profile`** — delete own account (set is_active=false, revoke all tokens)
 
 ---
 
@@ -198,7 +198,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 | Milestone | Description | Depends On |
 |-----------|-------------|------------|
 | **M1: Foundation** | Project scaffolding, config, DB config, models, migrations ✅ | — |
-| **M2: Auth** | Registration, login, JWT, profile management 🔜 | M1 |
+| **M2: Auth** | Registration, login, JWT, profile management ✅ | M1 |
 | **M3: Ingestion** | MQTT consumer, payload validation, reading intake | M1 |
 | **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation | M2, M3 |
 | **M5: API Layer** | Readings, nodes, alerts, forecast, export endpoints | M2, M4 |
