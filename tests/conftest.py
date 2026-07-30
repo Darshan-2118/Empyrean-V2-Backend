@@ -16,7 +16,9 @@ from models.helpers import hash_password
 
 # ── Test database ─────────────────────────────────────────────────────────────
 cfg = get_config()
-_TEST_DB_URL = cfg.DATABASE_URL.replace("Empyrean", "empyrean_test")
+# Derive test DB URL by replacing the last path segment (the DB name)
+# with "empyrean_test".  Handles any database name.
+_TEST_DB_URL = cfg.DATABASE_URL.rsplit("/", 1)[0] + "/empyrean_test"
 
 _engine = create_engine(_TEST_DB_URL, pool_pre_ping=True)
 _SessionFactory = sessionmaker(bind=_engine)

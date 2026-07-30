@@ -7,7 +7,7 @@ REM   verify           full suite
 REM   verify --quick   skip tests
 REM ─────────────────────────────────────────────────────────────────────────────
 
-python "%~dp0scripts\verify.py" %*
+python "%~dp0verify.py" %*
 if %ERRORLEVEL% neq 0 (
     pause
     exit /b %ERRORLEVEL%
