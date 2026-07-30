@@ -12,7 +12,7 @@ Checks:
 
 Usage::
 
-    python check_health.py
+    python scripts/check_health.py
 
 Exit code 0 = everything OK.
 Exit code 1 = something failed (details printed).
@@ -21,8 +21,8 @@ Exit code 1 = something failed (details printed).
 import sys
 from pathlib import Path
 
-# Make sure the project root is importable
-_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+# Make the project root importable
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 

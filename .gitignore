@@ -41,6 +41,11 @@ logs/
 # Migration
 # (migration version files ARE tracked — alembic history needs them on clone)
 
+# Certificates (actual .crt/.key files, not .gitkeep)
+certs/*.crt
+certs/*.key
+certs/*.pem
+
 # Deployment
 deploy/*.pem
 deploy/*.key

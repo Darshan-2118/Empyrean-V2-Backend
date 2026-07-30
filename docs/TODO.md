@@ -7,12 +7,12 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 1: Project Scaffolding & Core Infrastructure
 
-- [x] **Initialize project structure** — create all directories: `api/`, `fuzzy/`, `tasks/`, `models/`, `mqtt/`, `ws/`, `migrations/`, `tests/`, `config/`
+- [x] **Initialize project structure** — create all directories: `api/`, `fuzzy/`, `tasks/`, `models/`, `mqtt/`, `api/ws/`, `migrations/`, `tests/`, `config/`
 - [x] **Create `.gitignore`** — Python, venv, `.env`, `__pycache__`, `.DS_Store`, etc.
 - [x] **Create `requirements.txt`** — list all dependencies (Quart, Quart-CORS, SQLAlchemy, asyncpg, psycopg2, alembic, celery[redis], redis, paho-mqtt, PyJWT, bcrypt, scikit-learn, pandas, pydantic, pytest, etc.)
 - [x] **Create `.env.example`** — template for all environment variables (DATABASE_URL, REDIS_URL, MQTT_BROKER_HOST, JWT_SECRET, etc.)
 - [x] **Create `app.py`** — Quart application factory, register blueprints, CORS config, error handlers
-- [x] **Create `config.py`** — load env vars, app configuration classes (Dev/Prod)
+- [x] **Create `config/__init__.py`** — load env vars via pydantic-settings, app configuration classes (Dev/Prod)
 - [x] **Create `celery_app.py`** — Celery application instance with Redis broker config
 - [x] **Set up Alembic** — `alembic.ini` + `migrations/` directory for DB schema versioning
 - [x] **Set up logging** — structured logging config for all services
@@ -32,8 +32,8 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [x] **Alerts model** — `models/alert.py` (alert_id PK, node_id FK, parameter, value, threshold, severity, message, triggered_at, acknowledged_at, acknowledged_by FK)
 - [x] **System Settings model** — `models/setting.py` (key PK, value, description, updated_at, updated_by FK)
 - [x] **Create Alembic migrations** — initial schema with all 7 tables, indexes on refresh_tokens and sensor_readings
-- [x] **Seed script** — `seed.py` for dev/test data (admin user, default settings, sample nodes)
-- [x] **Health check script** — `check_health.py` validates entire stack
+- [x] **Seed script** — `scripts/seed.py` for dev/test data (admin user, default settings, sample nodes)
+- [x] **Health check script** — `scripts/check_health.py` validates entire stack
 - [x] **Code review** — fixed asyncio deprecation, CWD path bugs, model-migration drift
 
 ---
@@ -41,22 +41,22 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 ## Phase 3: Authentication & User Management
 
 ### Auth Endpoints
-- [ ] **POST `/api/v1/auth/register`** — user registration (username, email, password, optional profile fields)
-- [ ] **POST `/api/v1/auth/login`** — authenticate, return JWT access + refresh tokens
-- [ ] **POST `/api/v1/auth/refresh`** — exchange refresh token for new access token
-- [ ] **POST `/api/v1/auth/logout`** — invalidate refresh token
+- [x] **POST `/api/v1/auth/register`** — user registration (auto-login — returns JWT tokens immediately)
+- [x] **POST `/api/v1/auth/login`** — authenticate, return JWT access + refresh tokens
+- [x] **POST `/api/v1/auth/refresh`** — exchange refresh token for new access token (token rotation — revokes old)
+- [x] **POST `/api/v1/auth/logout`** — invalidate refresh token (returns 204, no info leakage)
 
 ### JWT Middleware
-- [ ] **JWT encoding/decoding utility** — RS256 signing, token validation, expiry checks
-- [ ] **Auth decorator** — `@jwt_required` decorator for protected routes
-- [ ] **Admin-only decorator** — `@admin_required` for admin endpoints
-- [ ] **Refresh token rotation** — secure refresh token handling
+- [x] **JWT encoding/decoding utility** — HS256 token creation, validation, expiry checks (`api/jwt.py`)
+- [x] **Auth decorator** — `@jwt_required` decorator for protected routes
+- [x] **Admin-only decorator** — `@admin_required` for admin endpoints
+- [x] **Refresh token rotation** — secure refresh token handling (revoke old → issue new)
 
 ### Profile Endpoints
-- [ ] **GET `/api/v1/profile`** — get own profile
-- [ ] **PATCH `/api/v1/profile`** — update username/email/health condition/notification prefs
-- [ ] **POST `/api/v1/profile/change-password`** — change password (bcrypt)
-- [ ] **DELETE `/api/v1/profile`** — delete own account
+- [x] **GET `/api/v1/profile`** — get own profile
+- [x] **PATCH `/api/v1/profile`** — update username/email/notification prefs
+- [x] **POST `/api/v1/profile/change-password`** — change password (bcrypt verify + rehash)
+- [x] **DELETE `/api/v1/profile`** — delete own account (set is_active=false, revoke all tokens)
 
 ---
 
@@ -131,7 +131,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [ ] **Alert creation logic** — triggered by Celery Beat when AQI exceeds thresholds
 
 ### WebSocket
-- [ ] **WebSocket connection manager** — `ws/manager.py` — track connected clients, handle lifecycle
+- [ ] **WebSocket connection manager** — `api/ws/manager.py` — track connected clients, handle lifecycle
 - [ ] **Alert broadcasting** — bridge MQTT `air/alerts` topic to WebSocket clients
 - [ ] **WebSocket auth** — authenticate WebSocket connections via JWT
 
@@ -198,7 +198,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 | Milestone | Description | Depends On |
 |-----------|-------------|------------|
 | **M1: Foundation** | Project scaffolding, config, DB config, models, migrations ✅ | — |
-| **M2: Auth** | Registration, login, JWT, profile management 🔜 | M1 |
+| **M2: Auth** | Registration, login, JWT, profile management ✅ | M1 |
 | **M3: Ingestion** | MQTT consumer, payload validation, reading intake | M1 |
 | **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation | M2, M3 |
 | **M5: API Layer** | Readings, nodes, alerts, forecast, export endpoints | M2, M4 |

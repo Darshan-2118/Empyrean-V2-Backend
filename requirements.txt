@@ -29,6 +29,7 @@ numpy==2.1.3
 # Validation
 pydantic==2.9.2
 pydantic-settings==2.6.1
+email-validator==2.2.0  # required by pydantic EmailStr
 
 # Testing
 pytest==8.2.0

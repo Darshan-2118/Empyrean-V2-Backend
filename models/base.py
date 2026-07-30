@@ -101,6 +101,26 @@ SyncSessionLocal = sessionmaker(
 # ── Retry decorator ───────────────────────────────────────────────────────────
 
 
+def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float) -> float:
+    """Exponential back-off with jitter."""
+    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+    return delay + delay * 0.1 * (time.time() % 1)
+
+
+def _check_db_error(exc, attempt: int, max_retries: int):
+    """Raise a typed exception or return True (retry) / False (fatal)."""
+    if isinstance(exc, OperationalError):
+        if attempt >= max_retries:
+            logger.error("DB transient error – exhausted retries.")
+            raise DatabaseError(str(exc)) from exc
+        return True  # retry
+    if isinstance(exc, IntegrityError):
+        raise DuplicateError(str(exc)) from exc
+    if isinstance(exc, SAError):
+        raise DatabaseError(str(exc)) from exc
+    return False  # not a DB error, let the caller handle it
+
+
 def retry_on_db_failure(
     max_retries: int = 3,
     base_delay: float = 0.5,
@@ -118,24 +138,15 @@ def retry_on_db_failure(
             for attempt in range(1, max_retries + 1):
                 try:
                     return await func(*args, **kwargs)
-                except OperationalError as exc:
+                except (OperationalError, IntegrityError, SAError) as exc:
                     last_exc = exc
-                    if attempt < max_retries:
-                        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                        jitter = delay * 0.1 * (time.time() % 1)
+                    if _check_db_error(exc, attempt, max_retries):
+                        delay = _compute_retry_delay(attempt, base_delay, max_delay)
                         logger.warning(
                             "DB transient error (attempt %d/%d): %s.  Retrying in %.2fs…",
-                            attempt, max_retries, exc, delay + jitter,
+                            attempt, max_retries, exc, delay,
                         )
-                        await asyncio.sleep(delay + jitter)
-                    else:
-                        logger.error("DB transient error – exhausted retries.")
-                        raise DatabaseError(str(exc)) from exc
-                except IntegrityError as exc:
-                    raise DuplicateError(str(exc)) from exc
-                except SAError as exc:
-                    raise DatabaseError(str(exc)) from exc
-            # Should not reach here, but belt-and-suspenders
+                        await asyncio.sleep(delay)
             raise DatabaseError(str(last_exc)) if last_exc else DatabaseError("Unknown error")
 
         @wraps(func)
@@ -144,31 +155,37 @@ def retry_on_db_failure(
             for attempt in range(1, max_retries + 1):
                 try:
                     return func(*args, **kwargs)
-                except OperationalError as exc:
+                except (OperationalError, IntegrityError, SAError) as exc:
                     last_exc = exc
-                    if attempt < max_retries:
-                        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                        jitter = delay * 0.1 * (time.time() % 1)
+                    if _check_db_error(exc, attempt, max_retries):
+                        delay = _compute_retry_delay(attempt, base_delay, max_delay)
                         logger.warning(
                             "DB transient error (attempt %d/%d): %s.  Retrying in %.2fs…",
-                            attempt, max_retries, exc, delay + jitter,
+                            attempt, max_retries, exc, delay,
                         )
-                        time.sleep(delay + jitter)  # noqa: ASYNC100 — sync wrapper is deliberate
-                    else:
-                        logger.error("DB transient error – exhausted retries.")
-                        raise DatabaseError(str(exc)) from exc
-                except IntegrityError as exc:
-                    raise DuplicateError(str(exc)) from exc
-                except SAError as exc:
-                    raise DatabaseError(str(exc)) from exc
+                        time.sleep(delay)  # noqa: ASYNC100
             raise DatabaseError(str(last_exc)) if last_exc else DatabaseError("Unknown error")
 
-        # Return the right wrapper based on whether the original was a coroutine
         if asyncio.iscoroutinefunction(func):
             return async_wrapper
         return sync_wrapper
 
     return decorator
+
+
+# ── Engine lifecycle ────────────────────────────────────────────────────────────
+
+
+async def dispose_engines() -> None:
+    """Dispose both engines, releasing all pooled connections.
+
+    Call this on application shutdown (e.g. in a ``after_serving`` hook)
+    to avoid leaking connections.
+    """
+    logger.info("Disposing database engines …")
+    sync_engine.dispose()
+    await async_engine.dispose()
+    logger.info("Database engines disposed.")
 
 
 # ── Session helpers ───────────────────────────────────────────────────────────

@@ -121,9 +121,10 @@ This is the **big one**. Every 30 seconds, every node sends a reading. With 10 n
 ### Setup
 
 ```sql
--- Make it a hypertable partitioned by time (7-day chunks)
+-- Make it a hypertable partitioned by time
 SELECT create_hypertable('sensor_readings', 'time',
-    chunk_time_interval => INTERVAL '7 days');
+    if_not_exists => TRUE,
+    migrate_data => TRUE);
 
 -- Speed up "all readings for node X in date range Y"
 CREATE INDEX idx_readings_node_time
@@ -132,18 +133,9 @@ CREATE INDEX idx_readings_node_time
 -- Also index time alone for global date-range queries
 CREATE INDEX idx_readings_time
     ON sensor_readings (time DESC);
-
--- Compress old chunks after 30 days (saves ~90% disk space)
-ALTER TABLE sensor_readings SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'node_id',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('sensor_readings', INTERVAL '30 days');
-
--- Auto-delete readings older than 1 year
-SELECT add_retention_policy('sensor_readings', INTERVAL '365 days');
 ```
+
+> **Note:** The migration uses `create_hypertable` with `if_not_exists => TRUE` (idempotent). Chunk interval, compression, and retention policies are not yet configured — they'll be added once the system is handling production data volumes.
 
 > **Change from v1:** Added compression config (segmentby node_id for per-node decompression efficiency) and a `time DESC` index for global range queries.
 
@@ -151,9 +143,11 @@ SELECT add_retention_policy('sensor_readings', INTERVAL '365 days');
 
 ---
 
-## Table 5: `hourly_agg` — pre-computed summaries (Continuous Aggregate)
+## Table 5: `hourly_agg` — pre-computed summaries (Continuous Aggregate — planned)
 
-When the frontend asks "show average AQI for the last 30 days," scanning millions of raw rows would be slow. This continuous aggregate auto-refreshes every hour.
+When the frontend asks "show average AQI for the last 30 days," scanning millions of raw rows would be slow. The final design uses a TimescaleDB continuous aggregate that auto-refreshes every hour.
+
+> **Current status:** `hourly_agg` is a regular PostgreSQL table (not yet a continuous aggregate). It will be converted once the Celery aggregation logic (Phase 7) is implemented.
 
 | Column | Type | Why? |
 |--------|------|------|
@@ -170,6 +164,8 @@ When the frontend asks "show average AQI for the last 30 days," scanning million
 | `reading_count` | `INTEGER` | Total readings in that hour |
 
 > **Change from v1:** Added `anomaly_count` — useful for the dashboard to show "X anomalies detected in the last 24 hours" without scanning raw data.
+
+> **Note:** The SQL below shows the *target* design. Currently `hourly_agg` is a regular table created via SQLAlchemy — the continuous aggregate conversion will happen in a future migration.
 
 ```sql
 CREATE MATERIALIZED VIEW hourly_agg
@@ -271,13 +267,18 @@ FK behavior:
 
 ## Migration strategy
 
-One Alembic migration that:
-1. Creates regular tables: `users`, `refresh_tokens`, `nodes`, `alerts`, `system_settings`
-2. Creates `sensor_readings` table + converts to hypertable
-3. Creates indexes on `sensor_readings` and `refresh_tokens`
-4. Creates `hourly_agg` continuous aggregate
-5. Sets up compression and retention policies
-6. Seeds default data (admin user, default settings)
+Two Alembic migrations:
+
+**`eb88597519c9` — initial schema:**
+1. Creates all 7 regular tables: `users`, `refresh_tokens`, `nodes`, `sensor_readings`, `hourly_agg`, `alerts`, `system_settings`
+2. Creates indexes on `sensor_readings` and `refresh_tokens`
+3. Foreign keys with cascade / set-null behaviour
+
+**`b2bab23ab3c0` — TimescaleDB hypertable:**
+1. Installs the TimescaleDB extension (`CREATE EXTENSION IF NOT EXISTS timescaledb`)
+2. Converts `sensor_readings` to a hypertable partitioned on `time`
+
+> **Note:** `hourly_agg` is currently a regular table. It will become a TimescaleDB continuous aggregate once the Celery aggregation logic is implemented. Compression and retention policies on the hypertable are also planned for later.
 
 ---
 

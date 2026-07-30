@@ -8,11 +8,11 @@ This repo is made for the Backend part of the Empyrean application (IoT Air Qual
 
 - **API Server:** Quart (async Flask) — REST endpoints, JWT auth, WebSocket push
 - **Task Queue:** Celery + Redis — async fuzzy inference, anomaly detection, scheduled aggregation, alerting
-- **Primary Database:** PostgreSQL 18 (TimescaleDB planned) — time-series storage, hypertable partitioning
+- **Primary Database:** PostgreSQL 18 + TimescaleDB — time-series storage, hypertable partitioning
 - **Cache / Broker:** Redis — latest-reading cache, rate limiting, Celery broker
 - **MQTT Broker:** Eclipse Mosquitto (TLS/MQTTS) — device ingestion, config push, alert broadcast
 - **ML Engine:** Scikit-learn + Pandas — AQI forecasting (linear regression), Z-score anomaly detection
-- **Auth:** JWT (RS256) — 15-min access tokens, 7-day refresh tokens
+- **Auth:** JWT (HS256) — 15-min access tokens, 7-day refresh tokens
 - **Process Management:** all services run as local processes (or systemd units) on a single host — see Running Locally / Production below
 ## Architecture Overview
 
@@ -56,31 +56,43 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 ```
 backend/
 ├── api/                    # Quart route handlers (auth, readings, nodes, alerts, forecast, export, profile, admin)
+│   └── ws/                 # WebSocket alert broadcasting
+├── config/
+│   └── __init__.py         # App configuration (pydantic-settings, Dev/Prod)
+├── docs/                   # Project documentation
+│   ├── schema-plan.md      # Database schema blueprint
+│   └── TODO.md             # Implementation checklist
 ├── fuzzy/                  # Tsukamoto fuzzy inference engine
-├── tasks/                  # Celery worker + beat task definitions
-├── models/
-│   ├── __init__.py         # Re-exports all models + base utilities
-│   ├── base.py             # SQLAlchemy engine, session factories, get_db(), error handling, retry logic
-│   ├── user.py             # User model (both admin & regular users)
-│   ├── refresh_token.py    # RefreshToken model (server-side JWT storage, revocation, rotation)
-│   ├── node.py             # Node model (ESP32 sensor devices, location tracking)
-│   ├── reading.py          # SensorReading model (core time-series data, composite PK)
-│   ├── aggregate.py        # HourlyAgg model (pre-computed hourly summaries)
-│   ├── alert.py            # Alert model (threshold-breach notifications)
-│   └── setting.py          # SystemSetting model (configurable system knobs)
-├── mqtt/                   # MQTT consumer & payload validation
-├── ws/                     # WebSocket alert broadcasting
 ├── migrations/
 │   ├── env.py              # Alembic environment (wired to models)
-│   └── versions/
-│       └── xxx_initial_schema.py   # Initial schema migration (7 tables + indexes)
+│   └── versions/           # Migration files
+├── models/
+│   ├── __init__.py         # Re-exports all models + base utilities
+│   ├── base.py             # SQLAlchemy engine, session factories, retry logic
+│   ├── helpers.py          # Shared utilities (password hashing)
+│   ├── user.py             # User model
+│   ├── refresh_token.py    # RefreshToken model
+│   ├── node.py             # Node model (ESP32 sensor devices)
+│   ├── reading.py          # SensorReading model (TimescaleDB hypertable)
+│   ├── aggregate.py        # HourlyAgg model
+│   ├── alert.py            # Alert model
+│   └── setting.py          # SystemSetting model
+├── mqtt/                   # MQTT consumer & payload validation
+├── scripts/                # Dev tools & utilities
+│   ├── verify.py           # Full-stack verification (Python)
+│   ├── check.bat           # Verify wrapper for cmd/PowerShell
+│   ├── check_health.py     # Environment health check
+│   ├── seed.py             # Dev seed script
+│   └── db.sh               # Database helper (bash/Git Bash)
+├── tasks/                  # Celery worker + beat task definitions
 ├── tests/                  # pytest suite
-├── config/__init__.py      # App configuration (env-based, Dev/Prod)
+│   ├── conftest.py         # Fixtures & test DB setup
+│   └── test_smoke.py       # Smoke tests
+├── certs/                  # MQTT TLS certificates (gitignored)
 ├── app.py                  # Quart application factory
 ├── celery_app.py           # Celery application instance
-├── seed.py                 # Dev seed script (admin user, defaults, sample node)
-├── check_health.py         # Health check script (validates entire stack)
 ├── requirements.txt
+├── alembic.ini             # Alembic configuration
 ├── .env                    # Local credentials (gitignored)
 └── .env.example            # Template env vars (safe to commit)
 ```
@@ -112,7 +124,7 @@ The AQI fuzzy engine consumes three input variables and outputs a crisp 0–100 
 
 ## REST API
 
-All endpoints are prefixed with `/api/v1/`. Auth uses JWT RS256 Bearer tokens (except login/refresh). Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+All endpoints are prefixed with `/api/v1/`. Auth uses JWT HS256 Bearer tokens (except login/refresh). Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
 ### Authentication
 | Endpoint | Method | Auth | Description |
@@ -152,7 +164,7 @@ All endpoints are prefixed with `/api/v1/`. Auth uses JWT RS256 Bearer tokens (e
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/profile` | GET | Yes | Get own profile |
-| `/profile` | PATCH | Yes | Update username/email/health condition/notification prefs |
+| `/profile` | PATCH | Yes | Update username/email/notification prefs |
 | `/profile/change-password` | POST | Yes | Change password |
 | `/profile` | DELETE | Yes | Delete own account |
 
@@ -291,8 +303,8 @@ TTLs are tuned per data volatility, not a single blanket value: live readings ne
 
 ## Security
 
-- JWT RS256, 15-min access / 7-day refresh token expiry
-- MQTT over TLS (MQTTS, port 8883) — no plaintext MQTT
+- JWT HS256, 15-min access / 7-day refresh token expiry
+- MQTT over TLS (MQTTS) in production; plaintext (port 1883) supported for local dev
 - REST API over HTTPS only; HTTP redirects to HTTPS
 - Passwords hashed with bcrypt (cost factor ≥ 12)
 - API rate-limited to 200 requests/minute per IP via Redis (`X-RateLimit-*` headers, `429` + `Retry-After` on breach)
@@ -316,12 +328,13 @@ TTLs are tuned per data volatility, not a single blanket value: live readings ne
 
 | Variable | Example | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://postgres:root@localhost:5432/Empyren` | PostgreSQL connection string (use `.env`, NOT tracked in git) |
+| `DATABASE_URL` | `postgresql://postgres:root@localhost:5432/Empyrean` | PostgreSQL connection string (use `.env`, NOT tracked in git) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
 | `MQTT_BROKER_HOST` | `localhost` | MQTT broker hostname |
-| `MQTT_BROKER_PORT` | `8883` | MQTT TLS port |
+| `MQTT_BROKER_PORT` | `1883` | MQTT broker port (non-TLS in dev) |
+| `MQTT_USE_TLS` | `false` | Enable TLS for MQTT (requires certs) |
 | `JWT_SECRET` | `<256-bit random>` | JWT signing secret |
-| `JWT_ALGORITHM` | `RS256` | JWT algorithm |
+| `JWT_ALGORITHM` | `HS256` | JWT algorithm |
 | `AQI_WARNING_THRESHOLD` | `100` | AQI value that triggers a warning alert |
 | `AQI_CRITICAL_THRESHOLD` | `150` | AQI value that triggers a critical alert |
 
@@ -334,7 +347,7 @@ All services run as local processes on one host — no containers. Use a process
 | `quart-api` | `hypercorn app:app` (or `quart run`) | 8000 | Quart async API server |
 | `celery-worker` | `celery -A tasks worker` | — | Fuzzy inference + ML tasks |
 | `celery-beat` | `celery -A tasks beat` | — | Scheduled aggregation + alert checks |
-| `mosquitto` | native install / systemd service | 8883 (MQTTS) | MQTT broker with TLS |
+| `mosquitto` | native install / systemd service | 8883 (TLS) / 1883 (dev) | MQTT broker (TLS in prod, plaintext in dev) |
 | `timescaledb` | native PostgreSQL + TimescaleDB extension | 5432 | Primary database |
 | `redis` | native install / systemd service | 6379 | Cache + Celery broker |
 
@@ -363,21 +376,21 @@ pip install -r requirements.txt
 
 # 4. Configure environment
 #    Copy .env.example → .env and fill in your credentials:
-#    DATABASE_URL=postgresql://postgres:your_password@localhost:5432/Empyren
+#    DATABASE_URL=postgresql://postgres:your_password@localhost:5432/Empyrean
 cp .env.example .env
 # Edit .env with your actual database credentials
 
 # 5. Create the database (if it doesn't exist)
-psql -U postgres -c "CREATE DATABASE \"Empyren\";"
+psql -U postgres -c "CREATE DATABASE \"Empyrean\";"
 
 # 6. Run migrations
 alembic upgrade head
 
 # 7. Seed initial data (admin user, defaults, sample node)
-python seed.py
+python scripts/seed.py
 
 # 8. Verify everything is working
-python check_health.py
+python scripts/check_health.py
 
 # 9. Start the API server
 hypercorn app:app --bind 0.0.0.0:8000
@@ -391,13 +404,25 @@ The API will be available at `http://localhost:8000/api/v1/`.
 
 ### Health Check
 
-Run `python check_health.py` at any time to verify:
+Run `python scripts/check_health.py` at any time to verify:
 - Python environment and model imports
 - PostgreSQL connection and database version
 - All 7 tables and required indexes exist
 - Alembic migration is applied
 - Seed data is present (admin user, default settings, sample node)
 - Quart app factory loads without errors
+
+### Full Verification
+
+Run a single command (any shell) to check everything at once before committing:
+
+```bash
+scripts\check                # cmd.exe / PowerShell
+python scripts/verify.py     # Git Bash / Linux / macOS
+python scripts/verify.py --quick  # skip tests, env only
+```
+
+Checks PostgreSQL, Alembic migrations, health check, and pytest all in one go.
 
 ### Database Migrations
 
@@ -460,17 +485,7 @@ The frontend (`Empyrean-V2-Frontend` — React + Leaflet + Recharts) lives in a 
 
 ### 1. CORS
 
-The frontend dev server and this API run on different origins/ports, so the backend must explicitly allow the frontend's origin. In the Quart app:
-
-```python
-from quart_cors import cors
-
-app = cors(
-    app,
-    allow_origin=["http://localhost:3000", "https://<your-frontend-domain>"],
-    allow_credentials=True,
-)
-```
+The frontend dev server and this API run on different origins/ports, so the backend must explicitly allow the frontend's origin. Origins are configured via the `CORS_ORIGINS` env var (comma-separated).
 
 Add every environment the frontend is served from (local dev port, staging, production domain).
 
