@@ -5,6 +5,8 @@ The ``node_id`` (e.g. ``"ESP32-01"``) comes from the device itself and
 serves as the primary key, avoiding extra joins when processing readings.
 """
 
+from datetime import datetime
+
 from sqlalchemy import Boolean, Double, Integer, String, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -39,23 +41,29 @@ class Node(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
     )
-    registered_at = mapped_column(
+    registered_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
     )
-    last_seen = mapped_column(
+    last_seen: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,
     )
 
     # ── Relationships ─────────────────────────────────────────────────────
+    # passive_deletes=True: the DB already declares ON DELETE CASCADE on the
+    # FKs, so let Postgres delete child rows instead of the ORM loading every
+    # reading into memory (an OOM hazard on a hypertable).
     sensor_readings = relationship(
-        "SensorReading", back_populates="node", cascade="all, delete-orphan",
+        "SensorReading", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
     hourly_aggregates = relationship(
-        "HourlyAgg", back_populates="node", cascade="all, delete-orphan",
+        "HourlyAgg", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
     alerts = relationship(
-        "Alert", back_populates="node", cascade="all, delete-orphan",
+        "Alert", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
 
     def __repr__(self) -> str:

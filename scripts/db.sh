@@ -18,22 +18,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── Load DATABASE_URL from .env ──────────────────────────────────────────────
-export "$(grep -E '^DATABASE_URL=' .env | head -1)"
-
-if [[ -z "${DATABASE_URL:-}" ]]; then
+DB_URL_LINE="$(grep -E '^DATABASE_URL=' .env 2>/dev/null | head -1 || true)"
+if [[ -z "${DB_URL_LINE:-}" ]]; then
   echo "ERROR: DATABASE_URL not found in .env" >&2
   exit 1
 fi
+export "$DB_URL_LINE"
 
-# Parse the URL into parts
-#   postgresql://user:pass@host:port/dbname
-_USER="${DATABASE_URL#*//}";  _USER="${_USER%%:*}"
-_PASS="${DATABASE_URL#*:}";   _PASS="${_PASS#*:}";  _PASS="${_PASS%%@*}"
-_HOST="${DATABASE_URL#*@}";   _HOST="${_HOST%%:*}";  [[ "$_HOST" == "$DATABASE_URL" ]] && _HOST="localhost"
-_PORT="${DATABASE_URL##*:}";  _PORT="${_PORT%%/*}"
-_DB="${DATABASE_URL##*/}";    _DB="${_DB%%\?*}"
-
-_PSQL=(psql -U "$_USER" -h "$_HOST" -p "$_PORT" -d "$_DB")
+# psql accepts a full connection URI, so no manual URL parsing is needed
+# (this also handles the password correctly without exposing it on the CLI).
+_PSQL=(psql "$DATABASE_URL")
 
 case "${1:-help}" in
   connect)

@@ -28,7 +28,6 @@ if _PROJECT_ROOT not in sys.path:
 
 PASS = "[OK]"
 FAIL = "[FAIL]"
-SKIP = "[SKIP]"
 SEP = "-" * 60
 
 
@@ -53,11 +52,11 @@ def main() -> bool:
     py_ok = sys.version_info >= (3, 12)
     all_ok &= check("Python >= 3.12", py_ok, sys.version.split()[0])
 
-    # Model imports
+    # Model imports (broad except: a config error here is still a FAIL, not a crash)
     try:
         from models import Base, User, Node, SensorReading, Alert, SystemSetting  # noqa: F401
         all_ok &= check("Model imports", True, "all 7 models loaded")
-    except ImportError as e:
+    except Exception as e:
         all_ok &= check("Model imports", False, str(e))
 
     # -- 2. Database connection -----------------------------------------------
@@ -65,20 +64,15 @@ def main() -> bool:
     print(SEP)
 
     try:
-        from sqlalchemy import create_engine, inspect, text as sa_text
-        from config import get_config
+        from sqlalchemy import inspect, text as sa_text
+        from scripts.db_utils import make_engine
 
-        cfg = get_config()
-        engine = create_engine(
-            cfg.DATABASE_URL,
-            pool_pre_ping=True,
-            connect_args={"connect_timeout": 5},
-        )
+        engine = make_engine()
 
         # Quick connection test
         with engine.connect() as conn:
             conn.execute(sa_text("SELECT 1"))
-        all_ok &= check("PostgreSQL connection", True, cfg.DATABASE_URL.rsplit("@", 1)[-1])
+        all_ok &= check("PostgreSQL connection", True, str(engine.url).rsplit("@", 1)[-1])
 
         # Database version
         with engine.connect() as conn:
@@ -120,12 +114,41 @@ def main() -> bool:
                 all_ok &= check("Sensor reading indexes", True, "idx_readings_node_time, idx_readings_time")
 
         # -- 5. Alembic migration ---------------------------------------------
-        with engine.connect() as conn:
-            result = conn.execute(sa_text("SELECT version_num FROM alembic_version")).scalar()
-        if result:
-            all_ok &= check("Alembic migration applied", True, f"revision {result}")
-        else:
-            all_ok &= check("Alembic migration applied", False, "no revision found")
+        try:
+            from alembic.config import Config as AlembicConfig
+            from alembic.script import ScriptDirectory
+
+            alembic_cfg = AlembicConfig(
+                str(Path(__file__).resolve().parents[1] / "alembic.ini")
+            )
+            head = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+
+            with engine.connect() as conn:
+                has_alembic = conn.execute(
+                    sa_text("SELECT to_regclass('alembic_version') IS NOT NULL")
+                ).scalar()
+            if not has_alembic:
+                all_ok &= check(
+                    "Alembic migration applied", False,
+                    "no alembic_version table (run `alembic upgrade head`)",
+                )
+            else:
+                with engine.connect() as conn:
+                    db_rev = conn.execute(
+                        sa_text("SELECT version_num FROM alembic_version")
+                    ).scalar()
+                if db_rev == head:
+                    all_ok &= check(
+                        "Alembic migration applied", True,
+                        f"revision {db_rev} (up to date)",
+                    )
+                else:
+                    all_ok &= check(
+                        "Alembic migration applied", False,
+                        f"database at {db_rev}, expected {head}",
+                    )
+        except Exception as e:
+            all_ok &= check("Alembic migration applied", False, str(e))
 
         # -- 6. Seed data -----------------------------------------------------
         print(f"\n[3/7] Seed Data")

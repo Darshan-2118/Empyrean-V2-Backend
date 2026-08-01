@@ -5,20 +5,18 @@ Provides:
 - ``Base`` — declarative base with a standard naming convention
 - ``AsyncEngine`` / ``SyncEngine`` — pre-configured engines (read from app config)
 - ``AsyncSessionLocal`` / ``SyncSessionLocal`` — session factories
+- ``async_db_session()`` — async context manager that commits/rolls back sessions
 - ``get_db()`` — async generator for FastAPI/Quart dependency injection
 - ``get_sync_db()`` — sync context manager for Celery tasks
-- Retry logic for transient database failures
+- Custom exceptions: ``DatabaseError``, ``NotFoundError``, ``DuplicateError``
 """
 
-import asyncio
 import logging
-import time
 from contextlib import asynccontextmanager, contextmanager
-from functools import wraps
 from typing import AsyncGenerator, Generator
 
 from sqlalchemy import MetaData, create_engine
-from sqlalchemy.exc import DatabaseError as SAError, IntegrityError, OperationalError
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -63,8 +61,9 @@ class DuplicateError(DatabaseError):
 _cfg = get_config()
 _sync_db_url = _cfg.DATABASE_URL
 
-# Build an async-compatible URL (replace postgresql:// → postgresql+asyncpg://)
-_async_db_url = _sync_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+# Build an async-compatible URL by swapping the driver, so any
+# postgresql:// (or postgresql+<driver>://) form becomes asyncpg.
+_async_db_url = make_url(_sync_db_url).set(drivername="postgresql+asyncpg")
 
 sync_engine = create_engine(
     _sync_db_url,
@@ -98,81 +97,6 @@ SyncSessionLocal = sessionmaker(
 )
 
 
-# ── Retry decorator ───────────────────────────────────────────────────────────
-
-
-def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float) -> float:
-    """Exponential back-off with jitter."""
-    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-    return delay + delay * 0.1 * (time.time() % 1)
-
-
-def _check_db_error(exc, attempt: int, max_retries: int):
-    """Raise a typed exception or return True (retry) / False (fatal)."""
-    if isinstance(exc, OperationalError):
-        if attempt >= max_retries:
-            logger.error("DB transient error – exhausted retries.")
-            raise DatabaseError(str(exc)) from exc
-        return True  # retry
-    if isinstance(exc, IntegrityError):
-        raise DuplicateError(str(exc)) from exc
-    if isinstance(exc, SAError):
-        raise DatabaseError(str(exc)) from exc
-    return False  # not a DB error, let the caller handle it
-
-
-def retry_on_db_failure(
-    max_retries: int = 3,
-    base_delay: float = 0.5,
-    max_delay: float = 5.0,
-):
-    """Decorator that retries the wrapped call on transient DB failures.
-
-    Uses exponential backoff with jitter.  Re-raises if all retries are
-    exhausted or if the error is non-transient (e.g. constraint violation).
-    """
-    def decorator(func):
-        @wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            last_exc = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except (OperationalError, IntegrityError, SAError) as exc:
-                    last_exc = exc
-                    if _check_db_error(exc, attempt, max_retries):
-                        delay = _compute_retry_delay(attempt, base_delay, max_delay)
-                        logger.warning(
-                            "DB transient error (attempt %d/%d): %s.  Retrying in %.2fs…",
-                            attempt, max_retries, exc, delay,
-                        )
-                        await asyncio.sleep(delay)
-            raise DatabaseError(str(last_exc)) if last_exc else DatabaseError("Unknown error")
-
-        @wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            last_exc = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except (OperationalError, IntegrityError, SAError) as exc:
-                    last_exc = exc
-                    if _check_db_error(exc, attempt, max_retries):
-                        delay = _compute_retry_delay(attempt, base_delay, max_delay)
-                        logger.warning(
-                            "DB transient error (attempt %d/%d): %s.  Retrying in %.2fs…",
-                            attempt, max_retries, exc, delay,
-                        )
-                        time.sleep(delay)  # noqa: ASYNC100
-            raise DatabaseError(str(last_exc)) if last_exc else DatabaseError("Unknown error")
-
-        if asyncio.iscoroutinefunction(func):
-            return async_wrapper
-        return sync_wrapper
-
-    return decorator
-
-
 # ── Engine lifecycle ────────────────────────────────────────────────────────────
 
 
@@ -191,29 +115,12 @@ async def dispose_engines() -> None:
 # ── Session helpers ───────────────────────────────────────────────────────────
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI/Quart-compatible async session dependency.
-
-    Yields a session and ensures it is closed (and rolled back on error)
-    when the caller exits.
-    """
-    session = AsyncSessionLocal()
-    try:
-        yield session
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        logger.exception("Database session rolled back due to error")
-        raise
-    finally:
-        await session.close()
-
-
 @asynccontextmanager
-async def async_db_session():
+async def async_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Async context manager that yields a committed (or rolled-back) session.
 
-    Usage::
+    Commits on success, rolls back and re-raises on error, and always closes
+    the session.  Usage::
 
         async with async_db_session() as session:
             user = await session.get(User, 1)
@@ -228,6 +135,19 @@ async def async_db_session():
         raise
     finally:
         await session.close()
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI/Quart-compatible async session dependency.
+
+    Thin wrapper over :func:`async_db_session` for dependency-injection
+    style usage::
+
+        async def route(session: AsyncSession = Depends(get_db)) -> ...:
+            ...
+    """
+    async with async_db_session() as session:
+        yield session
 
 
 @contextmanager
@@ -249,29 +169,3 @@ def get_sync_db() -> Generator:
         raise
     finally:
         session.close()
-
-
-# ── Utility helpers ───────────────────────────────────────────────────────────
-
-
-def map_integrity_error(func):
-    """Decorator that catches SQLAlchemy ``IntegrityError`` and raises our
-    ``DuplicateError`` instead.
-    """
-    @wraps(func)
-    async def async_wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except IntegrityError as exc:
-            raise DuplicateError(str(exc)) from exc
-
-    @wraps(func)
-    def sync_wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except IntegrityError as exc:
-            raise DuplicateError(str(exc)) from exc
-
-    if asyncio.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper

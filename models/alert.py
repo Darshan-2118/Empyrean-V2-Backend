@@ -5,6 +5,8 @@ When AQI (or another parameter) crosses a threshold, the system logs an
 alert here.  The frontend displays unacknowledged alerts on a map.
 """
 
+from datetime import datetime
+
 from sqlalchemy import ForeignKey, Integer, REAL, String, Text, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -37,11 +39,11 @@ class Alert(Base):
     message: Mapped[str | None] = mapped_column(
         Text, nullable=True,
     )
-    triggered_at = mapped_column(
+    triggered_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
     )
-    acknowledged_at = mapped_column(
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,
     )
     acknowledged_by: Mapped[int | None] = mapped_column(

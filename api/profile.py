@@ -129,6 +129,7 @@ async def change_password():
         session.add(user)
         await session.commit()
 
+    logger.info("Password changed for user %s", user.username)
     return jsonify({"message": "Password changed successfully"}), 200
 
 
@@ -157,4 +158,5 @@ async def delete_profile():
         session.add(user)
         await session.commit()
 
+    logger.info("Account deactivated for user %s", user.username)
     return jsonify({"message": "Account deleted successfully"}), 200

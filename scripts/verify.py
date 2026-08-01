@@ -40,10 +40,6 @@ def fail_msg(msg: str):
     print(f"  {RED}FAIL{NC}  {msg}")
 
 
-def info_msg(msg: str):
-    print(f"  {YELLOW}..{NC}  {msg}")
-
-
 def header(msg: str):
     print(f"\n{BOLD}-- {msg} --{NC}")
 
@@ -52,15 +48,10 @@ def header(msg: str):
 def check_postgresql() -> bool:
     header("1/4  PostgreSQL")
     try:
-        from sqlalchemy import create_engine, text as sa_text
-        from config import get_config
+        from sqlalchemy import text as sa_text
+        from scripts.db_utils import make_engine
 
-        cfg = get_config()
-        engine = create_engine(
-            cfg.DATABASE_URL,
-            pool_pre_ping=True,
-            connect_args={"connect_timeout": 5},
-        )
+        engine = make_engine()
         with engine.connect() as conn:
             conn.execute(sa_text("SELECT 1"))
         engine.dispose()
@@ -77,12 +68,24 @@ def check_migrations() -> bool:
     try:
         from alembic.config import Config
         from alembic.script import ScriptDirectory
+        from sqlalchemy import text as sa_text
+        from scripts.db_utils import make_engine
 
         alembic_cfg = Config(PROJECT_ROOT / "alembic.ini")
-        script = ScriptDirectory.from_config(alembic_cfg)
-        head = script.get_current_head()
-        pass_msg(f"Alembic head is at {head}")
-        return True
+        head = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+
+        engine = make_engine()
+        with engine.connect() as conn:
+            db_rev = conn.execute(
+                sa_text("SELECT version_num FROM alembic_version")
+            ).scalar()
+        engine.dispose()
+
+        if db_rev == head:
+            pass_msg(f"Alembic migration is up to date (revision {head})")
+            return True
+        fail_msg(f"Database is at revision {db_rev}, expected {head}")
+        return False
     except Exception as e:
         fail_msg(f"Alembic check failed: {e}")
         return False
@@ -92,7 +95,6 @@ def check_migrations() -> bool:
 def check_health() -> bool:
     header("3/4  Health check")
     try:
-        sys.path.insert(0, str(PROJECT_ROOT))
         from scripts import check_health
 
         result = check_health.main()
@@ -115,6 +117,7 @@ def check_tests() -> bool:
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
+        timeout=900,
     )
     for line in result.stdout.strip().split("\n"):
         if line.strip():

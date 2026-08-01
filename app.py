@@ -4,6 +4,7 @@ import sys
 from quart import Quart, jsonify
 from quart_cors import cors
 
+from api.jwt import _problem_json
 from config import get_config
 from models.base import dispose_engines
 
@@ -46,33 +47,40 @@ def create_app() -> Quart:
     _app = cors(app, allow_origin=cfg.cors_origins_list, allow_credentials=True)
 
     # --- Error handlers (RFC 7807 problem+json) ---
-    def _problem_json(status: int, title: str, detail: str | None = None):
-        """Factory: return an RFC 7807 error handler."""
-        async def handler(e):
-            return jsonify({
-                "type": "about:blank",
-                "title": title,
-                "status": status,
-                "detail": detail or str(e),
-            }), status, {"Content-Type": "application/problem+json"}
-        return handler
+    @_app.errorhandler(400)
+    async def bad_request(e):
+        return _problem_json(400, "Bad Request")
 
-    _app.errorhandler(400)(_problem_json(400, "Bad Request"))
-    _app.errorhandler(401)(_problem_json(401, "Unauthorized", "Authentication is required"))
-    _app.errorhandler(403)(_problem_json(403, "Forbidden", "You do not have permission to access this resource"))
-    _app.errorhandler(404)(_problem_json(404, "Not Found", "The requested resource was not found"))
-    _app.errorhandler(422)(_problem_json(422, "Unprocessable Entity"))
-    _app.errorhandler(429)(_problem_json(429, "Too Many Requests", "Rate limit exceeded. Please slow down."))
+    @_app.errorhandler(401)
+    async def unauthorized(e):
+        return _problem_json(401, "Unauthorized", "Authentication is required")
+
+    @_app.errorhandler(403)
+    async def forbidden(e):
+        return _problem_json(
+            403, "Forbidden", "You do not have permission to access this resource"
+        )
+
+    @_app.errorhandler(404)
+    async def not_found(e):
+        return _problem_json(404, "Not Found", "The requested resource was not found")
+
+    @_app.errorhandler(422)
+    async def unprocessable_entity(e):
+        return _problem_json(422, "Unprocessable Entity")
+
+    @_app.errorhandler(429)
+    async def too_many_requests(e):
+        return _problem_json(
+            429, "Too Many Requests", "Rate limit exceeded. Please slow down."
+        )
 
     @_app.errorhandler(500)
     async def internal_error(e):
         logger.exception("Internal server error")
-        return jsonify({
-            "type": "about:blank",
-            "title": "Internal Server Error",
-            "status": 500,
-            "detail": "An unexpected error occurred",
-        }), 500, {"Content-Type": "application/problem+json"}
+        return _problem_json(
+            500, "Internal Server Error", "An unexpected error occurred"
+        )
 
     # --- Health endpoint ---
     @_app.route("/health")

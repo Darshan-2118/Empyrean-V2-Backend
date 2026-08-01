@@ -4,14 +4,28 @@ All values are read from ``.env`` automatically, with sensible defaults.
 Type coercion (int, bool, etc.) is handled by pydantic.
 """
 
-from pydantic import field_validator
+from pathlib import Path
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Known development placeholder secrets — refuse to start with these in prod.
+_DEV_SECRETS = {
+    "dev-secret-key",
+    "dev-jwt-secret",
+    "change-me-to-a-256-bit-random-secret",
+}
 
 
 class Config(BaseSettings):
     """Configuration loaded from environment / .env file."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # Resolve .env relative to the repo root (this file), so scripts work
+    # from any working directory instead of silently falling back to defaults.
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[1] / ".env",
+        env_file_encoding="utf-8",
+    )
 
     # App
     APP_ENV: str = "development"
@@ -71,25 +85,31 @@ class Config(BaseSettings):
             raise ValueError(f"LOG_LEVEL must be one of {allowed}, got {v!r}")
         return upper
 
+    @model_validator(mode="after")
+    def _reject_dev_secrets_in_production(self) -> "Config":
+        """Fail fast in production if a secret is still a dev placeholder.
 
-class DevelopmentConfig(Config):
-    """Development — debug defaults."""
-    APP_ENV: str = "development"
-
-
-class ProductionConfig(Config):
-    """Production — debug is always off."""
-    APP_ENV: str = "production"
-
-
-_config_map = {
-    "development": DevelopmentConfig,
-    "production": ProductionConfig,
-}
+        A publicly-known JWT_SECRET would let anyone mint valid tokens, so
+        this turns that misconfiguration into a startup error instead.
+        """
+        if self.APP_ENV == "production":
+            bad = [
+                name
+                for name, value in (
+                    ("SECRET_KEY", self.SECRET_KEY),
+                    ("JWT_SECRET", self.JWT_SECRET),
+                )
+                if value in _DEV_SECRETS
+            ]
+            if bad:
+                raise ValueError(
+                    "Refusing to start in production: "
+                    f"{', '.join(bad)} is still set to a development default. "
+                    "Set real secrets in .env."
+                )
+        return self
 
 
 def get_config() -> Config:
-    """Return the right config class for the current environment."""
-    env = Config().APP_ENV  # fresh load to get the actual env
-    cls = _config_map.get(env, DevelopmentConfig)
-    return cls()
+    """Return the application configuration."""
+    return Config()

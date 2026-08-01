@@ -6,6 +6,8 @@ continuous aggregate once the extension is installed, at which point
 it will auto-refresh every hour.
 """
 
+from datetime import datetime
+
 from sqlalchemy import ForeignKey, Integer, PrimaryKeyConstraint, REAL, SmallInteger, String
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -16,7 +18,7 @@ from models.base import Base
 class HourlyAgg(Base):
     __tablename__ = "hourly_agg"
 
-    bucket = mapped_column(
+    bucket: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
     )
     node_id: Mapped[str] = mapped_column(

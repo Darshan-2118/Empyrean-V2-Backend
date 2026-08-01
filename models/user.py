@@ -4,9 +4,9 @@ User model — both admins and regular users live here.
 The ``role`` column (``'admin'`` | ``'user'``) controls access level.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 
-from sqlalchemy import Boolean, Integer, String, Text, func
+from sqlalchemy import Boolean, Integer, String, func
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -37,14 +37,14 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
     )
-    last_login_at = mapped_column(
+    last_login_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,
     )
-    created_at = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
     )
-    updated_at = mapped_column(
+    updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
         onupdate=func.now(),

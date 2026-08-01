@@ -28,10 +28,11 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 - [x] **Refresh Token model** — `models/refresh_token.py` (id, user_id FK, token_hash, expires_at, created_at, revoked)
 - [x] **Nodes model** — `models/node.py` (node_id PK, name, location_name, lat, lon, firmware_version, reading_interval, is_active, registered_at, last_seen)
 - [x] **Sensor Readings model** — `models/reading.py` (time, node_id FK, temperature, humidity, pressure, voc_ohm, mq135_ppm, pm1, pm25, pm10, battery_v, fuzzy_score, aqi, aqi_category, is_anomaly) — regular table (TimescaleDB hypertable later)
-- [x] **Hourly Aggregate model** — `models/aggregate.py` (bucket, node_id, avg_temperature, avg_humidity, avg_pm25, avg_pm10, max_aqi, min_aqi, avg_aqi, anomaly_count, reading_count) — regular materialized view (continuous aggregate later)
+- [x] **Hourly Aggregate model** — `models/aggregate.py` (bucket, node_id, avg_temperature, avg_humidity, avg_pm25, avg_pm10, max_aqi, min_aqi, avg_aqi, anomaly_count, reading_count) — regular table (continuous aggregate later)
 - [x] **Alerts model** — `models/alert.py` (alert_id PK, node_id FK, parameter, value, threshold, severity, message, triggered_at, acknowledged_at, acknowledged_by FK)
 - [x] **System Settings model** — `models/setting.py` (key PK, value, description, updated_at, updated_by FK)
 - [x] **Create Alembic migrations** — initial schema with all 7 tables, indexes on refresh_tokens and sensor_readings
+- [x] **TimescaleDB hypertable migration** — converts `sensor_readings` to a hypertable (`b2bab23ab3c0`)
 - [x] **Seed script** — `scripts/seed.py` for dev/test data (admin user, default settings, sample nodes)
 - [x] **Health check script** — `scripts/check_health.py` validates entire stack
 - [x] **Code review** — fixed asyncio deprecation, CWD path bugs, model-migration drift
@@ -156,10 +157,10 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 12: Error Handling & Middleware
 
-- [ ] **RFC 7807 Problem JSON** — standardized error responses (`application/problem+json`)
-- [ ] **Global error handlers** — 400, 401, 403, 404, 422, 429, 500 error handlers
-- [ ] **Request validation middleware** — Pydantic schema validation on all inputs
-- [ ] **CORS configuration** — allow frontend origins, credentials support
+- [x] **RFC 7807 Problem JSON** — standardized error responses (`application/problem+json`)
+- [x] **Global error handlers** — 400, 401, 403, 404, 422, 429, 500 error handlers
+- [ ] **Request validation middleware** — Pydantic schema validation on all inputs (partial)
+- [x] **CORS configuration** — allow frontend origins, credentials support
 - [ ] **Request logging middleware** — log method, path, status, duration
 
 ---

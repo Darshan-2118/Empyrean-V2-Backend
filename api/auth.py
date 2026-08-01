@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 from quart import Blueprint, jsonify, request
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 
 from api.jwt import (
@@ -31,12 +31,36 @@ logger = logging.getLogger("empyrean.auth")
 
 auth_bp = Blueprint("auth", __name__)
 
+# Precomputed bcrypt hash of a dummy password, compared against when a login
+# username does not exist — so unknown usernames take the same time as a wrong
+# password and the endpoint does not leak which usernames are registered.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(
+    b"timing-equalizer", bcrypt.gensalt(rounds=12)
+).decode()
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-async def _build_auth_response(user: User) -> tuple:
-    """Create JWT pair, persist refresh token, return ``AuthResponse`` JSON.
+def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
+    """Build the ``AuthResponse`` payload dict for a token pair."""
+    cfg = get_config()
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60,
+        role=user.role,
+        user=UserBrief(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            role=user.role,
+        ),
+    ).model_dump()
+
+
+async def _issue_auth_tokens(user: User) -> tuple:
+    """Create a JWT pair, persist the refresh token, return a 201 response.
 
     Shared by register and login.
     """
@@ -58,22 +82,7 @@ async def _build_auth_response(user: User) -> tuple:
         session.add(rt)
         await session.commit()
 
-    expires_in = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60
-
-    resp = AuthResponse(
-        access_token=access,
-        refresh_token=raw_refresh,
-        expires_in=expires_in,
-        role=user.role,
-        user=UserBrief(
-            id=user.id,
-            username=user.username,
-            email=user.email,
-            role=user.role,
-        ),
-    ).model_dump()
-
-    return jsonify(resp), 201
+    return jsonify(_auth_payload(user, access, raw_refresh)), 201
 
 
 # ── POST /auth/register ────────────────────────────────────────────────────────
@@ -116,7 +125,7 @@ async def register():
             )
 
     # ── Auto-login ───────────────────────────────────────────────────────────
-    return await _build_auth_response(user)
+    return await _issue_auth_tokens(user)
 
 
 # ── POST /auth/login ───────────────────────────────────────────────────────────
@@ -139,24 +148,28 @@ async def login():
             select(User).where(User.username == data.username)
         )
         user = result.scalar_one_or_none()
+        pwd_bytes = data.password.encode("utf-8")
 
+        # Unknown username: burn a bcrypt compare so timing matches a wrong
+        # password, and return the same message in every failure case.
         if user is None:
+            bcrypt.checkpw(pwd_bytes, _DUMMY_PASSWORD_HASH.encode("utf-8"))
+            logger.warning("Failed login: unknown username %r", data.username)
+            return _problem_json(401, "Unauthorized", "Invalid username or password")
+
+        if not bcrypt.checkpw(pwd_bytes, user.password_hash.encode("utf-8")):
+            logger.warning("Failed login: wrong password for %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
         if not user.is_active:
-            return _problem_json(401, "Unauthorized", "Account is deactivated")
-
-        if not bcrypt.checkpw(
-            data.password.encode("utf-8"),
-            user.password_hash.encode("utf-8"),
-        ):
+            logger.warning("Failed login: inactive user %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
         # Update last_login_at
         user.last_login_at = datetime.now(timezone.utc)
         await session.commit()
 
-    return await _build_auth_response(user)
+    return await _issue_auth_tokens(user)
 
 
 # ── POST /auth/refresh ─────────────────────────────────────────────────────────
@@ -178,25 +191,36 @@ async def refresh():
     now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as session:
+        # Claim the token atomically: mark it revoked and read the owner in one
+        # UPDATE ... RETURNING, so two concurrent requests with the same token
+        # cannot both rotate it into two live refresh tokens.
         result = await session.execute(
-            select(RefreshToken).where(
+            sa_update(RefreshToken)
+            .where(
                 RefreshToken.token_hash == token_hash,
                 RefreshToken.revoked == False,  # noqa: E712
             )
+            .values(revoked=True)
+            .returning(RefreshToken.user_id, RefreshToken.expires_at)
         )
-        rt = result.scalar_one_or_none()
+        row = result.first()
 
-        if rt is None:
-            return _problem_json(401, "Unauthorized", "Refresh token is invalid or revoked")
-
-        if rt.expires_at < now:
-            return _problem_json(401, "Token expired", "Refresh token has expired")
-
-        # ── Rotate: revoke old, issue new ────────────────────────────────────
-        rt.revoked = True
+        # Same 401 whether the token was invalid, already revoked, or expired —
+        # don't reveal which.
+        if row is None:
+            logger.warning("Rejected refresh token: invalid or already revoked")
+            return _problem_json(
+                401, "Unauthorized", "Refresh token is invalid or expired"
+            )
+        user_id, expires_at = row
+        if expires_at < now:
+            logger.warning("Rejected refresh token: expired")
+            return _problem_json(
+                401, "Unauthorized", "Refresh token is invalid or expired"
+            )
 
         user_result = await session.execute(
-            select(User).where(User.id == rt.user_id)
+            select(User).where(User.id == user_id)
         )
         user = user_result.scalar_one_or_none()
         if user is None or not user.is_active:
@@ -220,22 +244,7 @@ async def refresh():
 
     # Build response
     access = create_access_token(user.id, user.role)
-    expires_in = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60
-
-    resp = AuthResponse(
-        access_token=access,
-        refresh_token=raw_new,
-        expires_in=expires_in,
-        role=user.role,
-        user=UserBrief(
-            id=user.id,
-            username=user.username,
-            email=user.email,
-            role=user.role,
-        ),
-    ).model_dump()
-
-    return jsonify(resp), 200
+    return jsonify(_auth_payload(user, access, raw_new)), 200
 
 
 # ── POST /auth/logout ──────────────────────────────────────────────────────────

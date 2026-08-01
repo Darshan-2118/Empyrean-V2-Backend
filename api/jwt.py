@@ -28,7 +28,6 @@ cfg = get_config()
 JWT_SECRET = cfg.JWT_SECRET
 JWT_ALGORITHM = cfg.JWT_ALGORITHM
 ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
-REFRESH_TOKEN_EXPIRY_DAYS = cfg.JWT_REFRESH_TOKEN_EXPIRY_DAYS
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -68,7 +67,15 @@ def decode_access_token(token: str) -> dict[str, Any]:
     Returns the decoded payload on success.
     Raises ``jwt.ExpiredSignatureError`` or ``jwt.InvalidTokenError`` on failure.
     """
-    return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    payload = pyjwt.decode(
+        token,
+        JWT_SECRET,
+        algorithms=[JWT_ALGORITHM],
+        options={"require": ["sub", "exp"]},
+    )
+    if payload.get("type") != "access":
+        raise pyjwt.InvalidTokenError("Not an access token")
+    return payload
 
 
 # ── Refresh token (opaque, DB-tracked) ────────────────────────────────────────
@@ -110,8 +117,10 @@ def jwt_required(f: Callable) -> Callable:
         try:
             payload = decode_access_token(token)
         except pyjwt.ExpiredSignatureError:
+            logger.warning("Rejected expired access token")
             return _problem_json(401, "Token expired", "Access token has expired")
         except pyjwt.InvalidTokenError:
+            logger.warning("Rejected invalid access token")
             return _problem_json(401, "Invalid token", "Access token is not valid")
 
         user_id: int = payload.get("sub")
@@ -135,16 +144,18 @@ def jwt_required(f: Callable) -> Callable:
 def admin_required(f: Callable) -> Callable:
     """Require a valid JWT with ``role == 'admin'``.
 
-    Stack *below* ``@jwt_required`` (runs after it).
+    Reads ``g.current_user`` (populated by ``@jwt_required``). This is
+    independent of decorator stacking order: an unauthenticated request
+    gets 401, a non-admin user gets 403.
     """
 
     @wraps(f)
     async def decorated(*args: Any, **kwargs: Any) -> Any:
         user = getattr(g, "current_user", None)
-        if user is None or user.role != "admin":
-            return _problem_json(
-                403, "Forbidden", "Admin privileges are required"
-            )
+        if user is None:
+            return _problem_json(401, "Unauthorized", "Authentication is required")
+        if user.role != "admin":
+            return _problem_json(403, "Forbidden", "Admin privileges are required")
         return await f(*args, **kwargs)
 
     return decorated
