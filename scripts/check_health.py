@@ -28,7 +28,6 @@ if _PROJECT_ROOT not in sys.path:
 
 PASS = "[OK]"
 FAIL = "[FAIL]"
-SKIP = "[SKIP]"
 SEP = "-" * 60
 
 
@@ -65,20 +64,15 @@ def main() -> bool:
     print(SEP)
 
     try:
-        from sqlalchemy import create_engine, inspect, text as sa_text
-        from config import get_config
+        from sqlalchemy import inspect, text as sa_text
+        from scripts.db_utils import make_engine
 
-        cfg = get_config()
-        engine = create_engine(
-            cfg.DATABASE_URL,
-            pool_pre_ping=True,
-            connect_args={"connect_timeout": 5},
-        )
+        engine = make_engine()
 
         # Quick connection test
         with engine.connect() as conn:
             conn.execute(sa_text("SELECT 1"))
-        all_ok &= check("PostgreSQL connection", True, cfg.DATABASE_URL.rsplit("@", 1)[-1])
+        all_ok &= check("PostgreSQL connection", True, str(engine.url).rsplit("@", 1)[-1])
 
         # Database version
         with engine.connect() as conn:

@@ -5,7 +5,9 @@ Enables logout (set ``revoked = True``) and refresh-token rotation
 (revoke the old token when issuing a new one).
 """
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
+from datetime import datetime
+
+from sqlalchemy import Boolean, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -25,10 +27,10 @@ class RefreshToken(Base):
     token_hash: Mapped[str] = mapped_column(
         String(255), nullable=False, index=True,
     )
-    expires_at = mapped_column(
+    expires_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
     )
-    created_at = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
     )

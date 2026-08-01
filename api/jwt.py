@@ -28,7 +28,6 @@ cfg = get_config()
 JWT_SECRET = cfg.JWT_SECRET
 JWT_ALGORITHM = cfg.JWT_ALGORITHM
 ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
-REFRESH_TOKEN_EXPIRY_DAYS = cfg.JWT_REFRESH_TOKEN_EXPIRY_DAYS
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -118,8 +117,10 @@ def jwt_required(f: Callable) -> Callable:
         try:
             payload = decode_access_token(token)
         except pyjwt.ExpiredSignatureError:
+            logger.warning("Rejected expired access token")
             return _problem_json(401, "Token expired", "Access token has expired")
         except pyjwt.InvalidTokenError:
+            logger.warning("Rejected invalid access token")
             return _problem_json(401, "Invalid token", "Access token is not valid")
 
         user_id: int = payload.get("sub")

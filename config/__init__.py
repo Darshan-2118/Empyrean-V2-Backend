@@ -110,24 +110,6 @@ class Config(BaseSettings):
         return self
 
 
-class DevelopmentConfig(Config):
-    """Development — debug defaults."""
-    APP_ENV: str = "development"
-
-
-class ProductionConfig(Config):
-    """Production — debug is always off."""
-    APP_ENV: str = "production"
-
-
-_config_map = {
-    "development": DevelopmentConfig,
-    "production": ProductionConfig,
-}
-
-
 def get_config() -> Config:
-    """Return the right config class for the current environment."""
-    env = Config().APP_ENV  # fresh load to get the actual env
-    cls = _config_map.get(env, DevelopmentConfig)
-    return cls()
+    """Return the application configuration."""
+    return Config()

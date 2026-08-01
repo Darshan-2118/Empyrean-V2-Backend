@@ -42,8 +42,25 @@ _DUMMY_PASSWORD_HASH = bcrypt.hashpw(
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-async def _build_auth_response(user: User) -> tuple:
-    """Create JWT pair, persist refresh token, return ``AuthResponse`` JSON.
+def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
+    """Build the ``AuthResponse`` payload dict for a token pair."""
+    cfg = get_config()
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60,
+        role=user.role,
+        user=UserBrief(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            role=user.role,
+        ),
+    ).model_dump()
+
+
+async def _issue_auth_tokens(user: User) -> tuple:
+    """Create a JWT pair, persist the refresh token, return a 201 response.
 
     Shared by register and login.
     """
@@ -65,22 +82,7 @@ async def _build_auth_response(user: User) -> tuple:
         session.add(rt)
         await session.commit()
 
-    expires_in = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60
-
-    resp = AuthResponse(
-        access_token=access,
-        refresh_token=raw_refresh,
-        expires_in=expires_in,
-        role=user.role,
-        user=UserBrief(
-            id=user.id,
-            username=user.username,
-            email=user.email,
-            role=user.role,
-        ),
-    ).model_dump()
-
-    return jsonify(resp), 201
+    return jsonify(_auth_payload(user, access, raw_refresh)), 201
 
 
 # ── POST /auth/register ────────────────────────────────────────────────────────
@@ -123,7 +125,7 @@ async def register():
             )
 
     # ── Auto-login ───────────────────────────────────────────────────────────
-    return await _build_auth_response(user)
+    return await _issue_auth_tokens(user)
 
 
 # ── POST /auth/login ───────────────────────────────────────────────────────────
@@ -152,19 +154,22 @@ async def login():
         # password, and return the same message in every failure case.
         if user is None:
             bcrypt.checkpw(pwd_bytes, _DUMMY_PASSWORD_HASH.encode("utf-8"))
+            logger.warning("Failed login: unknown username %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
         if not bcrypt.checkpw(pwd_bytes, user.password_hash.encode("utf-8")):
+            logger.warning("Failed login: wrong password for %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
         if not user.is_active:
+            logger.warning("Failed login: inactive user %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
         # Update last_login_at
         user.last_login_at = datetime.now(timezone.utc)
         await session.commit()
 
-    return await _build_auth_response(user)
+    return await _issue_auth_tokens(user)
 
 
 # ── POST /auth/refresh ─────────────────────────────────────────────────────────
@@ -203,11 +208,13 @@ async def refresh():
         # Same 401 whether the token was invalid, already revoked, or expired —
         # don't reveal which.
         if row is None:
+            logger.warning("Rejected refresh token: invalid or already revoked")
             return _problem_json(
                 401, "Unauthorized", "Refresh token is invalid or expired"
             )
         user_id, expires_at = row
         if expires_at < now:
+            logger.warning("Rejected refresh token: expired")
             return _problem_json(
                 401, "Unauthorized", "Refresh token is invalid or expired"
             )
@@ -237,22 +244,7 @@ async def refresh():
 
     # Build response
     access = create_access_token(user.id, user.role)
-    expires_in = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES * 60
-
-    resp = AuthResponse(
-        access_token=access,
-        refresh_token=raw_new,
-        expires_in=expires_in,
-        role=user.role,
-        user=UserBrief(
-            id=user.id,
-            username=user.username,
-            email=user.email,
-            role=user.role,
-        ),
-    ).model_dump()
-
-    return jsonify(resp), 200
+    return jsonify(_auth_payload(user, access, raw_new)), 200
 
 
 # ── POST /auth/logout ──────────────────────────────────────────────────────────

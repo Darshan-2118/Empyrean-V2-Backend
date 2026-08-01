@@ -1,10 +1,10 @@
 @echo off
-REM Empyrean — verify.bat
+REM Empyrean — check.bat
 REM Works in cmd.exe and PowerShell. Calls the Python verify script.
 REM
 REM Usage:
-REM   verify           full suite
-REM   verify --quick   skip tests
+REM   check            full suite
+REM   check --quick    skip tests
 REM ─────────────────────────────────────────────────────────────────────────────
 
 python "%~dp0verify.py" %*

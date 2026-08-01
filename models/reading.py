@@ -8,6 +8,8 @@ Stored as a TimescaleDB hypertable (converted by migration ``b2bab23ab3c0``),
 partitioned on ``time``.
 """
 
+from datetime import datetime
+
 from sqlalchemy import Boolean, ForeignKey, Index, Integer, PrimaryKeyConstraint, REAL, SmallInteger, String, func, text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -20,7 +22,7 @@ class SensorReading(Base):
 
     # Use (time, node_id) as composite PK — works with both regular tables
     # and TimescaleDB hypertables (where the PK must include the partition column).
-    time = mapped_column(
+    time: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
     )
     node_id: Mapped[str] = mapped_column(

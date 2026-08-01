@@ -5,6 +5,8 @@ Admins can tweak behaviour (thresholds, feature flags, etc.) without
 touching code.  Changes persist across restarts.
 """
 
+from datetime import datetime
+
 from sqlalchemy import ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -24,7 +26,7 @@ class SystemSetting(Base):
     description: Mapped[str | None] = mapped_column(
         String(255), nullable=True,
     )
-    updated_at = mapped_column(
+    updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,
         server_default=func.now(),
         onupdate=func.now(),

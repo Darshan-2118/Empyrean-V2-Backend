@@ -15,7 +15,6 @@ from models.base import (
     async_db_session,
     get_db,
     get_sync_db,
-    retry_on_db_failure,
 )
 
 # Model classes (order doesn't matter — SQLAlchemy resolves string-based
@@ -43,5 +42,4 @@ __all__ = [
     "get_db",
     "get_sync_db",
     "async_db_session",
-    "retry_on_db_failure",
 ]
