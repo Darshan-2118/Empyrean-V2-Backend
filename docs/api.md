@@ -2,7 +2,75 @@
 
 Base URL: `/api/v1`
 
-All endpoints return JSON. Errors use **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+
+Request/response field tables are documented inline above.
+
+---
+
+## Endpoint Overview
+
+In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `Admin` = valid JWT with `role = "admin"` required.
+
+> **Status:** Only `/auth/*`, `/profile*`, and `/health` are implemented (phases 1–3). The endpoint groups below (readings, nodes, alerts, forecast, export, admin) are planned for phases 4+ and currently return 404.
+
+### Authentication
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/auth/register` | POST | No | Register a new user and auto-login (returns `access_token`, `refresh_token`, `expires_in`, `role`) |
+| `/auth/login` | POST | No | Returns `access_token`, `refresh_token`, `expires_in`, `role` |
+| `/auth/refresh` | POST | No | Exchanges a refresh token for a new access token |
+| `/auth/logout` | POST | No | Revokes a refresh token |
+
+### Sensor Readings
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/readings/latest` | GET | Yes | Latest reading per node. Redis-cached, TTL 60s. Polled every 5s by the dashboard. |
+| `/readings/history` | GET | Yes | Time-bucketed historical readings (`from`, `to`, `node_id`, `bucket`) via `time_bucket()` / `hourly_agg` |
+
+### Nodes
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/nodes` | GET | Yes | All registered nodes with metadata. Redis-cached, TTL 300s. |
+| `/nodes/:node_id` | PATCH | Admin | Update name, location, reading interval, or active status (pushes config to device via MQTT) |
+
+### Alerts
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/alerts` | GET | Yes | Unacknowledged threshold-breach alerts (`limit`, `offset`, `severity`) |
+| `/alerts/:alert_id/acknowledge` | PATCH | Yes | Marks an alert acknowledged |
+
+### Forecast
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/forecast` | GET | Yes | Next-60-minute AQI prediction (linear regression, retrained hourly, cached 1h) |
+
+### Export
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/export` | GET | Yes | CSV download of raw readings for a date range |
+
+### Profile
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/profile` | GET | Yes | Get own profile |
+| `/profile` | PATCH | Yes | Update username/email/notification prefs |
+| `/profile/change-password` | POST | Yes | Change password |
+| `/profile` | DELETE | Yes | Delete own account |
+
+### Admin
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/admin/health` | GET | Admin | Status of MQTT broker, TimescaleDB, Redis, Celery worker/beat, DB & Redis size |
+| `/admin/settings` | GET/PATCH | Admin | AQI thresholds, data retention, alert email, alerts enabled flag |
 
 ---
 

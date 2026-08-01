@@ -5,8 +5,8 @@ Broker:    Redis (configured via REDIS_URL)
 Backend:   Redis (same URL)
 Beat:      Scheduled tasks defined below
 
-Auto-discovers tasks registered in the ``tasks/`` package via the
-``@celery_app.task`` decorator.
+Task modules under ``tasks/`` are imported eagerly via ``include`` so their
+``@celery_app.task``-decorated callables register with the worker.
 """
 
 from celery import Celery
@@ -19,6 +19,7 @@ celery_app = Celery(
     "empyrean",
     broker=cfg.REDIS_URL,
     backend=cfg.REDIS_URL,
+    include=["tasks.aggregation", "tasks.alerts", "tasks.forecast"],
 )
 
 celery_app.conf.update(
@@ -48,6 +49,3 @@ celery_app.conf.update(
         },
     },
 )
-
-# Picks up any ``@celery_app.task``-decorated callables inside ``tasks/``
-celery_app.autodiscover_tasks(["tasks"])

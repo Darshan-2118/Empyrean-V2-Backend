@@ -48,14 +48,20 @@ class Node(Base):
     )
 
     # ── Relationships ─────────────────────────────────────────────────────
+    # passive_deletes=True: the DB already declares ON DELETE CASCADE on the
+    # FKs, so let Postgres delete child rows instead of the ORM loading every
+    # reading into memory (an OOM hazard on a hypertable).
     sensor_readings = relationship(
-        "SensorReading", back_populates="node", cascade="all, delete-orphan",
+        "SensorReading", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
     hourly_aggregates = relationship(
-        "HourlyAgg", back_populates="node", cascade="all, delete-orphan",
+        "HourlyAgg", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
     alerts = relationship(
-        "Alert", back_populates="node", cascade="all, delete-orphan",
+        "Alert", back_populates="node",
+        cascade="all, delete-orphan", passive_deletes=True,
     )
 
     def __repr__(self) -> str:

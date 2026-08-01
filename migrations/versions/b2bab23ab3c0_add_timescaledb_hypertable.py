@@ -42,16 +42,13 @@ def downgrade() -> None:
     # TimescaleDB does not support converting a hypertable back to a plain
     # table directly.  Since we are in early development (no critical data),
     # recreate sensor_readings as a plain table.
+    #
+    # ``LIKE ... INCLUDING ALL`` copies the table's constraints and indexes
+    # (with their names), so they must NOT be re-created below.
     op.execute("CREATE TABLE sensor_readings_plain (LIKE sensor_readings INCLUDING ALL)")
     op.execute("INSERT INTO sensor_readings_plain SELECT * FROM sensor_readings")
-    op.execute("DROP TABLE sensor_readings CASCADE")
+    op.execute("DROP TABLE sensor_readings")
     op.execute("ALTER TABLE sensor_readings_plain RENAME TO sensor_readings")
-
-    # Recreate indexes dropped with the hypertable
-    op.create_index("idx_readings_node_time", "sensor_readings",
-                    ["node_id", sa.text("time DESC")])
-    op.create_index("idx_readings_time", "sensor_readings",
-                    [sa.text("time DESC")])
 
     # Note: we do NOT drop the timescaledb extension here — other databases
     # in the cluster may depend on it.

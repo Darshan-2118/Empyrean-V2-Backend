@@ -4,11 +4,11 @@ SensorReading model — the core time-series data from sensor nodes.
 Each row represents a single sensor reading enriched with computed values
 (fuzzy_score, aqi, aqi_category, is_anomaly).
 
-This is designed as a regular table now; it will be converted to a
-TimescaleDB hypertable once the extension is installed.
+Stored as a TimescaleDB hypertable (converted by migration ``b2bab23ab3c0``),
+partitioned on ``time``.
 """
 
-from sqlalchemy import Boolean, ForeignKey, Integer, PrimaryKeyConstraint, REAL, SmallInteger, String, func, text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, PrimaryKeyConstraint, REAL, SmallInteger, String, func, text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -47,9 +47,14 @@ class SensorReading(Base):
         Boolean, default=False, server_default=text('false'), nullable=False,
     )
 
-    # ── Constraints ───────────────────────────────────────────────────────
+    # ── Constraints & indexes ─────────────────────────────────────────────
+    # The two indexes mirror the ones created in the initial migration —
+    # declaring them here keeps the model in sync so ``alembic --autogenerate``
+    # does not try to drop them.
     __table_args__ = (
         PrimaryKeyConstraint("time", "node_id", name="sensor_readings_pkey"),
+        Index("idx_readings_node_time", "node_id", text("time DESC")),
+        Index("idx_readings_time", text("time DESC")),
     )
 
     # ── Relationships ─────────────────────────────────────────────────────

@@ -1,24 +1,34 @@
 """
 pytest configuration — fixtures for the entire test suite.
 
-Uses a separate PostgreSQL database (``Empyrean_test``) so tests never touch
+Uses a separate PostgreSQL database (``empyrean_test``) so tests never touch
 real data.  Tables are created once per session; each test function runs in
 its own transaction that gets rolled back on exit.
 """
 
+import os
+
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from config import get_config
-from models import Base, Node, SystemSetting, User
-from models.helpers import hash_password
 
 # ── Test database ─────────────────────────────────────────────────────────────
 cfg = get_config()
-# Derive test DB URL by replacing the last path segment (the DB name)
-# with "empyrean_test".  Handles any database name.
-_TEST_DB_URL = cfg.DATABASE_URL.rsplit("/", 1)[0] + "/empyrean_test"
+# Derive test DB URL by replacing the last path segment (the DB name) with
+# "empyrean_test", or honor an explicit TEST_DATABASE_URL override.
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL") or (
+    cfg.DATABASE_URL.rsplit("/", 1)[0] + "/empyrean_test"
+)
+
+# Point the application's engines at the test DB *before* the models import
+# below (models/base.py builds its engines from DATABASE_URL at import time).
+# Without this, API-level tests would silently hit the real "Empyrean" DB.
+os.environ["DATABASE_URL"] = _TEST_DB_URL
+
+from models import Base, Node, SystemSetting, User
+from models.helpers import hash_password
 
 _engine = create_engine(_TEST_DB_URL, pool_pre_ping=True)
 _SessionFactory = sessionmaker(bind=_engine)
@@ -28,10 +38,11 @@ _SessionFactory = sessionmaker(bind=_engine)
 
 @pytest.fixture(scope="session", autouse=True)
 def create_test_tables():
-    """Create all tables once per test session, then drop them."""
+    """Create all tables once per test session, then drop them and dispose."""
     Base.metadata.create_all(_engine)
     yield
     Base.metadata.drop_all(_engine)
+    _engine.dispose()
 
 
 # ── Function-scoped: isolated transaction ─────────────────────────────────────
@@ -117,12 +128,3 @@ def default_settings(db_session: Session) -> list[SystemSetting]:
         db_session.add(s)
     db_session.flush()
     return settings
-
-
-# ── Engine cleanup ────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="session", autouse=True)
-def dispose_engine():
-    """Dispose of the test engine after the session."""
-    yield
-    _engine.dispose()

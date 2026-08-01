@@ -12,12 +12,14 @@ Provides:
 
 import asyncio
 import logging
+import random
 import time
 from contextlib import asynccontextmanager, contextmanager
 from functools import wraps
 from typing import AsyncGenerator, Generator
 
 from sqlalchemy import MetaData, create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DatabaseError as SAError, IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -63,8 +65,9 @@ class DuplicateError(DatabaseError):
 _cfg = get_config()
 _sync_db_url = _cfg.DATABASE_URL
 
-# Build an async-compatible URL (replace postgresql:// → postgresql+asyncpg://)
-_async_db_url = _sync_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+# Build an async-compatible URL by swapping the driver, so any
+# postgresql:// (or postgresql+<driver>://) form becomes asyncpg.
+_async_db_url = make_url(_sync_db_url).set(drivername="postgresql+asyncpg")
 
 sync_engine = create_engine(
     _sync_db_url,
@@ -102,9 +105,9 @@ SyncSessionLocal = sessionmaker(
 
 
 def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float) -> float:
-    """Exponential back-off with jitter."""
+    """Exponential back-off with jitter (capped at ``max_delay``)."""
     delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-    return delay + delay * 0.1 * (time.time() % 1)
+    return delay + delay * 0.1 * random.random()
 
 
 def _check_db_error(exc, attempt: int, max_retries: int):
