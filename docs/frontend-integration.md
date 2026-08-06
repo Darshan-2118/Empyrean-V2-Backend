@@ -31,7 +31,7 @@ In production these become `https://<your-domain>/api/v1` and `wss://<your-domai
 
 - **Polling:** the dashboard map polls `GET /readings/latest` every 5 seconds and `GET /nodes` less frequently (it's cached 300s server-side) — no backend change needed to adjust this, it's purely a frontend interval.
 - **Push (planned — Phase 9):** the frontend opens a WebSocket to `VITE_WS_URL` to receive `air/alerts` broadcasts in real time (threshold-breach toasts) instead of polling `/alerts`. The backend bridges the MQTT `air/alerts` topic onto this WebSocket. The WebSocket endpoint is not implemented yet.
-- **Rate limits (planned — Phase 5):** the frontend should respect `X-RateLimit-Remaining`/`Retry-After` headers and back off polling if it starts hitting `429`. Rate limiting is not yet enforced.
+- **Rate limits (enforced since Phase 5):** readings endpoints are limited to 200 requests/minute per IP. The frontend should respect `X-RateLimit-Remaining` and back off polling if it starts hitting `429`; `X-RateLimit-Reset` (Unix epoch seconds) tells when the window clears. The dashboard polls `/readings/latest` every 5s (~12 req/min, comfortably under the limit), but keep the backoff logic anyway. `Retry-After` is not sent — use `X-RateLimit-Reset`.
 
 ## 5. Local dev — running both together
 

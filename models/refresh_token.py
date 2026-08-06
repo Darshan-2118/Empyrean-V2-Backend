@@ -7,7 +7,7 @@ Enables logout (set ``revoked = True``) and refresh-token rotation
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, ForeignKey, Integer, String, false, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,7 +35,7 @@ class RefreshToken(Base):
         server_default=func.now(),
     )
     revoked: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False,
+        Boolean, default=False, nullable=False, server_default=false(),
     )
 
     # ── Relationships ─────────────────────────────────────────────────────

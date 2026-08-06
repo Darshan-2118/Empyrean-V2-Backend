@@ -49,3 +49,7 @@ certs/*.pem
 # Deployment
 deploy/*.pem
 deploy/*.key
+
+# Internal collaboration / skill working files (never part of the product)
+.team/
+docs/superpowers/

@@ -7,7 +7,7 @@ serves as the primary key, avoiding extra joins when processing readings.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Double, Integer, String, func
+from sqlalchemy import Boolean, Double, Integer, String, func, true
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,10 +36,10 @@ class Node(Base):
         String(50), nullable=True,
     )
     reading_interval: Mapped[int] = mapped_column(
-        Integer, default=30, nullable=False,
+        Integer, default=30, nullable=False, server_default="30",
     )
     is_active: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False,
+        Boolean, default=True, nullable=False, server_default=true(),
     )
     registered_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,

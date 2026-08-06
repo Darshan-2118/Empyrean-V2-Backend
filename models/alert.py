@@ -7,7 +7,7 @@ alert here.  The frontend displays unacknowledged alerts on a map.
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Integer, REAL, String, Text, func
+from sqlalchemy import ForeignKey, Index, Integer, REAL, String, Text, func, text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,6 +16,22 @@ from models.base import Base
 
 class Alert(Base):
     __tablename__ = "alerts"
+
+    # Partial unique index backing the escalation-aware alert de-dupe (M-4).
+    # At most one *unacknowledged* alert may exist per (node_id, parameter), so
+    # the DB — not a racy application-side check-then-insert — arbitrates
+    # double-inserts. ``tasks.check_thresholds`` upserts against this index.
+    # Delivered by migration ``1785940433799_add_alerts_partial_unique.py``;
+    # this declaration keeps alembic autogenerate + ``create_all`` in sync.
+    __table_args__ = (
+        Index(
+            "uq_alerts_unacked_node",
+            "node_id",
+            "parameter",
+            unique=True,
+            postgresql_where=text("acknowledged_at IS NULL"),
+        ),
+    )
 
     alert_id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True,

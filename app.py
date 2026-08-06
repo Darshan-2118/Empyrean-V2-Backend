@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 
 from quart import Quart, jsonify
@@ -7,6 +8,10 @@ from quart_cors import cors
 from api.jwt import _problem_json
 from config import get_config
 from models.base import dispose_engines
+
+# The running MQTT ingestion client, if started (M-10). Module-level so the
+# before/after_serving hooks can share it across the app's lifetime.
+_mqtt_client = None
 
 
 def create_app() -> Quart:
@@ -23,9 +28,17 @@ def create_app() -> Quart:
     logger.info("Starting Empyrean backend — environment: %s", cfg.APP_ENV)
 
     # --- Create app ---
-    app = Quart(__name__)
+    # static_folder=None so the default /static/<path:filename> route is not
+    # registered — otherwise a static/ dir created later would be served with
+    # no auth (L-34).
+    app = Quart(__name__, static_folder=None)
     app.config.from_object(cfg)
     app.secret_key = cfg.SECRET_KEY
+
+    # M-13: hard cap on request-body size. Without this a multi-hundred-MB JSON
+    # body to login/refresh/logout is fully parsed into memory — an easy
+    # memory-exhaustion DoS. 64 KB comfortably fits every endpoint's payload.
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # 64 KB
 
     # --- DB lifecycle hooks ---
     @app.before_serving
@@ -42,6 +55,54 @@ def create_app() -> Quart:
     async def shutdown_db():
         """Dispose connection pools on app shutdown."""
         await dispose_engines()
+
+    # --- MQTT lifecycle (M-10) ---
+    # Wire the ingestion client into the app process so the documented
+    # deployment shape actually runs it. Gated behind the ``MQTT_ENABLED`` env
+    # var so deployments without MQTT are unaffected, and made fail-soft: if
+    # paho isn't installed, the broker is unreachable, TLS is misconfigured, or
+    # start() raises for any reason, we log and keep serving HTTP — a bad broker
+    # must not take the API down.
+
+    @app.before_serving
+    async def start_mqtt():
+        """Start the MQTT ingestion client, tolerating an unavailable setup."""
+        global _mqtt_client
+        if os.environ.get("MQTT_ENABLED", "0").lower() not in {"1", "true", "yes"}:
+            logger.info("MQTT_ENABLED unset — MQTT ingestion client not started")
+            return
+        try:
+            # Import lazily so a missing paho-mqtt (or mqtt package) is a
+            # logged warning, not an app-level import error.
+            from mqtt.client import MQTTClient
+
+            client = MQTTClient()
+        except Exception:
+            logger.exception(
+                "MQTT client unavailable — continuing without MQTT ingestion"
+            )
+            return
+        try:
+            client.start()
+        except Exception:
+            logger.exception(
+                "MQTT client failed to start — continuing without MQTT ingestion"
+            )
+            return
+        _mqtt_client = client
+        logger.info("MQTT ingestion client started (M-10 lifecycle wiring)")
+
+    @app.after_serving
+    async def stop_mqtt():
+        """Stop the MQTT ingestion client if it was started."""
+        global _mqtt_client
+        if _mqtt_client is None:
+            return
+        try:
+            _mqtt_client.stop()
+        except Exception:
+            logger.exception("MQTT client failed to stop cleanly")
+        _mqtt_client = None
 
     # --- CORS ---
     _app = cors(app, allow_origin=cfg.cors_origins_list, allow_credentials=True)
@@ -89,20 +150,20 @@ def create_app() -> Quart:
 
     # --- Blueprint registration (incremental — more added in later phases) ---
     from api.auth import auth_bp
+    from api.forecast import forecast_bp
     from api.profile import profile_bp
-    # from api.readings import readings_bp
+    from api.readings import readings_bp
     # from api.nodes import nodes_bp
     # from api.alerts import alerts_bp
-    # from api.forecast import forecast_bp
     # from api.export import export_bp
     # from api.admin import admin_bp
 
     _app.register_blueprint(auth_bp, url_prefix="/api/v1/auth")
     _app.register_blueprint(profile_bp, url_prefix="/api/v1/profile")
-    # _app.register_blueprint(readings_bp, url_prefix="/api/v1/readings")
+    _app.register_blueprint(readings_bp, url_prefix="/api/v1/readings")
+    _app.register_blueprint(forecast_bp, url_prefix="/api/v1/forecast")
     # _app.register_blueprint(nodes_bp, url_prefix="/api/v1/nodes")
     # _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
-    # _app.register_blueprint(forecast_bp, url_prefix="/api/v1/forecast")
     # _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
     # _app.register_blueprint(admin_bp, url_prefix="/api/v1/admin")
 

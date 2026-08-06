@@ -2,7 +2,7 @@
 
 This document describes the high-level architecture of the Empyrean backend — a real-time, geospatially-aware IoT air-quality platform. It covers the system's services, end-to-end data flow, component responsibilities, and scalability considerations.
 
-> **Status:** Phases 1–3 (scaffolding, DB models/migrations, auth & profile) are implemented. Phases 4+ (MQTT ingestion, fuzzy engine, Celery tasks) are stubs/planned. The pipeline described below is the target architecture, not the current live state.
+> **Status:** Phases 1–7 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast) are implemented. Phases 8+ (nodes/alerts/export/admin APIs, WebSocket, testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, and readings/forecast API layers are live.
 
 > **Deployment status:** the physical hardware is still in development, so the current live deployment runs a single node (`ESP32-01`). The architecture below — node registration, per-node MQTT topics, `node_id`-partitioned TimescaleDB storage — already supports many concurrent nodes and needs no backend changes to scale up as more physical nodes come online; see NFR target of ≥ 50 nodes under Performance & Reliability Targets in [security.md](security.md).
 
@@ -22,18 +22,19 @@ This document describes the high-level architecture of the Empyrean backend — 
 The backend sits between the MQTT-publishing sensor nodes and the React frontend, and is composed of four cooperating services, all running on a single machine:
 
 1. **MQTT Broker (Mosquitto)** — receives sensor payloads over TLS, authenticates devices via client certificates, and routes messages.
-2. **Quart API Server** — the async MQTT consumer that validates incoming payloads, plus the REST/WebSocket layer the frontend talks to.
-3. **Celery Worker + Beat** — runs the Tsukamoto fuzzy inference, computes AQI, flags anomalies, generates forecasts, and checks alert thresholds on a schedule.
-4. **TimescaleDB + Redis** — durable time-series storage and a fast cache layer respectively.
+2. **MQTT Consumer** — `mqtt/client.py` (paho) subscribes to device readings + heartbeats, validates payloads, dispatches readings to Celery, and updates `Node.last_seen`.
+3. **Quart API Server** — the REST/WebSocket layer the frontend talks to (auth, profile, readings, forecast).
+4. **Celery Worker + Beat** — runs the Tsukamoto fuzzy inference, computes AQI, flags anomalies, generates forecasts, and checks alert thresholds on a schedule.
+5. **TimescaleDB + Redis** — durable time-series storage and a fast cache layer respectively.
 
 ### End-to-End Data Flow
 
 | Step | Description |
 |------|-------------|
 | 1 | Sensor node publishes a JSON reading to MQTT topic `air/node/{id}/reading` every 30s over MQTTS. |
-| 2 | Mosquitto authenticates the device certificate and routes the message to the Quart consumer. |
-| 3 | Quart validates the payload against a JSON schema; malformed payloads are rejected and logged. |
-| 4 | The valid reading is dispatched to a Celery worker via the Redis queue. |
+| 2 | Mosquitto authenticates the device certificate and routes the message to the MQTT consumer (`mqtt/client.py`). |
+| 3 | `mqtt/validator.py` validates the payload (Pydantic); malformed payloads are rejected and logged, never crashing the client thread. |
+| 4 | The valid reading is dispatched to the Celery `tasks.process_reading` task via the Redis queue. |
 | 5 | The worker runs Tsukamoto Fuzzy Inference on (Temperature, Humidity, PM2.5) to produce a 0–100 fuzzy score. |
 | 6 | The worker computes the EPA AQI from PM2.5/PM10 and runs a Z-score anomaly check. |
 | 7 | The enriched record is inserted into the `sensor_readings` table in PostgreSQL (will become a TimescaleDB hypertable later). |
@@ -48,6 +49,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | Component | Technology | Responsibility |
 |---|---|---|
 | MQTT Broker | Eclipse Mosquitto | Message routing, TLS termination, device authentication, QoS management |
+| MQTT Consumer | paho-mqtt (`mqtt/client.py`) | Subscribe to device topics, validate payloads, dispatch readings to Celery, heartbeat handling, config push |
 | API Server | Quart (async Flask) | REST endpoints, JWT auth, WebSocket push, request validation |
 | Task Queue | Celery + Redis | Async fuzzy inference, anomaly detection, scheduled aggregation, alerts |
 | Primary DB | TimescaleDB (PostgreSQL) | Time-series storage, hypertable partitioning, continuous aggregates |

@@ -3,6 +3,10 @@
 ## Overview
 Complete implementation checklist for the Empyrean IoT Air Quality Mapping System backend. Each phase builds on the previous one.
 
+> **Status 2026-08-06:** Phases 1–7 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**155 passed**). Phases 8–14 below remain.
+>
+> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–7 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration; DB-probe degrades to SKIP). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (8 tests, phases 1–7).
+
 ---
 
 ## Phase 1: Project Scaffolding & Core Infrastructure
@@ -63,56 +67,56 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 4: MQTT Ingestion Layer
 
-- [ ] **MQTT client module** — `mqtt/client.py` — async MQTT client connecting to Mosquitto broker over TLS
-- [ ] **Payload validation** — `mqtt/validator.py` — Pydantic/JSON schema validation for incoming sensor readings
-- [ ] **Topic handler** — subscribe to `air/node/{id}/reading`, `air/node/{id}/status`
-- [ ] **Reading ingestion flow** — receive MQTT message → validate → dispatch to Celery worker for processing
-- [ ] **Status heartbeat handler** — update `last_seen` in nodes table on status messages
-- [ ] **MQTT config publisher** — `mqtt/config.py` — publish config changes to `air/node/{id}/config`
-- [ ] **TLS certificate handling** — client certificate auth for device connections
-- [ ] **QoS management** — at-least-once delivery with retry logic
+- [x] **MQTT client module** — `mqtt/client.py` — MQTT client connecting to Mosquitto broker over TLS
+- [x] **Payload validation** — `mqtt/validator.py` — Pydantic/JSON schema validation for incoming sensor readings
+- [x] **Topic handler** — subscribe to `air/node/{id}/reading`, `air/node/{id}/status`
+- [x] **Reading ingestion flow** — receive MQTT message → validate → dispatch to Celery worker for processing
+- [x] **Status heartbeat handler** — update `last_seen` in nodes table on status messages
+- [x] **MQTT config publisher** — `mqtt/config.py` — publish config changes to `air/node/{id}/config`
+- [x] **TLS certificate handling** — client certificate auth for device connections
+- [x] **QoS management** — at-least-once delivery with retry logic
 
 ---
 
 ## Phase 5: Sensor Readings API
 
-- [ ] **GET `/api/v1/readings/latest`** — latest reading per node (Redis-cached, TTL 60s)
-- [ ] **GET `/api/v1/readings/history`** — time-bucketed historical readings (`from`, `to`, `node_id`, `bucket` params)
-- [ ] **Redis caching layer** — `api/cache.py` — read-through cache pattern for readings
-- [ ] **DTO schemas** — Pydantic models for request validation and response serialization
-- [ ] **Rate limiting middleware** — Redis-based, 200 req/min per IP, `X-RateLimit-*` headers
+- [x] **GET `/api/v1/readings/latest`** — latest reading per node (Redis-cached, TTL 60s)
+- [x] **GET `/api/v1/readings/history`** — time-bucketed historical readings (`from`, `to`, `node_id`, `bucket` params)
+- [x] **Redis caching layer** — `api/cache.py` — read-through cache pattern for readings
+- [x] **DTO schemas** — Pydantic models for request validation and response serialization
+- [x] **Rate limiting middleware** — Redis-based, 200 req/min per IP, `X-RateLimit-*` headers
 
 ---
 
 ## Phase 6: Tsukamoto Fuzzy Inference Engine
 
-- [ ] **Membership functions** — `fuzzy/membership.py` — triangular/trapezoidal MFs for Temperature, Humidity, PM2.5
-  - Temperature: Low (0–30), Medium (25–35–45), High (40–50)
-  - Humidity: Dry (0–50), Humid (40–60–80), Wet (70–100)
-  - PM2.5: Low (0–50), Medium (40–60–80), High (70–100+)
-- [ ] **Fuzzy rules engine** — `fuzzy/rules.py` — full 27-rule rule base evaluation
-- [ ] **Defuzzification** — `fuzzy/tsukamoto.py` — weighted-average defuzzification: `AQI_crisp = Σ(αᵢ × zᵢ) / Σ(αᵢ)`
-- [ ] **Fuzzy inference pipeline** — compose membership → rules → defuzzification into single call
-- [ ] **Unit tests** — `tests/test_fuzzy.py` — edge cases, boundary conditions, known output validation
+- [x] **Membership functions** — `fuzzy/membership.py` — triangular/trapezoidal MFs for Temperature, Humidity, PM2.5
+  - Temperature: Low (peak 20, support [0–30]), Medium (25–35–45), High (ramp 40→50)
+  - Humidity: Dry (shoulder [0–25]), Humid (40–60–80), Wet (ramp 60→80)
+  - PM2.5: Low (shoulder [0–25]), Medium (40–60–80), High (ramp 70→90)
+- [x] **Fuzzy rules engine** — `fuzzy/rules.py` — full 27-rule rule base evaluation
+- [x] **Defuzzification** — `fuzzy/tsukamoto.py` — weighted-average defuzzification: `AQI_crisp = Σ(αᵢ × zᵢ) / Σ(αᵢ)`
+- [x] **Fuzzy inference pipeline** — compose membership → rules → defuzzification into single call
+- [x] **Unit tests** — `tests/test_fuzzy.py` — edge cases, boundary conditions, known output validation
 
 ---
 
 ## Phase 7: Celery Tasks (Async Processing)
 
 ### Fuzzy Inference & Enrichment
-- [ ] **Process reading task** — consume raw sensor reading, run fuzzy inference, compute AQI, detect anomalies
-- [ ] **AQI computation** — EPA AQI from PM2.5/PM10 (standard breakpoints)
-- [ ] **Anomaly detection** — Z-score based anomaly flagging
+- [x] **Process reading task** — consume raw sensor reading, run fuzzy inference, compute AQI, detect anomalies
+- [x] **AQI computation** — EPA AQI from PM2.5/PM10 (standard breakpoints)
+- [x] **Anomaly detection** — Z-score based anomaly flagging
 
 ### Scheduled Tasks (Celery Beat)
-- [ ] **Hourly aggregation** — compute `hourly_agg` continuous aggregate refresh
-- [ ] **Alert threshold check** — every 60s, check AQI against thresholds, create alert records on breach
-- [ ] **Forecast model retraining** — hourly retrain of linear regression model
-- [ ] **Data retention cleanup** — enforce 1-year retention policy
+- [x] **Hourly aggregation** — compute `hourly_agg` via UPSERT of the last complete hour (regular table for now)
+- [x] **Alert threshold check** — every 60s, check AQI against thresholds, create alert records on breach
+- [x] **Forecast model retraining** — hourly retrain of linear regression model
+- [x] **Data retention cleanup** — enforce 1-year retention policy
 
 ### Forecast
-- [ ] **Forecast generation task** — linear regression/ARIMA for next-60-minute AQI prediction
-- [ ] **GET `/api/v1/forecast`** — API endpoint for forecast data (Redis-cached, TTL 1h)
+- [x] **Forecast generation task** — linear regression for next-60-minute AQI prediction
+- [x] **GET `/api/v1/forecast`** — API endpoint for forecast data (Redis-cached, TTL 1h)
 
 ---
 
@@ -200,12 +204,13 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 |-----------|-------------|------------|
 | **M1: Foundation** | Project scaffolding, config, DB config, models, migrations ✅ | — |
 | **M2: Auth** | Registration, login, JWT, profile management ✅ | M1 |
-| **M3: Ingestion** | MQTT consumer, payload validation, reading intake | M1 |
-| **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation | M2, M3 |
-| **M5: API Layer** | Readings, nodes, alerts, forecast, export endpoints | M2, M4 |
+| **M3: Ingestion** | MQTT consumer, payload validation, reading intake ✅ | M1 |
+| **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation ✅ | M2, M3 |
+| **M5: API Layer** | Readings + forecast live; nodes, alerts, export pending | M2, M4 |
 | **M6: Real-time** | WebSocket alert broadcasting | M5 |
 | **M7: Admin & Ops** | Admin endpoints, health monitoring | M5 |
 | **M8: Hardening** | Tests, error handling, production deployment | M1–M7 |
+| **M8.1 (2026-08-06)** | Known-issues backlog resolved (C/H/M/L/N tiers) ✅ · `pytest -q` = 155 passed · temp phase smoke `scripts/smoke_phases.py` · Phase 13 exhaustive testing deferred | M1–M7 |
 
 ---
 
