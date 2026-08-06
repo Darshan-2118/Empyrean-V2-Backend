@@ -280,7 +280,11 @@ def test_register_login_refresh_logout_rotation():
 
 
 def test_auth_error_contract():
-    """Validation errors are RFC 7807 problem+json with the right status."""
+    """Validation errors are RFC 7807 problem+json with the right status.
+
+    A missing body 400s, but a well-formed empty ``{}`` object falls through to
+    schema validation and 422s (it is not a "missing body").
+    """
 
     async def scenario():
         app = create_app()
@@ -319,6 +323,11 @@ def test_auth_error_contract():
             # missing body → 400
             missing = await client.post(f"{API}/auth/login", json=None)
             assert missing.status_code == 400
+
+            # empty {} body → 422 (schema validation, NOT a 400 missing body)
+            empty_obj = await client.post(f"{API}/auth/login", json={})
+            assert empty_obj.status_code == 422
+            assert (await empty_obj.get_json())["status"] == 422
 
     _run(scenario())
 
@@ -387,6 +396,97 @@ def test_profile_lifecycle_and_change_password():
             assert deleted.status_code == 200
             gone = await client.get(f"{API}/profile", headers=headers)
             assert gone.status_code == 401
+
+    _run(scenario())
+
+
+def test_empty_patch_body_is_noop_and_change_password_empty_422():
+    """Empty PATCH {} is a 200 no-op; empty change-password {} is a 422.
+
+    A ``{}`` PATCH body supplies no fields, so it is a valid no-op that returns
+    the unchanged profile with a 200 (not a 400) — only fields actually
+    supplied in the request are applied. A ``{}`` change-password body is
+    missing the required current/new password fields, so it fails schema
+    validation with 422.
+    """
+
+    async def scenario():
+        app = create_app()
+        username = _unique("empty")
+        _CREATED_USERNAMES.add(username)
+        password = "start-pass"
+        async with app.test_client() as client:
+            reg = await client.post(
+                f"{API}/auth/register",
+                json={"username": username, "email": f"{username}@example.com", "password": password},
+            )
+            assert reg.status_code == 201
+            token = (await reg.get_json())["access_token"]
+            headers = _auth_headers(token)
+
+            # PATCH {} → 200 no-op: profile unchanged
+            patched = await client.patch(f"{API}/profile", json={}, headers=headers)
+            assert patched.status_code == 200
+            body = await patched.get_json()
+            assert body["username"] == username
+            assert body["email"] == f"{username}@example.com"
+
+            # change-password {} → 422 (required fields missing), problem+json
+            empty = await client.post(
+                f"{API}/profile/change-password", json={}, headers=headers
+            )
+            assert empty.status_code == 422
+            assert (await empty.get_json())["status"] == 422
+            assert "application/problem+json" in empty.headers.get("Content-Type", "")
+
+    _run(scenario())
+
+
+def test_change_password_revokes_all_refresh_tokens():
+    """A password change invalidates every outstanding refresh token.
+
+    register auto-logs-in (issuing refresh token A) and a second login issues a
+    second live refresh token B. After change-password both A and B must be
+    rejected by /auth/refresh with 401 — a prior session must not outlive the
+    new credentials.
+    """
+
+    async def scenario():
+        app = create_app()
+        username = _unique("revo")
+        _CREATED_USERNAMES.add(username)
+        password = "old-pass"
+        async with app.test_client() as client:
+            reg = await client.post(
+                f"{API}/auth/register",
+                json={"username": username, "email": f"{username}@example.com", "password": password},
+            )
+            assert reg.status_code == 201
+            reg_body = await reg.get_json()
+            access, refresh_a = reg_body["access_token"], reg_body["refresh_token"]
+
+            # second login → a second, still-live refresh token
+            login = await client.post(
+                f"{API}/auth/login", json={"username": username, "password": password}
+            )
+            assert login.status_code == 201
+            refresh_b = (await login.get_json())["refresh_token"]
+
+            # change password using the access token from register
+            change = await client.post(
+                f"{API}/profile/change-password",
+                json={"current_password": password, "new_password": "new-pass-1"},
+                headers=_auth_headers(access),
+            )
+            assert change.status_code == 200
+
+            # both pre-change refresh tokens are now revoked → 401
+            for old_token in (refresh_a, refresh_b):
+                resp = await client.post(
+                    f"{API}/auth/refresh", json={"refresh_token": old_token}
+                )
+                assert resp.status_code == 401
+                assert (await resp.get_json())["title"] == "Unauthorized"
 
     _run(scenario())
 
@@ -818,6 +918,41 @@ def test_refresh_token_length_capped():
         RefreshRequest(refresh_token="x" * 257)
 
 
+def test_padded_username_is_rejected():
+    """A whitespace-padded short username must not slip past min_length=3.
+
+    The schema normalises (strips) usernames in a ``mode="before"`` validator
+    so the 3-char minimum applies to the *stripped* value: ``"  a  "`` →
+    ``"a"`` and ``" ab "`` → ``"ab"`` are both rejected (422). A padded name
+    that still has >=3 real characters (``"  abc  "`` → ``"abc"``) registers
+    normally — sanity check that ordinary usernames still work.
+    """
+
+    async def scenario():
+        app = create_app()
+        async with app.test_client() as client:
+            # short after stripping → 422
+            for padded in ("  a  ", " ab "):
+                resp = await client.post(
+                    f"{API}/auth/register",
+                    json={"username": padded, "email": "pad@example.com", "password": "pass-123"},
+                )
+                assert resp.status_code == 422
+                assert (await resp.get_json())["status"] == 422
+
+            # >=3 real chars after stripping → 201, and the stored username is
+            # the stripped value
+            base = _unique("pad")
+            ok = await client.post(
+                f"{API}/auth/register",
+                json={"username": f"  {base}  ", "email": f"{base}@example.com", "password": "pass-123"},
+            )
+            assert ok.status_code == 201
+            assert (await ok.get_json())["user"]["username"] == base
+
+    _run(scenario())
+
+
 # ── Misc status contract (M-16) ────────────────────────────────────────────────
 
 
@@ -850,7 +985,11 @@ def test_create_app_registers_no_static_route():
 
 
 def test_request_body_size_capped():
-    """M-13: an oversized request body is rejected with 413."""
+    """M-13: an oversized request body is rejected with 413 problem+json.
+
+    The 64 KB ``MAX_CONTENT_LENGTH`` cap must return RFC 7807 with
+    ``Content-Type: application/problem+json`` — not a bare status code.
+    """
 
     async def scenario():
         app = create_app()
@@ -858,5 +997,114 @@ def test_request_body_size_capped():
             big = {"username": "x", "password": "p" + "a" * 70_000}
             resp = await client.post(f"{API}/auth/login", json=big)
             assert resp.status_code == 413
+            body = await resp.get_json()
+            assert body["status"] == 413 and body["title"] == "Request Entity Too Large"
+            assert "application/problem+json" in resp.headers.get("Content-Type", "")
 
+    _run(scenario())
+
+
+# ── Cache invalidation helper (Phase 8) ────────────────────────────────────────
+
+
+def test_cache_delete_fails_open_when_redis_down():
+    """cache_delete is a no-op (doesn't raise) when Redis client is None."""
+    from api.cache import cache_delete
+    # _fast_redis_down autouse fixture has already patched api.cache.get_client
+    # to return None, so this exercises the documented degrade path.
+    import asyncio
+
+    async def scenario():
+        await cache_delete("nodes:the")
+
+    asyncio.run(scenario())  # must not raise
+
+
+# ── Nodes API (Phase 8) ───────────────────────────────────────────────────────
+
+def test_nodes_list_returns_nodes():
+    async def scenario():
+        from models.base import AsyncSessionLocal
+        user = await _create_user(_unique("nuser"))
+        node_id = _unique("NODE") + "-LST"
+        _CREATED_NODE_IDS.add(node_id)
+        async with AsyncSessionLocal() as session:
+            session.add(Node(node_id=node_id, name="Listed", location_name="Lab", reading_interval=30, is_active=True))
+            await session.commit()
+
+        app = create_app()
+        async with app.test_client() as client:
+            resp = await client.get(f"{API}/nodes", headers=_auth_headers(create_access_token(user.id, "user")))
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert any(n["node_id"] == node_id and n["name"] == "Listed" for n in body["nodes"])
+    _run(scenario())
+
+
+def test_nodes_register_duplicate_returns_409():
+    async def scenario():
+        user = await _create_user(_unique("nuser"))
+        node_id = _unique("NODE") + "-DUP"
+        _CREATED_NODE_IDS.add(node_id)
+        app = create_app()
+        headers = _auth_headers(create_access_token(user.id, "user"))
+        payload = {"node_id": node_id, "name": "Dup", "reading_interval": 60}
+        async with app.test_client() as client:
+            assert (await client.post(f"{API}/nodes", headers=headers, json=payload)).status_code == 201
+            resp = await client.post(f"{API}/nodes", headers=headers, json=payload)
+            assert resp.status_code == 409
+    _run(scenario())
+
+
+def test_nodes_patch_requires_admin():
+    async def scenario():
+        from models.base import AsyncSessionLocal
+        admin = await _create_user(_unique("nadmin"), role="admin")
+        user = await _create_user(_unique("nuser"))
+        node_id = _unique("NODE") + "-P"
+        _CREATED_NODE_IDS.add(node_id)
+        async with AsyncSessionLocal() as session:
+            session.add(Node(node_id=node_id, name="Before", reading_interval=30, is_active=True))
+            await session.commit()
+        app = create_app()
+        async with app.test_client() as client:
+            r = await client.patch(f"{API}/nodes/{node_id}", headers=_auth_headers(create_access_token(user.id, "user")), json={"name": "Hacked"})
+            assert r.status_code == 403
+            r = await client.patch(f"{API}/nodes/{node_id}", headers=_auth_headers(create_access_token(admin.id, "admin")), json={"name": "Admin"})
+            assert r.status_code == 200
+            assert (await r.get_json())["name"] == "Admin"
+    _run(scenario())
+
+
+def test_nodes_patch_unknown_node_404():
+    async def scenario():
+        admin = await _create_user(_unique("nadmin"), role="admin")
+        app = create_app()
+        headers = _auth_headers(create_access_token(admin.id, "admin"))
+        async with app.test_client() as client:
+            resp = await client.patch(f"{API}/nodes/NOPE-{_unique('N')}", headers=headers, json={"name": "x"})
+            assert resp.status_code == 404
+    _run(scenario())
+
+
+def test_nodes_patch_mqtt_push_fails_open():
+    async def scenario():
+        from models.base import AsyncSessionLocal
+        admin = await _create_user(_unique("nadmin"), role="admin")
+        node_id = _unique("NODE") + "-FO"
+        _CREATED_NODE_IDS.add(node_id)
+        async with AsyncSessionLocal() as session:
+            session.add(Node(node_id=node_id, name="X", reading_interval=30, is_active=True))
+            await session.commit()
+        app = create_app()
+        headers = _auth_headers(create_access_token(admin.id, "admin"))
+        async with app.test_client() as client:
+            resp = await client.patch(f"{API}/nodes/{node_id}", headers=headers, json={"reading_interval": 120})
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["reading_interval"] == 120
+            assert body["config_pushed"] is False
+        async with AsyncSessionLocal() as session:
+            persisted = await session.get(Node, node_id)
+            assert persisted.reading_interval == 120
     _run(scenario())

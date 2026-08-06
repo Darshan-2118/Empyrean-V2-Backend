@@ -27,8 +27,22 @@ MAX_PASSWORD_LEN = 72
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
-def _normalise_username(v: str) -> str:
-    """Strip surrounding whitespace and reject usernames with illegal chars."""
+def _normalise_username(v: object) -> object:
+    """Normalise a raw username before the schema constraints run.
+
+    Called from ``mode="before"`` validators so the ``min_length`` /
+    ``max_length`` constraints see the *normalised* value — otherwise padding
+    like ``"  a  "`` passes the raw ``min_length=3`` check and is then stripped
+    to a 1-char username here, bypassing the documented minimum. ``v`` is the
+    raw input and may be any type: non-strings are returned unchanged so
+    pydantic's core ``str`` validation rejects them with its standard error
+    (never call ``.strip()`` on a non-string). Strings are stripped of
+    surrounding whitespace and rejected if they contain illegal characters.
+    """
+    if not isinstance(v, str):
+        # Non-string input: let pydantic's core str validation produce its
+        # standard error rather than raising AttributeError from .strip().
+        return v
     v = v.strip()
     if not _USERNAME_RE.fullmatch(v):
         raise ValueError(
@@ -66,9 +80,12 @@ class RegisterRequest(BaseModel):
         description="Plain-text password",
     )
 
-    @field_validator("username")
+    @field_validator("username", mode="before")
     @classmethod
-    def _strip_username(cls, v: str) -> str:
+    def _strip_username(cls, v: object) -> object:
+        # mode="before" so min_length/max_length see the normalised value —
+        # padding like "  a  " must not pass the 3-char minimum and then be
+        # stripped to a 1-char username here.
         return _normalise_username(v)
 
     @field_validator("email")
@@ -139,10 +156,14 @@ class UpdateProfileRequest(BaseModel):
     email: EmailStr | None = Field(None, max_length=255)
     notification_prefs: dict | None = None
 
-    @field_validator("username")
+    @field_validator("username", mode="before")
     @classmethod
-    def _strip_username(cls, v: str | None) -> str | None:
-        return _normalise_username(v) if v is not None else None
+    def _strip_username(cls, v: object) -> object:
+        # mode="before" so min_length/max_length see the normalised value —
+        # padding like "  a  " must not pass the 3-char minimum and then be
+        # stripped to a 1-char username here. ``None`` (the optional-username
+        # default) flows straight through _normalise_username unchanged.
+        return _normalise_username(v)
 
     @field_validator("email")
     @classmethod
@@ -235,3 +256,61 @@ class ForecastResponse(BaseModel):
     node_id: str
     horizon_minutes: int
     points: list[ForecastPoint]
+
+
+# ── Node schemas ──────────────────────────────────────────────────────────────
+
+
+class NodeResponse(BaseModel):
+    """One sensor node's metadata (GET /nodes)."""
+
+    node_id: str
+    name: str | None = None
+    location_name: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    firmware_version: str | None = None
+    reading_interval: int
+    is_active: bool = True
+    registered_at: datetime
+    last_seen: datetime | None = None
+
+    @field_serializer("registered_at", "last_seen")
+    def _iso_datetime(self, value: datetime | None) -> str | None:
+        return value.isoformat().replace("+00:00", "Z") if value else None
+
+
+class RegisterNodeRequest(BaseModel):
+    """Body for POST /nodes (self-service registration)."""
+
+    node_id: str = Field(..., min_length=1, max_length=50)
+    name: str | None = Field(None, max_length=100)
+    location_name: str | None = Field(None, max_length=200)
+    lat: float | None = None
+    lon: float | None = None
+    firmware_version: str | None = Field(None, max_length=50)
+    reading_interval: int = Field(30, ge=1, le=86400)
+
+    @field_validator("node_id")
+    @classmethod
+    def _node_id_safe(cls, v: str) -> str:
+        import re
+        # Mirror of mqtt/config._NODE_ID_RE: a crafted id must not be able to
+        # inject MQTT path segments or wildcards.
+        if not re.fullmatch(r"^[A-Za-z0-9_-]{1,50}$", v):
+            raise ValueError(
+                "node_id may contain only letters, digits, '_', '-' (1-50 chars)"
+            )
+        return v
+
+
+class UpdateNodeRequest(BaseModel):
+    """Body for PATCH /nodes/:node_id (admin re-configuration; all optional)."""
+
+    name: str | None = Field(None, max_length=100)
+    location_name: str | None = Field(None, max_length=200)
+    lat: float | None = None
+    lon: float | None = None
+    firmware_version: str | None = Field(None, max_length=50)
+    reading_interval: int | None = Field(None, ge=1, le=86400)
+    is_active: bool | None = None

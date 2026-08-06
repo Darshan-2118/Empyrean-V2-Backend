@@ -7,13 +7,19 @@ a fresh bucket per request (bypass) and burn a victim's bucket (DoS).
 Quart derives ``remote_addr`` from the ``Remote-Addr`` header set by the trusted
 ASGI transport/proxy layer; the test simulates that trusted value and a spoofed
 XFF header side-by-side.
+
+The Redis key itself is also scoped per endpoint (``ratelimit:{endpoint}:{ip}:
+{minute}``), so one route cannot exhaust the whole per-IP allowance — that
+key-builder contract is asserted here too.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 from quart import Quart, request
 
-from api.rate_limit import _client_ip, _incr
+from app import create_app
+from api.rate_limit import _client_ip, _incr, _rate_limit_key
 
 app = Quart(__name__)
 
@@ -97,3 +103,31 @@ def test_incr_fails_open_when_eval_raises():
         assert result is None
 
     asyncio.run(scenario())
+
+
+# ── H-5 · Redis key is scoped per endpoint, not just per IP+minute ─────────────
+
+
+def test_rate_limit_key_includes_endpoint_scope():
+    """H-5: the key is ``ratelimit:{endpoint}:{ip}:{minute}``.
+
+    Scoping by the matched Quart route keeps each endpoint's bucket
+    independent, so one hot route cannot exhaust the whole per-IP allowance.
+    ``request.endpoint`` is ``auth.login`` for POST /api/v1/auth/login; a
+    request that matches no route falls back to a stable ``default`` scope.
+    """
+    minute = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+
+    async def check():
+        app = create_app()
+        # A real matched route → endpoint-scoped key.
+        async with app.test_request_context("/api/v1/auth/login", method="POST"):
+            key = _rate_limit_key("192.0.2.10", minute)
+            assert key == "ratelimit:auth.login:192.0.2.10:202608061200"
+
+        # Unmatched path → stable "default" scope (no crash on missing endpoint).
+        async with app.test_request_context("/no-such-route"):
+            key = _rate_limit_key("192.0.2.10", minute)
+            assert key == "ratelimit:default:192.0.2.10:202608061200"
+
+    asyncio.run(check())

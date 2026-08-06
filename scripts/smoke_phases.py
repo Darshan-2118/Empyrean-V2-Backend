@@ -1,7 +1,7 @@
 """
-Temporary phase 1–7 smoke script (health + working).
+Temporary phase 1–8 smoke script (health + working).
 
-Runs a quick liveness check for each completed phase (1–7) of the Empyrean
+Runs a quick liveness check for each completed phase (1–8) of the Empyrean
 backend. Lightweight by design: it exercises imports, the app factory, the
 blueprint/route map, the core pure-logic entry points (fuzzy inference, MQTT
 payload validation + topic-authoritative dispatch with a stubbed broker, JWT
@@ -193,6 +193,44 @@ def phase_7_celery_tasks() -> tuple[list[str], str]:
         return [f"celery check failed: {exc}"], ""
 
 
+def phase_8_nodes_api() -> tuple[list[str], str]:
+    """Nodes API: routes wired; registry + cache_delete + Node DTOs live."""
+    problems: list[str] = []
+    try:
+        from app import create_app
+
+        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        for fragment in ("/api/v1/nodes",):
+            if not any(fragment in r for r in rules):
+                problems.append(f"missing route containing {fragment!r}")
+
+        # mqtt/registry round-trip (broker client holder, Task 1).
+        from mqtt.registry import get_client, set_client
+
+        set_client("dummy-client")
+        if get_client() != "dummy-client":
+            problems.append("registry set/get round-trip failed")
+        set_client(None)
+
+        # cache_delete importable (Task 2).
+        from api.cache import cache_delete  # noqa: F401
+
+        # Node schemas serialize the ISO-8601 trailing-Z contract (Task 3).
+        from datetime import datetime, timezone
+
+        from api.schemas import NodeResponse
+
+        dumped = NodeResponse(
+            node_id="N-1", reading_interval=30, is_active=True,
+            registered_at=datetime.now(timezone.utc), last_seen=None,
+        ).model_dump()
+        if not dumped["registered_at"].endswith("Z") or dumped["last_seen"] is not None:
+            problems.append("NodeResponse datetime serialization is not ISO-Z")
+        return problems, "routes wired | registry + cache_delete + schemas OK"
+    except Exception as exc:  # noqa: BLE001
+        return [f"nodes check failed: {exc}"], ""
+
+
 _PHASES = [
     (1, "Scaffolding & app factory", phase_1_scaffolding),
     (2, "Database models", phase_2_database_models),
@@ -201,11 +239,12 @@ _PHASES = [
     (5, "Readings API", phase_5_readings_api),
     (6, "Fuzzy inference engine", phase_6_fuzzy_engine),
     (7, "Celery tasks", phase_7_celery_tasks),
+    (8, "Nodes API", phase_8_nodes_api),
 ]
 
 
 def main() -> bool:
-    print("Empyrean phase 1-7 smoke (TEMPORARY - replaced by the full script in a later stage)")
+    print("Empyrean phase 1-8 smoke (TEMPORARY - replaced by the full script in a later stage)")
     print("=" * 66)
     all_ok = True
     for number, name, fn in _PHASES:

@@ -4,15 +4,13 @@ Base URL: `/api/v1`
 
 REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
-Request/response field tables are documented inline above.
-
 ---
 
 ## Endpoint Overview
 
 In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `Admin` = valid JWT with `role = "admin"` required.
 
-> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/forecast`, and `/health` are implemented (phases 1–3 + Phase 5 + Phase 7). The endpoint groups below (nodes, alerts, export, admin) are planned for later phases and currently return 404.
+> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/forecast`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–8). The endpoint groups below (alerts, export, admin) are planned for later phases and currently return 404.
 
 ### Authentication
 
@@ -32,12 +30,17 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 
 ### Nodes
 
+> **Live since Phase 8.** `PATCH` pushes the reading interval to the device via MQTT (fail-open — a broker outage does not fail the update). `POST` and `PATCH` both invalidate the Redis `nodes:all` cache so the served list is never stale past a mutation; `PATCH` also drops `readings:latest` when `is_active` changes.
+
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/nodes` | GET | Yes | All registered nodes with metadata. Redis-cached, TTL 300s. |
-| `/nodes/:node_id` | PATCH | Admin | Update name, location, reading interval, or active status (pushes config to device via MQTT) |
+| `/nodes` | POST | Yes | Self-service registration of a new sensor node (any authenticated user). Invalidates the `nodes:all` cache. |
+| `/nodes/:node_id` | PATCH | Admin | Update name, location, reading interval, or active status (pushes config to device via MQTT). Invalidates the `nodes:all` cache. |
 
 ### Alerts
+
+> **Not implemented yet** — these endpoints return `404` until a later phase.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -51,6 +54,8 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 | `/forecast` | GET | Yes | Next-60-minute AQI prediction (linear regression, retrained hourly, cached 1h) |
 
 ### Export
+
+> **Not implemented yet** — this endpoint returns `404` until a later phase.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -66,6 +71,8 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 | `/profile` | DELETE | Yes | Delete own account |
 
 ### Admin
+
+> **Not implemented yet** — these endpoints return `404` until a later phase.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -215,6 +222,25 @@ Authorization: Bearer <access_token>
 1. Call `POST /auth/refresh` with the stored refresh token
 2. On success, retry the original request with the new access token
 3. On failure (`401`), force logout
+
+---
+
+## Request validation
+
+All request fields are validated server-side; a failed validation returns `422` (RFC 7807 problem+json).
+
+| Field | Endpoints | Rule |
+|---|---|---|
+| `username` | register, PATCH `/profile` | 3–50 chars, letters / digits / `_` only. Surrounding whitespace is stripped **before** the length check, so `"  a  "` fails the 3-char minimum. |
+| `email` | register, PATCH `/profile` | valid email address, ≤255 chars, stored lowercase. |
+| `password` | register, `change-password` | 6–72 **bytes** UTF-8 (bcrypt limit — multi-byte characters count by byte, not by character). |
+| `current_password` / `new_password` | `change-password` | both required; `new_password` must satisfy the password rule above. |
+| `refresh_token` | `refresh`, `logout` | required opaque token string. |
+| `notification_prefs` | PATCH `/profile` | free-form JSON object, stored and echoed back verbatim. |
+
+JSON request bodies must set `Content-Type: application/json`.
+
+> **Note:** `login` and `register` return **`201 Created`**, not `200`. Treat any `2xx` as success rather than asserting `200`.
 
 ---
 
@@ -460,6 +486,7 @@ All errors follow RFC 7807:
 | `403` | Forbidden (admin-only route) |
 | `404` | Resource not found |
 | `409` | Conflict (duplicate username/email) |
+| `413` | Request Entity Too Large (request body exceeds 64 KB) — `application/problem+json` |
 | `422` | Validation error (invalid field values) |
 | `429` | Rate limited |
 | `500` | Internal server error |
@@ -477,11 +504,28 @@ Credentials are supported (for `Authorization` headers).
 
 ## Rate Limiting
 
-Redis-backed fixed-window rate limiting is enforced on the readings endpoints (Phase 5): **200 requests/minute per IP**. The window is keyed on the client IP (`X-Forwarded-For` first entry, else `remote_addr`) plus the current UTC minute.
+Redis-backed fixed-window rate limiting is applied **per endpoint**, so each endpoint has its own per-IP budget and one endpoint cannot exhaust another's. The window key is the **trusted remote address** (`request.remote_addr` only — a client-supplied `X-Forwarded-For` first entry is never trusted, H-5 hardening) plus the current UTC minute plus the endpoint scope: `ratelimit:{endpoint}:{ip}:{minute}` (e.g. `ratelimit:readings.latest:192.0.2.10:202608051530`).
+
+| Endpoint(s) | Cap (requests/minute/IP) |
+|---|---|
+| `POST /auth/register` | **5** |
+| `POST /auth/login` | **10** |
+| `POST /auth/refresh` | **10** |
+| `POST /auth/logout` | **10** |
+| `GET /readings/latest` | 200 |
+| `GET /readings/history` | 200 |
+| `GET /forecast` | 200 |
+| `GET /nodes` | 200 |
+| `POST /nodes` | 200 |
+| `PATCH /nodes/:node_id` | 200 |
+
+`/profile/*` (GET/PATCH/change-password/DELETE) is **not** rate-limited. The JWT **authentication** endpoints — `register`, `login`, `refresh`, `logout` — **are** rate-limited; the caps in the table above apply to them.
+
+> Auth caps are deliberately tight (brute-force defence) — a frontend that retries login more than 10×/min (or refresh on every tab focus) will be answered `429`.
 
 Every response from a rate-limited endpoint carries:
 
-- `X-RateLimit-Limit` — the window limit (200)
+- `X-RateLimit-Limit` — the window cap for that endpoint
 - `X-RateLimit-Remaining` — requests left in the current window
 - `X-RateLimit-Reset` — Unix epoch seconds when the window resets
 

@@ -12,7 +12,8 @@ Key             TTL   Value
 =============== ===== =================================================
 ``readings:latest``       60s  JSON array of ``LatestReading`` objects
 ``readings:latest:{node_id}``  60s  Latest enriched reading for one node
-``ratelimit:{ip}:{minute}``    60s  Request count (int) — see api/rate_limit.py
+``nodes:all``             300s  JSON array of ``NodeResponse`` objects
+``ratelimit:{endpoint}:{ip}:{minute}``  60s  Request count (int) — see api/rate_limit.py
 ``celery:forecast:{node_id}`` 3600s  AQI forecast JSON array — tasks side
 =============== ===== =================================================
 
@@ -98,3 +99,14 @@ async def cache_set_json(key: str, obj: Any, ttl: int) -> None:
         logger.warning("Cannot JSON-serialize value for %r — skipping write", key)
         return
     await cache_set(key, payload, ttl)
+
+
+async def cache_delete(key: str) -> None:
+    """Delete ``key`` from Redis (best-effort; no-op if Redis is down)."""
+    client = get_client()
+    if client is None:
+        return
+    try:
+        await client.delete(key)
+    except Exception:
+        logger.warning("Redis DEL failed for %r — skipping invalidation", key)
