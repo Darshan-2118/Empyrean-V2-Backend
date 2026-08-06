@@ -3,17 +3,12 @@ Empyrean database models.
 
 Usage::
 
-    from models import Base, User, get_db
+    from models import Base, User
 """
 
 # Re-export the base so callers can do ``from models import Base``
 from models.base import (
     Base,
-    DatabaseError,
-    DuplicateError,
-    NotFoundError,
-    async_db_session,
-    get_db,
     get_sync_db,
 )
 
@@ -36,10 +31,5 @@ __all__ = [
     "HourlyAgg",
     "Alert",
     "SystemSetting",
-    "DatabaseError",
-    "DuplicateError",
-    "NotFoundError",
-    "get_db",
     "get_sync_db",
-    "async_db_session",
 ]

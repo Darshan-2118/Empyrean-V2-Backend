@@ -99,6 +99,49 @@ def hash_refresh_token(raw_token: str) -> str:
 # ── Decorators ─────────────────────────────────────────────────────────────────
 
 
+async def _authenticate_user() -> tuple[Any | None, Any | None]:
+    """Authenticate from the ``Authorization`` header, returning ``(user, error)``.
+
+    On success returns ``(User, None)`` where ``User`` is the active DB row;
+    on failure returns ``(None, problem_response)`` where ``problem_response``
+    is a ready-to-return RFC 7807 ``(body, status, headers)`` tuple. Shared by
+    ``jwt_required`` and ``admin_required`` so both decorators are
+    order-independent (M-11).
+    """
+    auth = request.headers.get("Authorization", "")
+    # RFC 7235 auth-scheme names are case-insensitive, so accept "bearer " too
+    # (L-30).
+    if not auth.lower().startswith("bearer "):
+        return None, _problem_json(
+            401, "Unauthorized", "Missing or malformed Authorization header"
+        )
+
+    token = auth[7:].strip()
+    try:
+        payload = decode_access_token(token)
+    except pyjwt.ExpiredSignatureError:
+        logger.warning("Rejected expired access token")
+        return None, _problem_json(401, "Token expired", "Access token has expired")
+    except pyjwt.InvalidTokenError:
+        logger.warning("Rejected invalid access token")
+        return None, _problem_json(401, "Invalid token", "Access token is not valid")
+
+    user_id: int = payload.get("sub")
+
+    from models.base import AsyncSessionLocal
+    from models.user import User
+
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        if user is None or not user.is_active:
+            # Return the same generic detail as an invalid token so a caller
+            # cannot learn whether the account was deactivated (N-11; L-26 class).
+            return None, _problem_json(
+                401, "Unauthorized", "Access token is not valid"
+            )
+        return user, None
+
+
 def jwt_required(f: Callable) -> Callable:
     """Require a valid JWT access token.
 
@@ -107,35 +150,10 @@ def jwt_required(f: Callable) -> Callable:
 
     @wraps(f)
     async def decorated(*args: Any, **kwargs: Any) -> Any:
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return _problem_json(
-                401, "Unauthorized", "Missing or malformed Authorization header"
-            )
-
-        token = auth.removeprefix("Bearer ").strip()
-        try:
-            payload = decode_access_token(token)
-        except pyjwt.ExpiredSignatureError:
-            logger.warning("Rejected expired access token")
-            return _problem_json(401, "Token expired", "Access token has expired")
-        except pyjwt.InvalidTokenError:
-            logger.warning("Rejected invalid access token")
-            return _problem_json(401, "Invalid token", "Access token is not valid")
-
-        user_id: int = payload.get("sub")
-
-        from models.base import AsyncSessionLocal
-        from models.user import User
-
-        async with AsyncSessionLocal() as session:
-            user = await session.get(User, user_id)
-            if user is None or not user.is_active:
-                return _problem_json(
-                    401, "Unauthorized", "User not found or deactivated"
-                )
-            g.current_user = user
-
+        user, error = await _authenticate_user()
+        if error is not None:
+            return error
+        g.current_user = user
         return await f(*args, **kwargs)
 
     return decorated
@@ -144,16 +162,22 @@ def jwt_required(f: Callable) -> Callable:
 def admin_required(f: Callable) -> Callable:
     """Require a valid JWT with ``role == 'admin'``.
 
-    Reads ``g.current_user`` (populated by ``@jwt_required``). This is
-    independent of decorator stacking order: an unauthenticated request
-    gets 401, a non-admin user gets 403.
+    Order-independent with ``@jwt_required`` (M-11): if stacked below it,
+    ``g.current_user`` is already populated and we just check the role; if
+    stacked above it (``@admin_required`` over ``@jwt_required``), this
+    decorator authenticates the request itself before the role check, so it no
+    longer depends on ``@jwt_required`` running first. An unauthenticated
+    request gets 401, a non-admin user gets 403.
     """
 
     @wraps(f)
     async def decorated(*args: Any, **kwargs: Any) -> Any:
         user = getattr(g, "current_user", None)
         if user is None:
-            return _problem_json(401, "Unauthorized", "Authentication is required")
+            user, error = await _authenticate_user()
+            if error is not None:
+                return error
+            g.current_user = user
         if user.role != "admin":
             return _problem_json(403, "Forbidden", "Admin privileges are required")
         return await f(*args, **kwargs)

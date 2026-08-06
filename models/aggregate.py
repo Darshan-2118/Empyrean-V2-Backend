@@ -1,9 +1,11 @@
 """
 HourlyAgg model — pre-computed hourly summaries per node.
 
-Currently a regular materialized view.  Will become a TimescaleDB
-continuous aggregate once the extension is installed, at which point
-it will auto-refresh every hour.
+This is a regular PostgreSQL table, filled by the Celery aggregation task
+(``tasks/aggregation.py``) each hour.  It is *not* a materialized view and is
+*not* yet a TimescaleDB continuous aggregate.  Whether to migrate it to a
+continuous aggregate (the extension is already installed by migration
+``b2bab23ab3c0``) is a future decision and is not currently planned.
 """
 
 from datetime import datetime
@@ -34,10 +36,10 @@ class HourlyAgg(Base):
     min_aqi: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     avg_aqi: Mapped[float | None] = mapped_column(REAL, nullable=True)
     anomaly_count: Mapped[int] = mapped_column(
-        Integer, default=0, nullable=False,
+        Integer, default=0, nullable=False, server_default="0",
     )
     reading_count: Mapped[int] = mapped_column(
-        Integer, default=0, nullable=False,
+        Integer, default=0, nullable=False, server_default="0",
     )
 
     # ── Constraints ───────────────────────────────────────────────────────

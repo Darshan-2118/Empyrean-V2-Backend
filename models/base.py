@@ -5,15 +5,12 @@ Provides:
 - ``Base`` — declarative base with a standard naming convention
 - ``AsyncEngine`` / ``SyncEngine`` — pre-configured engines (read from app config)
 - ``AsyncSessionLocal`` / ``SyncSessionLocal`` — session factories
-- ``async_db_session()`` — async context manager that commits/rolls back sessions
-- ``get_db()`` — async generator for FastAPI/Quart dependency injection
 - ``get_sync_db()`` — sync context manager for Celery tasks
-- Custom exceptions: ``DatabaseError``, ``NotFoundError``, ``DuplicateError``
 """
 
 import logging
-from contextlib import asynccontextmanager, contextmanager
-from typing import AsyncGenerator, Generator
+from contextlib import contextmanager
+from typing import Generator
 
 from sqlalchemy import MetaData, create_engine
 from sqlalchemy.engine import make_url
@@ -41,21 +38,6 @@ class Base(DeclarativeBase):
     metadata = _metadata
 
 
-# ── Custom exceptions ────────────────────────────────────────────────────────
-
-
-class DatabaseError(Exception):
-    """Base exception for database-related errors."""
-
-
-class NotFoundError(DatabaseError):
-    """Raised when a requested resource does not exist."""
-
-
-class DuplicateError(DatabaseError):
-    """Raised when a unique-constraint violation occurs."""
-
-
 # ── Engines ───────────────────────────────────────────────────────────────────
 
 _cfg = get_config()
@@ -81,6 +63,12 @@ async_engine = create_async_engine(
     pool_recycle=1800,
     pool_pre_ping=True,
     echo=False,
+    # N-1: disable SQLAlchemy's per-connection prepared-statement cache so a
+    # pooled connection can never replay a statement prepared against a stale
+    # (dropped/recreated) catalog, which otherwise surfaces intermittently as
+    # `relation "…" does not exist` after cross-engine DDL. This arg is
+    # intercepted by SQLAlchemy's asyncpg dialect (never forwarded to asyncpg).
+    connect_args={"prepared_statement_cache_size": 0},
 )
 
 # ── Session factories ─────────────────────────────────────────────────────────
@@ -113,41 +101,6 @@ async def dispose_engines() -> None:
 
 
 # ── Session helpers ───────────────────────────────────────────────────────────
-
-
-@asynccontextmanager
-async def async_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Async context manager that yields a committed (or rolled-back) session.
-
-    Commits on success, rolls back and re-raises on error, and always closes
-    the session.  Usage::
-
-        async with async_db_session() as session:
-            user = await session.get(User, 1)
-    """
-    session = AsyncSessionLocal()
-    try:
-        yield session
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        logger.exception("Database session rolled back due to error")
-        raise
-    finally:
-        await session.close()
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI/Quart-compatible async session dependency.
-
-    Thin wrapper over :func:`async_db_session` for dependency-injection
-    style usage::
-
-        async def route(session: AsyncSession = Depends(get_db)) -> ...:
-            ...
-    """
-    async with async_db_session() as session:
-        yield session
 
 
 @contextmanager

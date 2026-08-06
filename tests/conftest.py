@@ -9,23 +9,49 @@ its own transaction that gets rolled back on exit.
 import os
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from config import get_config
+from config import get_config, reset_config_cache
 
 # ── Test database ─────────────────────────────────────────────────────────────
 cfg = get_config()
-# Derive test DB URL by replacing the last path segment (the DB name) with
-# "empyrean_test", or honor an explicit TEST_DATABASE_URL override.
+
+# Derive test DB URL by swapping the DB name, preserving any ?query params.
+# Honor an explicit TEST_DATABASE_URL override.
 _TEST_DB_URL = os.environ.get("TEST_DATABASE_URL") or (
-    cfg.DATABASE_URL.rsplit("/", 1)[0] + "/empyrean_test"
+    make_url(cfg.DATABASE_URL).set(database="empyrean_test").render_as_string(hide_password=False)
 )
+
+
+def _ensure_test_db_exists(url_str: str) -> None:
+    """Create the test DB if it doesn't already exist (no-op otherwise)."""
+    url = make_url(url_str)
+    admin = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": url.database},
+            ).scalar()
+            if not exists:
+                conn.execute(text(f'CREATE DATABASE "{url.database}"'))
+    finally:
+        admin.dispose()
+
+
+_ensure_test_db_exists(_TEST_DB_URL)
 
 # Point the application's engines at the test DB *before* the models import
 # below (models/base.py builds its engines from DATABASE_URL at import time).
 # Without this, API-level tests would silently hit the real "Empyrean" DB.
 os.environ["DATABASE_URL"] = _TEST_DB_URL
+
+# N-8: get_config() caches its first Config. We built one above (from .env,
+# whose DATABASE_URL points at the real "Empyrean" DB) to derive the test URL;
+# drop that cached instance so the models import picks up the env override.
+reset_config_cache()
 
 from models import Base, Node, SystemSetting, User
 from models.helpers import hash_password
@@ -40,6 +66,18 @@ _SessionFactory = sessionmaker(bind=_engine)
 def create_test_tables():
     """Create all tables once per test session, then drop them and dispose."""
     Base.metadata.create_all(_engine)
+    # N-1: ensure no async-pool connection can serve a catalog that predates
+    # create_all, so a later async endpoint test never hits a stale
+    # "relation does not exist". Dispose the async engine's pool upfront; at
+    # session start there should be no live connections, but wrap defensively
+    # so an event-loop mismatch can never break the fixture.
+    import asyncio
+    from models.base import async_engine
+
+    try:
+        asyncio.run(async_engine.dispose())
+    except Exception:  # noqa: BLE001 - defensive: pool state must not break teardown
+        pass
     yield
     Base.metadata.drop_all(_engine)
     _engine.dispose()
@@ -57,7 +95,11 @@ def db_session() -> Session:
     yield session
 
     session.close()
-    transaction.rollback()
+    # A failed flush (e.g. the IntegrityError tests) aborts the session's
+    # transaction; closing the session detaches it from the connection, so
+    # only roll back while the underlying transaction is still active.
+    if transaction.is_active:
+        transaction.rollback()
     connection.close()
 
 

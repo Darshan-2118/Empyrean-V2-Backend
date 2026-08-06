@@ -6,7 +6,7 @@ The ``role`` column (``'admin'`` | ``'user'``) controls access level.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Integer, String, func
+from sqlalchemy import Boolean, Integer, String, func, text, true
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,13 +29,14 @@ class User(Base):
         String(255), nullable=False,
     )
     role: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="user",
+        String(20), nullable=False, default="user", server_default="user",
     )
     notification_prefs: Mapped[dict] = mapped_column(
         JSONB, default=dict, nullable=False,
+        server_default=text("'{}'::jsonb"),
     )
     is_active: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False,
+        Boolean, default=True, nullable=False, server_default=true(),
     )
     last_login_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,

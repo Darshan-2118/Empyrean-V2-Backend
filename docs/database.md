@@ -104,15 +104,17 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 
 ## Redis Key Schema
 
-> **Status:** Redis caching is planned (Phase 5) and not yet implemented — this is the intended key design.
+> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. The remaining keys land with their phases (nodes → p8, alerts → p9).
 
 | Key Pattern | TTL | Value |
 |---|---|---|
-| `readings:latest:{node_id}` | 60s | Latest enriched reading (JSON) |
-| `nodes:all` | 300s | All node metadata (JSON array) |
-| `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) |
+| `readings:latest` | 60s | Latest enriched reading per active node (JSON array) |
+| `readings:latest:{node_id}` | 60s | Latest enriched reading (JSON) — write-through from `tasks.process_reading`; the same write-through also `DEL`etes the global `readings:latest` key (L-28) so the served cache is never stale past a just-persisted reading |
+| `nodes:all` | 300s | All node metadata (JSON array) — p8 |
+| `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — p9 |
 | `ratelimit:{ip}:{minute}` | 60s | Request count (int) |
-| `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) |
+| `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) — read/written by the `/forecast` endpoint & `generate_forecast` |
+| `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `tasks.forecast.retrain_model` |
 
 TTLs are tuned per data volatility, not a single blanket value: live readings never go stale beyond 60s, while less time-sensitive data (node metadata, forecasts) uses a longer TTL to cut down on recomputation.
 

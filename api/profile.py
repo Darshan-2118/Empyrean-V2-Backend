@@ -6,6 +6,7 @@ All endpoints require ``@jwt_required`` (valid access token).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -86,18 +87,27 @@ async def update_profile():
         return jsonify(_serialise_user(user)), 200
 
     async with AsyncSessionLocal() as session:
-        session.add(user)
+        # Fetch a session-attached row and re-apply the mutated fields —
+        # the detached g.current_user cannot be committed into a fresh session.
+        persistent = await session.get(User, user.id)
+        if persistent is None:
+            return _problem_json(404, "Not Found", "User not found")
+
+        persistent.username = user.username
+        persistent.email = user.email
+        persistent.notification_prefs = user.notification_prefs
+
         try:
             await session.commit()
-            await session.refresh(user)
-            g.current_user = user
+            await session.refresh(persistent)
+            g.current_user = persistent
         except IntegrityError:
             await session.rollback()
             return _problem_json(
                 409, "Conflict", "Username or email already taken"
             )
 
-    return jsonify(_serialise_user(user)), 200
+    return jsonify(_serialise_user(persistent)), 200
 
 
 # ── POST /profile/change-password ──────────────────────────────────────────────
@@ -117,13 +127,17 @@ async def change_password():
     except Exception as exc:
         return _problem_json(422, "Unprocessable Entity", str(exc))
 
-    if not bcrypt.checkpw(
+    # bcrypt cost-12 work runs off the event loop so a ~500 ms hash/compare
+    # never blocks in-flight requests (H-6).
+    current_ok = await asyncio.to_thread(
+        bcrypt.checkpw,
         data.current_password.encode("utf-8"),
         user.password_hash.encode("utf-8"),
-    ):
+    )
+    if not current_ok:
         return _problem_json(401, "Unauthorized", "Current password is incorrect")
 
-    user.password_hash = hash_password(data.new_password)
+    user.password_hash = await asyncio.to_thread(hash_password, data.new_password)
 
     async with AsyncSessionLocal() as session:
         session.add(user)

@@ -1,14 +1,19 @@
 """
 Health check — validates that the entire backend stack is wired correctly.
 
-Checks:
+Checks (numbered to match the output):
 1. Python environment and imports
 2. PostgreSQL connection
-3. Database exists
-4. All required tables exist
+3. All required tables exist
+4. Sensor-reading indexes exist
 5. Alembic migration is applied (correct revision)
-6. Seed data present (admin user, default settings, sample node)
-7. App factory loads without errors
+6. ``sensor_readings`` is a real TimescaleDB hypertable (queried)
+7. Redis is reachable (real PING)
+8. Seed data present — only when ``APP_ENV == "development"``
+   (a healthy production DB is not required to carry the dev seed rows)
+9. App factory loads without errors
+
+Requires ``Python >= 3.12`` (type-hint syntax used across the repo).
 
 Usage::
 
@@ -26,8 +31,13 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from sqlalchemy import inspect, text as sa_text  # noqa: E402
+
+from config import get_config  # noqa: E402
+
 PASS = "[OK]"
 FAIL = "[FAIL]"
+SKIP = "[SKIP]"
 SEP = "-" * 60
 
 
@@ -42,10 +52,13 @@ def check(description: str, ok: bool, detail: str = ""):
 
 
 def main() -> bool:
+    cfg = get_config()
+    is_dev = cfg.APP_ENV == "development"
     all_ok = True
+    total = 9
 
     # -- 1. Python environment & imports -------------------------------------
-    print(f"\n[1/7] Environment & Imports")
+    print(f"\n[1/{total}] Environment & Imports")
     print(SEP)
 
     # Python version
@@ -60,11 +73,15 @@ def main() -> bool:
         all_ok &= check("Model imports", False, str(e))
 
     # -- 2. Database connection -----------------------------------------------
-    print(f"\n[2/7] Database")
+    # Isolated so a DB outage degrades the *dependent* sections (3–6, 8) to a
+    # SKIP while Redis (7) and the app factory (9) still get reported (N-7),
+    # instead of collapsing every check into one generic "Database checks" FAIL.
+    print(f"\n[2/{total}] Database")
     print(SEP)
 
+    engine = None
+    db_ok = False
     try:
-        from sqlalchemy import inspect, text as sa_text
         from scripts.db_utils import make_engine
 
         engine = make_engine()
@@ -73,6 +90,7 @@ def main() -> bool:
         with engine.connect() as conn:
             conn.execute(sa_text("SELECT 1"))
         all_ok &= check("PostgreSQL connection", True, str(engine.url).rsplit("@", 1)[-1])
+        db_ok = True
 
         # Database version
         with engine.connect() as conn:
@@ -82,8 +100,16 @@ def main() -> bool:
             "PostgreSQL" in (version or ""),
             (version or "").split(",")[0].strip() if version else "unknown",
         )
+    except Exception as e:
+        all_ok &= check("PostgreSQL connection", False, f"DB unreachable: {e}")
 
-        # -- 3. Tables exist --------------------------------------------------
+    # -- 3. Tables exist ------------------------------------------------------
+    print(f"\n[3/{total}] Tables")
+    print(SEP)
+    missing_tables: set[str] = set()
+    if not db_ok:
+        print(f"  {SKIP}  Table checks skipped (database connection failed)")
+    else:
         inspector = inspect(engine)
         existing_tables = set(inspector.get_table_names())
 
@@ -103,17 +129,28 @@ def main() -> bool:
         else:
             all_ok &= check("All tables exist", True, f"{len(expected_tables)} of {len(expected_tables)} present")
 
-        # -- 4. Indexes exist -------------------------------------------------
-        if not missing_tables:
-            sensor_indexes = {idx["name"] for idx in inspector.get_indexes("sensor_readings")}
-            required_sensor_indexes = {"idx_readings_node_time", "idx_readings_time"}
-            missing_sensor_indexes = required_sensor_indexes - sensor_indexes
-            if missing_sensor_indexes:
-                all_ok &= check("Sensor reading indexes", False, f"missing: {', '.join(sorted(missing_sensor_indexes))}")
-            else:
-                all_ok &= check("Sensor reading indexes", True, "idx_readings_node_time, idx_readings_time")
+    # -- 4. Indexes exist -----------------------------------------------------
+    print(f"\n[4/{total}] Indexes")
+    print(SEP)
+    if not db_ok or missing_tables:
+        reason = "database connection failed" if not db_ok else "tables missing"
+        print(f"  {SKIP}  Sensor reading index checks skipped ({reason})")
+    else:
+        inspector = inspect(engine)
+        sensor_indexes = {idx["name"] for idx in inspector.get_indexes("sensor_readings")}
+        required_sensor_indexes = {"idx_readings_node_time", "idx_readings_time"}
+        missing_sensor_indexes = required_sensor_indexes - sensor_indexes
+        if missing_sensor_indexes:
+            all_ok &= check("Sensor reading indexes", False, f"missing: {', '.join(sorted(missing_sensor_indexes))}")
+        else:
+            all_ok &= check("Sensor reading indexes", True, "idx_readings_node_time, idx_readings_time")
 
-        # -- 5. Alembic migration ---------------------------------------------
+    # -- 5. Alembic migration -------------------------------------------------
+    print(f"\n[5/{total}] Alembic Migration")
+    print(SEP)
+    if not db_ok:
+        print(f"  {SKIP}  Alembic check skipped (database connection failed)")
+    else:
         try:
             from alembic.config import Config as AlembicConfig
             from alembic.script import ScriptDirectory
@@ -150,10 +187,62 @@ def main() -> bool:
         except Exception as e:
             all_ok &= check("Alembic migration applied", False, str(e))
 
-        # -- 6. Seed data -----------------------------------------------------
-        print(f"\n[3/7] Seed Data")
-        print(SEP)
+    # -- 6. Hypertable (real query, not inferred) -----------------------------
+    print(f"\n[6/{total}] Hypertable")
+    print(SEP)
+    if not db_ok:
+        print(f"  {SKIP}  Hypertable check skipped (database connection failed)")
+    else:
+        try:
+            with engine.connect() as conn:
+                hypertable = conn.execute(
+                    sa_text(
+                        "SELECT hypertable_name FROM timescaledb_information.hypertables "
+                        "WHERE hypertable_name = 'sensor_readings'"
+                    )
+                ).scalar()
+            all_ok &= check(
+                "sensor_readings is a hypertable",
+                hypertable == "sensor_readings",
+                "sensor_readings" if hypertable == "sensor_readings"
+                else "not a hypertable (run `alembic upgrade head`)",
+            )
+        except Exception as e:
+            all_ok &= check(
+                "sensor_readings is a hypertable", False,
+                f"could not query hypertables: {e}",
+            )
 
+    # -- 7. Redis ---------------------------------------------------------------
+    print(f"\n[7/{total}] Redis")
+    print(SEP)
+    try:
+        from redis import Redis
+
+        client = Redis.from_url(cfg.REDIS_URL, socket_connect_timeout=3)
+        try:
+            pong = client.ping()
+            all_ok &= check(
+                "Redis reachable", bool(pong),
+                cfg.REDIS_URL if pong else "PING failed",
+            )
+        finally:
+            client.close()
+    except Exception as e:
+        all_ok &= check("Redis reachable", False, str(e))
+
+    # -- 8. Seed data (development only) --------------------------------------
+    print(f"\n[8/{total}] Seed Data")
+    print(SEP)
+
+    if not is_dev:
+        print(
+            f"  {SKIP}  Seed checks skipped (APP_ENV={cfg.APP_ENV!r} — "
+            "not development)"
+        )
+    elif not db_ok:
+        print(f"  {SKIP}  Seed checks skipped (database connection failed)")
+    else:
         with engine.connect() as conn:
             # Check admin user exists
             admin_count = conn.execute(
@@ -185,13 +274,11 @@ def main() -> bool:
                 f"found {setting_count} setting(s)" if setting_count else "not found",
             )
 
+    if engine is not None:
         engine.dispose()
 
-    except Exception as e:
-        all_ok &= check("Database checks", False, str(e))
-
-    # -- 7. App factory -------------------------------------------------------
-    print(f"\n[4/7] App Factory")
+    # -- 9. App factory ---------------------------------------------------------
+    print(f"\n[9/{total}] App Factory")
     print(SEP)
 
     try:

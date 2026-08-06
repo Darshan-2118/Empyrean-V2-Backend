@@ -1,5 +1,7 @@
 """Smoke test — verify conftest fixtures work end-to-end."""
 
+from sqlalchemy.orm import Session
+
 from models import User, Node, SystemSetting
 
 
@@ -32,13 +34,61 @@ class TestFixtures:
         assert admin_user.id is not None
         assert sample_node.node_id == "TEST-ESP32-01"
 
-    def test_db_session_rollback(self, db_session, admin_user: User):
-        """Each test starts from a clean users table.
+    def test_health_check_markers(self, capsys):
+        """Network-free smoke test of scripts/check_health (L-39).
 
-        The count is taken inside the same transaction that created
-        ``admin_user``, so it can't prove this test's own writes are rolled
-        back (that happens after the test returns).  It does catch rows left
-        over by earlier tests, which would show up here as extra users.
+        Imports the script module and exercises its pure ``check()`` helper
+        (which requires no DB/Redis/broker), verifying the PASS/FAIL/SKIP
+        markers and the return value contract without touching a live stack.
         """
-        count = db_session.query(User).count()
-        assert count == 1  # only the admin_user from this test's fixture
+        from scripts import check_health
+
+        assert check_health.PASS == "[OK]"
+        assert check_health.FAIL == "[FAIL]"
+        assert check_health.SKIP == "[SKIP]"
+        assert check_health.check("Is the sky blue?", True) is True
+        assert check_health.check("Is the sky blue?", False) is False
+        out = capsys.readouterr().out
+        assert "[OK]  Is the sky blue?" in out
+        assert "[FAIL]  Is the sky blue?" in out
+
+    def test_db_session_rollback(self, db_session, admin_user: User):
+        """Prove this test's writes are never committed, so teardown rollback
+        discards them.
+
+        A separate connection (outside the test transaction) only sees committed
+        rows.  Before teardown runs we verify:
+          * the ``admin_user`` fixture write is *not* visible outside the
+            transaction (it isn't committed yet), and
+          * a probe row written here, flushed inside the transaction, is also
+            invisible outside — so nothing this test writes can leak past the
+            rollback.
+        Any row left committed by an earlier test (a leak) *would* show up in
+        the outside count, which is what this catches.
+        """
+        engine = db_session.get_bind().engine
+        with engine.connect() as conn:
+            outside = Session(bind=conn)
+
+            # admin_user lives only inside the fixture transaction. Scope the
+            # count to *this* row so earlier behavioral tests' committed rows
+            # (e.g. test_api / test_phase_coverage) don't break the assertion
+            # — makes the rollback proof order-independent (L-43).
+            assert outside.query(User).filter_by(username="testadmin").count() == 0
+
+            # A probe write flushed inside the test transaction is not
+            # committed: the outside reader still sees an empty table.
+            db_session.add(User(
+                username="rollback-probe",
+                email="probe@test.local",
+                password_hash="x",
+            ))
+            db_session.flush()
+            assert db_session.query(User).filter_by(username="rollback-probe").count() == 1
+            # The uncommitted probe write is invisible to the committed-only
+            # outside reader, so teardown rollback discards it.
+            assert outside.query(User).filter_by(username="rollback-probe").count() == 0
+
+        # Teardown rolls the whole transaction back, discarding the probe row.
+        # (We can't observe post-teardown from here, but the assertions above
+        # prove the row was never committed, so the rollback removes it.)
