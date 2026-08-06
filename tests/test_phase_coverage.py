@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -305,7 +306,13 @@ def test_phase_1_to_6_fuzzy_engine():
 
 
 def test_phase_1_to_7_celery_tasks_and_forecast():
-    """Phase 7: enrichment task → DB → linear forecast → forecast API."""
+    """Phase 7: enrichment task → DB → linear forecast → forecast API.
+
+    Also asserts the forecast contract: every point's ``time`` is a whole-second
+    ISO-8601 string (``^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$``) with no
+    microsecond fraction, both from ``generate_forecast`` and over the HTTP
+    endpoint.
+    """
 
     async def _scenario():
         from tasks.forecast import generate_forecast
@@ -328,6 +335,9 @@ def test_phase_1_to_7_celery_tasks_and_forecast():
         points = generate_forecast(node_id)
         assert len(points) == 60
         assert all("time" in p and "aqi" in p for p in points)
+        # Whole-second precision: no fractional seconds, no microsecond dot.
+        assert all(re.fullmatch(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", p["time"]) for p in points)
+        assert all("." not in p["time"] for p in points)
 
         # The documented HTTP endpoint serves it.
         client = create_app().test_client()
@@ -340,6 +350,7 @@ def test_phase_1_to_7_celery_tasks_and_forecast():
         assert body["node_id"] == node_id
         assert body["horizon_minutes"] == 60
         assert len(body["points"]) == 60
+        assert all(re.fullmatch(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", p["time"]) for p in body["points"])
 
     _run_async(_scenario())
 
@@ -350,3 +361,52 @@ def test_phase_1_to_7_celery_tasks_and_forecast():
 # pattern: it drives phase 8's entry point and relies on phases 1-7 already
 # being proven by the tests above. Same for Phase 9 (Alerts/WebSocket), Phase 10
 # (Admin), Phase 11 (Export), Phase 12 (Error handling/middleware).
+
+
+def test_phase_1_to_8_nodes_api():
+    """Phase 8: register → list → patch a node over the HTTP API."""
+
+    async def _scenario():
+        from api.jwt import create_access_token
+        from models import User
+
+        user_id, node_id = _seed_user_and_node("p8")
+        admin = User(
+            username=f"p8admin_{secrets.token_hex(3)}",
+            email=f"p8admin_{secrets.token_hex(3)}@example.com",
+            password_hash=hash_password("secret-pass-123", rounds=4),
+            role="admin", is_active=True, notification_prefs={},
+        )
+        with get_sync_db() as session:
+            session.add(admin); session.flush(); admin_id = admin.id
+
+        client = create_app().test_client()
+        user_headers = {"Authorization": f"Bearer {create_access_token(user_id, 'user')}"}
+        admin_headers = {"Authorization": f"Bearer {create_access_token(admin_id, 'admin')}"}
+
+        # list includes the pre-seeded node
+        resp = await client.get("/api/v1/nodes", headers=user_headers)
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert any(n["node_id"] == node_id for n in body["nodes"])
+
+        # register a fresh node
+        new_id = f"P9-{secrets.token_hex(3).upper()}"
+        resp = await client.post("/api/v1/nodes", headers=user_headers, json={
+            "node_id": new_id, "name": "Phase8 node", "reading_interval": 60,
+        })
+        assert resp.status_code == 201
+        reg = await resp.get_json()
+        assert reg["node_id"] == new_id and reg["reading_interval"] == 60
+
+        # admin patch updates it; no broker → config_pushed false (fail-open)
+        resp = await client.patch(f"/api/v1/nodes/{new_id}", headers=admin_headers, json={
+            "name": "Renamed", "reading_interval": 120,
+        })
+        assert resp.status_code == 200
+        patched = await resp.get_json()
+        assert patched["name"] == "Renamed"
+        assert patched["reading_interval"] == 120
+        assert patched["config_pushed"] is False
+
+    _run_async(_scenario())

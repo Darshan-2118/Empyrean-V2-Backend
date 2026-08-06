@@ -61,10 +61,15 @@ async def get_profile():
 @profile_bp.route("", methods=["PATCH"])
 @jwt_required
 async def update_profile():
-    """Update username, email, or notification preferences."""
+    """Update username, email, or notification preferences.
+
+    An empty ``{}`` body is a valid no-op and returns the unchanged
+    profile with a 200 — only fields actually supplied in the request
+    are applied.
+    """
     user: User = g.current_user
     body = await request.get_json(silent=True)
-    if not body:
+    if body is None:
         return _problem_json(400, "Bad Request", "Request body is required")
 
     try:
@@ -72,30 +77,32 @@ async def update_profile():
     except Exception as exc:
         return _problem_json(422, "Unprocessable Entity", str(exc))
 
-    has_changes = False
-    if data.username is not None and data.username != user.username:
-        user.username = data.username
-        has_changes = True
-    if data.email is not None and data.email != user.email:
-        user.email = data.email
-        has_changes = True
-    if data.notification_prefs is not None:
-        user.notification_prefs = data.notification_prefs
-        has_changes = True
+    # "has_changes" is driven purely by which fields were supplied — not by
+    # whether they differ from the current values — so a "{}" body is a valid
+    # no-op and only actually-supplied fields are applied below.
+    has_changes = any(
+        v is not None
+        for v in (data.username, data.email, data.notification_prefs)
+    )
 
     if not has_changes:
         return jsonify(_serialise_user(user)), 200
 
     async with AsyncSessionLocal() as session:
-        # Fetch a session-attached row and re-apply the mutated fields —
-        # the detached g.current_user cannot be committed into a fresh session.
+        # Fetch a session-attached row and apply only the supplied fields —
+        # the detached g.current_user cannot be committed into a fresh session,
+        # and copying every field from the snapshot would clobber a concurrent
+        # writer's committed change (lost update).
         persistent = await session.get(User, user.id)
         if persistent is None:
             return _problem_json(404, "Not Found", "User not found")
 
-        persistent.username = user.username
-        persistent.email = user.email
-        persistent.notification_prefs = user.notification_prefs
+        if data.username is not None:
+            persistent.username = data.username
+        if data.email is not None:
+            persistent.email = data.email
+        if data.notification_prefs is not None:
+            persistent.notification_prefs = data.notification_prefs
 
         try:
             await session.commit()
@@ -116,10 +123,14 @@ async def update_profile():
 @profile_bp.route("/change-password", methods=["POST"])
 @jwt_required
 async def change_password():
-    """Verify current password and set a new one."""
+    """Verify current password and set a new one.
+
+    An empty ``{}`` body fails schema validation (422) — the required
+    ``current_password``/``new_password`` fields are missing.
+    """
     user: User = g.current_user
     body = await request.get_json(silent=True)
-    if not body:
+    if body is None:
         return _problem_json(400, "Bad Request", "Request body is required")
 
     try:
@@ -139,7 +150,19 @@ async def change_password():
 
     user.password_hash = await asyncio.to_thread(hash_password, data.new_password)
 
+    # A changed password must kill every outstanding refresh token so a prior
+    # session can't outlive the new credentials.
+    from models.refresh_token import RefreshToken
+
     async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(RefreshToken).where(
+                RefreshToken.user_id == user.id,
+                RefreshToken.revoked == False,  # noqa: E712
+            )
+        )
+        for rt in result.scalars().all():
+            rt.revoked = True
         session.add(user)
         await session.commit()
 

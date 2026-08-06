@@ -90,6 +90,7 @@ def create_app() -> Quart:
             )
             return
         _mqtt_client = client
+        from mqtt.registry import set_client; set_client(client)
         logger.info("MQTT ingestion client started (M-10 lifecycle wiring)")
 
     @app.after_serving
@@ -103,6 +104,7 @@ def create_app() -> Quart:
         except Exception:
             logger.exception("MQTT client failed to stop cleanly")
         _mqtt_client = None
+        from mqtt.registry import set_client; set_client(None)
 
     # --- CORS ---
     _app = cors(app, allow_origin=cfg.cors_origins_list, allow_credentials=True)
@@ -126,9 +128,19 @@ def create_app() -> Quart:
     async def not_found(e):
         return _problem_json(404, "Not Found", "The requested resource was not found")
 
+    @_app.errorhandler(405)
+    async def method_not_allowed(e):
+        return _problem_json(405, "Method Not Allowed")
+
     @_app.errorhandler(422)
     async def unprocessable_entity(e):
         return _problem_json(422, "Unprocessable Entity")
+
+    @_app.errorhandler(413)
+    async def request_entity_too_large(e):
+        return _problem_json(
+            413, "Request Entity Too Large", "Request body exceeds 64 KB"
+        )
 
     @_app.errorhandler(429)
     async def too_many_requests(e):
@@ -153,7 +165,7 @@ def create_app() -> Quart:
     from api.forecast import forecast_bp
     from api.profile import profile_bp
     from api.readings import readings_bp
-    # from api.nodes import nodes_bp
+    from api.nodes import nodes_bp
     # from api.alerts import alerts_bp
     # from api.export import export_bp
     # from api.admin import admin_bp
@@ -162,7 +174,7 @@ def create_app() -> Quart:
     _app.register_blueprint(profile_bp, url_prefix="/api/v1/profile")
     _app.register_blueprint(readings_bp, url_prefix="/api/v1/readings")
     _app.register_blueprint(forecast_bp, url_prefix="/api/v1/forecast")
-    # _app.register_blueprint(nodes_bp, url_prefix="/api/v1/nodes")
+    _app.register_blueprint(nodes_bp, url_prefix="/api/v1/nodes")
     # _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
     # _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
     # _app.register_blueprint(admin_bp, url_prefix="/api/v1/admin")

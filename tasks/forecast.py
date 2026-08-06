@@ -197,8 +197,8 @@ def generate_forecast(node_id: str) -> list[dict]:
     the node's last-7-days readings. Predictions are clamped to ``[0, 500]``
     and cached as ``celery:forecast:{node_id}`` (TTL 3600s).
 
-    Returns a list of ``{"time": <ISO-8601 Z>, "aqi": <float>}`` dicts — empty
-    when no model / data exists to forecast with.
+    Returns a list of ``{"time": <ISO-8601 Z, whole-second precision>, "aqi":
+    <float>}`` dicts — empty when no model / data exists to forecast with.
     """
     model = _get_model(node_id)
     if model is None or "slope" not in model or "intercept" not in model:
@@ -215,7 +215,14 @@ def generate_forecast(node_id: str) -> list[dict]:
         ts = now + timedelta(seconds=step * FORECAST_STEP_SECONDS)
         aqi = slope * ts.timestamp() + intercept
         aqi = min(500.0, max(0.0, aqi))
-        points.append({"time": ts.isoformat().replace("+00:00", "Z"), "aqi": aqi})
+        # Truncate sub-second precision so point times are whole-second
+        # ISO-8601 (docs/api.md), matching the documented response format.
+        points.append(
+            {
+                "time": ts.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "aqi": aqi,
+            }
+        )
 
     _cache_forecast(node_id, points)
     return points

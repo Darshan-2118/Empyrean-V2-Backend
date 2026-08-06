@@ -275,3 +275,13 @@ def test_start_refuses_when_tls_requested_but_not_configured(monkeypatch):
     client._tls_configured = False
     with pytest.raises(RuntimeError):
         client.start()
+
+
+def test_mqtt_client_registry():
+    """set_client/get_client round-trip; None clears."""
+    import mqtt.registry as reg
+    dummy = object()
+    reg.set_client(dummy)
+    assert reg.get_client() is dummy
+    reg.set_client(None)
+    assert reg.get_client() is None

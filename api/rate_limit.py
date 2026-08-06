@@ -3,9 +3,12 @@ Redis-backed fixed-window rate limiting (API side).
 
 Decorator ``@rate_limit(limit, window_seconds)`` applied to endpoints. The
 window is anchored to the UTC minute: the Redis key is
-``ratelimit:{ip}:{minute}`` (minute = ``%Y%m%d%H%M``, contract from
+``ratelimit:{endpoint}:{ip}:{minute}`` (endpoint = the Quart
+``request.endpoint`` scope, minute = ``%Y%m%d%H%M``, contract from
 ``docs/database.md``), so ``window_seconds`` should be ≤ 60 to match the key
-granularity. Every response from a wrapped endpoint carries
+granularity. The endpoint scope isolates each route's bucket so one endpoint
+cannot exhaust the whole per-IP allowance for the app. Every response from a
+wrapped endpoint carries
 ``X-RateLimit-Limit`` / ``X-RateLimit-Remaining`` / ``X-RateLimit-Reset``.
 
 If Redis is unreachable the decorator **fails open** — the request is allowed
@@ -46,9 +49,18 @@ def _client_ip() -> str:
 
 
 def _rate_limit_key(ip: str, now: datetime) -> str:
-    """Build the per-IP, per-minute Redis key for the given ``now``."""
+    """Build the per-endpoint, per-IP, per-minute Redis key for ``now``.
+
+    Scoping by ``request.endpoint`` (e.g. ``auth.login``, ``readings.latest``)
+    keeps each route's budget independent: without it every endpoint would share
+    one bucket per IP, so one hot route (or one heavy client) could burn the
+    whole budget and deny all other endpoints on that IP. ``request.endpoint``
+    is populated for any request that matched a route; a literal ``default``
+    scope keeps the key stable if it is ever missing.
+    """
+    endpoint = request.endpoint or "default"
     minute = now.strftime("%Y%m%d%H%M")
-    return f"ratelimit:{ip}:{minute}"
+    return f"ratelimit:{endpoint}:{ip}:{minute}"
 
 
 def _reset_epoch(now: datetime) -> int:

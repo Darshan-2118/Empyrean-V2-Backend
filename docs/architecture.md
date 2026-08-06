@@ -40,7 +40,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | 7 | The enriched record is inserted into the `sensor_readings` table in PostgreSQL (will become a TimescaleDB hypertable later). |
 | 8 | The `readings:latest:{node_id}` Redis key is updated (TTL 60s), invalidating the stale cache. |
 | 9 | Celery Beat checks AQI thresholds every 60s; on breach, an alert row is written and pushed to connected clients over WebSocket. |
-| 10 | The frontend polls `GET /api/v1/readings/latest` every 5s, hitting the Redis cache for a sub-10ms response. Note: the response is a flat `{ "nodes": [...] }` array with `lat`/`lon` fields, not GeoJSON — the frontend maps this into GeoJSON client-side for Leaflet if needed. |
+| 10 | The frontend polls `GET /api/v1/readings/latest` every 5s, hitting the Redis cache for a sub-10ms response. The response is `{ "readings": [...] }` — an array of objects with `node_id`, `time` (ISO-8601 UTC `Z`), `pm25`, `pm10`, `temperature`, `humidity`, `aqi`, `aqi_category`, `fuzzy_score`, and `is_anomaly` (no `lat`/`lon`); the frontend joins node coordinates client-side for map display. |
 
 **Target:** end-to-end latency from sensor reading to dashboard visibility is **< 2 seconds**.
 

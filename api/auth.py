@@ -71,9 +71,13 @@ async def _json_body(model: type[Any]) -> tuple[Any | None, Any | None]:
 
     ``error_response`` is a ready-to-return RFC 7807 ``(body, status, headers)``
     tuple when the body is missing or fails validation, else ``None``.
+
+    Distinction: ``request.get_json(silent=True)`` returning ``None`` (missing
+    body OR malformed JSON) -> 400; any non-``None`` value, including an empty
+    ``{}`` object, falls through to schema validation -> 422 on failure.
     """
     body = await request.get_json(silent=True)
-    if not body:
+    if body is None:
         return None, _problem_json(400, "Bad Request", "Request body is required")
     try:
         return model(**body), None
@@ -287,6 +291,7 @@ async def refresh():
 
 
 @auth_bp.route("/logout", methods=["POST"])
+@rate_limit(10, 60)  # M-12: per-IP cap on token revocation (write-flood surface)
 async def logout():
     """Revoke a refresh token."""
     data, err = await _json_body(RefreshRequest)
