@@ -45,7 +45,7 @@ from api.jwt import (
     jwt_required,
 )
 from app import create_app
-from models import Node, RefreshToken, SensorReading, User
+from models import Alert, Node, RefreshToken, SensorReading, User
 from models.base import AsyncSessionLocal, dispose_engines
 from models.helpers import hash_password
 
@@ -58,6 +58,7 @@ API = "/api/v1"
 # sweep) that assume a clean DB.
 _CREATED_USERNAMES: set[str] = set()
 _CREATED_NODE_IDS: set[str] = set()
+_CREATED_ALERT_IDS: set[int] = set()
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -129,8 +130,18 @@ def _auth_headers(token: str) -> dict:
 
 
 async def _cleanup_tracked_rows() -> None:
-    """Delete every user/node this module committed (FK cascades do the rest)."""
+    """Delete every row this module committed (FK-cascade aware ordering).
+
+    Alerts are removed *before* their nodes — ``alerts.node_id`` has an
+    ``ondelete="CASCADE"``, so node deletes would cascade anyway, but deleting
+    alerts first keeps the tracked-row sweep deterministic regardless of FK
+    configuration.
+    """
     async with AsyncSessionLocal() as session:
+        if _CREATED_ALERT_IDS:
+            await session.execute(
+                delete(Alert).where(Alert.alert_id.in_(_CREATED_ALERT_IDS))
+            )
         if _CREATED_USERNAMES:
             await session.execute(
                 delete(User).where(User.username.in_(_CREATED_USERNAMES))
@@ -140,6 +151,7 @@ async def _cleanup_tracked_rows() -> None:
                 delete(Node).where(Node.node_id.in_(_CREATED_NODE_IDS))
             )
         await session.commit()
+    _CREATED_ALERT_IDS.clear()
     _CREATED_USERNAMES.clear()
     _CREATED_NODE_IDS.clear()
 
@@ -1108,3 +1120,215 @@ def test_nodes_patch_mqtt_push_fails_open():
             persisted = await session.get(Node, node_id)
             assert persisted.reading_interval == 120
     _run(scenario())
+
+
+# ── Alerts API (Phase 9) ──────────────────────────────────────────────────────
+
+
+# Allowed Origin for WS handshakes: quartz-CORS aborts (400) any websocket whose
+# Origin is not in CORS_ORIGINS, mirroring how a real browser connects.
+_WS_ORIGIN = {"Origin": "http://localhost:5173"}
+
+
+async def _wait_ws_connected(_mgr) -> None:
+    """Busy-wait until the server has registered the socket on the connection manager.
+
+    Quart's test client returns from ``async with client.websocket(...)`` before
+    the server handler finishes the handshake. Broadcasting too early is a no-op
+    (the connection set is still empty), so wait for connection count == 1 first.
+    """
+    import asyncio
+
+    for _ in range(100):
+        if _mgr.connected_count >= 1:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("WebSocket server never registered the client connection")
+
+
+async def _seed_alert(node_id: str, *, severity: str = "critical", acked: bool = False) -> int:
+    """Persist an alert against ``node_id`` and track its id for cleanup."""
+    async with AsyncSessionLocal() as session:
+        alert = Alert(
+            node_id=node_id, parameter="aqi", value=150.0, threshold=150.0,
+            severity=severity, message="test alert",
+            acknowledged_at=datetime.now(timezone.utc) if acked else None,
+        )
+        session.add(alert)
+        await session.commit()
+        await session.refresh(alert)
+        _CREATED_ALERT_IDS.add(alert.alert_id)
+        return alert.alert_id
+
+
+def test_alerts_list_unacked_with_filter_and_pagination():
+    async def scenario():
+        from models.base import AsyncSessionLocal
+        user = await _create_user(_unique("auser"))
+        # Each *unacknowledged* alert needs its own node: the partial unique
+        # index (node_id, parameter) WHERE acknowledged_at IS NULL allows at
+        # most one open alert per node+parameter.
+        crit_id = _unique("ANODE") + "-A"
+        warn_id = _unique("ANODE") + "-B"
+        acked_id = _unique("ANODE") + "-C"
+        for nid in (crit_id, warn_id, acked_id):
+            _CREATED_NODE_IDS.add(nid)
+            async with AsyncSessionLocal() as session:
+                session.add(Node(node_id=nid, name="Alert", reading_interval=30, is_active=True))
+                await session.commit()
+        id_crit = await _seed_alert(crit_id, severity="critical")
+        await _seed_alert(warn_id, severity="warning")
+        await _seed_alert(acked_id, severity="critical", acked=True)  # excluded
+
+        app = create_app()
+        headers = _auth_headers(create_access_token(user.id, "user"))
+        async with app.test_client() as client:
+            resp = await client.get(f"{API}/alerts", headers=headers)
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["total"] == 2  # both unacked, regardless of severity
+            assert any(a["alert_id"] == id_crit for a in body["alerts"])
+
+            resp = await client.get(f"{API}/alerts?severity=warning", headers=headers)
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["total"] == 1
+            assert body["alerts"][0]["severity"] == "warning"
+
+            resp = await client.get(f"{API}/alerts?severity=bogus", headers=headers)
+            assert resp.status_code == 422
+            resp = await client.get(f"{API}/alerts?limit=0", headers=headers)
+            assert resp.status_code == 422
+    _run(scenario())
+
+
+def test_alerts_acknowledge_idempotent_and_404():
+    async def scenario():
+        from models.base import AsyncSessionLocal
+        user = await _create_user(_unique("auser"))
+        node_id = _unique("ANODE")
+        _CREATED_NODE_IDS.add(node_id)
+        async with AsyncSessionLocal() as session:
+            session.add(Node(node_id=node_id, name="Alert", reading_interval=30, is_active=True))
+            await session.commit()
+        alert_id = await _seed_alert(node_id)
+
+        app = create_app()
+        headers = _auth_headers(create_access_token(user.id, "user"))
+        async with app.test_client() as client:
+            resp = await client.patch(f"{API}/alerts/{alert_id}/acknowledge", headers=headers)
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["acknowledged_at"] is not None
+            assert body["acknowledged_by"] == user.id
+
+            # idempotent — second ack still 200, acknowledged_at unchanged
+            resp = await client.patch(f"{API}/alerts/{alert_id}/acknowledge", headers=headers)
+            assert resp.status_code == 200
+
+            resp = await client.patch(f"{API}/alerts/999999/acknowledge", headers=headers)
+            assert resp.status_code == 404
+    _run(scenario())
+
+
+# ── WebSocket manager (Phase 9) ───────────────────────────────────────────────
+
+
+def test_ws_manager_broadcast_schedules_json_send():
+    """broadcast() JSON-serializes and schedules a send on the captured loop."""
+    import asyncio
+    from api.ws.manager import ConnectionManager
+
+    class FakeWS:
+        def __init__(self):
+            self.sent = []
+        async def send(self, data):
+            self.sent.append(data)
+
+    async def scenario():
+        mgr = ConnectionManager()
+        ws = FakeWS()
+        await mgr.connect(ws)
+        mgr.broadcast({"node_id": "N9", "aqi": 150, "severity": "critical"})
+        # The send is marshalled onto the loop via run_coroutine_threadsafe; give
+        # the scheduled task a few iterations to run before asserting.
+        for _ in range(10):
+            await asyncio.sleep(0.05)
+            if ws.sent:
+                break
+        assert len(ws.sent) == 1
+        import json as _json
+        assert _json.loads(ws.sent[0])["node_id"] == "N9"
+        await mgr.disconnect(ws)
+        mgr.broadcast({"node_id": "gone"})  # no-op, must not raise
+        assert len(ws.sent) == 1
+
+    _run(scenario())
+
+
+def test_ws_alerts_auth_rejects_missing_token():
+    async def scenario():
+        app = create_app()
+        async with app.test_client() as client:
+            # Allowed Origin so CORS passes (WS handshakes require one); with no
+            # token the handler must still reject the socket (before accept()).
+            # The test client surfaces a rejected handshake as a raised error.
+            with pytest.raises(Exception):
+                async with client.websocket(
+                    "/ws/alerts", headers=_WS_ORIGIN
+                ) as ws:
+                    await ws.receive()
+    _run(scenario())
+
+
+def test_ws_alerts_accepts_and_receives_broadcast():
+    import asyncio
+    import json
+    async def scenario():
+        from api.ws.manager import manager as _mgr
+        user = await _create_user(_unique("wsuser"))
+        app = create_app()
+        token = create_access_token(user.id, "user")
+        async with app.test_client() as client:
+            async with client.websocket(
+                f"/ws/alerts?token={token}", headers=_WS_ORIGIN
+            ) as ws:
+                # Quart's test client returns before the server finishes the
+                # handshake; wait for the handler to register before broadcasting,
+                # so the broadcast is not a no-op.
+                await _wait_ws_connected(_mgr)
+                _mgr.broadcast({"node_id": "N9", "aqi": 150, "severity": "critical"})
+                # broadcast() transmits a JSON-serialized string over the socket.
+                msg = json.loads(await asyncio.wait_for(ws.receive(), timeout=2))
+                assert msg["node_id"] == "N9"
+                assert msg["severity"] == "critical"
+    _run(scenario())
+
+
+# ── MQTT alert bridge + publisher (Phase 9) ───────────────────────────────────
+
+
+def test_mqtt_alert_bridge_broadcasts_to_manager(monkeypatch):
+    import json as _json
+    from mqtt.client import _handle_alert
+
+    received = []
+    class FakeManager:
+        def broadcast(self, payload):
+            received.append(payload)
+
+    import api.ws.manager as ws_manager
+    monkeypatch.setattr(ws_manager, "manager", FakeManager())
+
+    _handle_alert(_json.dumps({"node_id": "N9", "aqi": 150}))
+    assert received and received[0]["node_id"] == "N9"
+
+    # malformed payloads are dropped, never raised
+    _handle_alert("not-json")
+    assert len(received) == 1
+
+
+def test_mqtt_publisher_fails_open_without_broker():
+    from mqtt.publisher import publish_alert
+    # No broker running → must not raise.
+    publish_alert("N9", 150.0, "Unhealthy", "critical", "2026-08-07T00:00:00Z")

@@ -48,6 +48,7 @@ _TOPIC_RE = re.compile(r"^air/node/(?P<node_id>[^/]+)/(?P<kind>reading|status)$"
 
 _READING_TOPIC = "air/node/+/reading"
 _STATUS_TOPIC = "air/node/+/status"
+_ALERTS_TOPIC = "air/alerts"
 _QOS = 1
 
 # Fixed client id + persistent session (clean_session=False, L-20): offline
@@ -187,6 +188,16 @@ def _handle_reading(node_id: str, raw: str) -> None:
     _dispatch_reading(node_id, payload)
 
 
+def _handle_alert(raw: str) -> None:
+    """Forward an ``air/alerts`` message to WebSocket clients (thread-safe)."""
+    data = _json_loads(raw, "alert")
+    if data is None:
+        return
+    from api.ws.manager import manager  # import here to avoid an import cycle
+
+    manager.broadcast(data)
+
+
 class MQTTClient:
     """Wraps a paho MQTT client wired to the Empyrean topic contract.
 
@@ -270,7 +281,7 @@ class MQTTClient:
         if rc != 0:
             logger.error("Broker connection refused with rc=%s — will retry", rc)
             return
-        for topic in (_READING_TOPIC, _STATUS_TOPIC):
+        for topic in (_READING_TOPIC, _STATUS_TOPIC, _ALERTS_TOPIC):
             result, mid = client.subscribe(topic, qos=_QOS)
             if result != mqtt.MQTT_ERR_SUCCESS:
                 logger.error("Failed to subscribe to %s (rc=%s)", topic, result)
@@ -302,6 +313,9 @@ class MQTTClient:
         try:
             raw = _resolve_payload(msg.payload)
             if raw is None:
+                return
+            if msg.topic == _ALERTS_TOPIC:
+                self._enqueue(_ALERTS_TOPIC, "alert", raw)
                 return
             match = _TOPIC_RE.fullmatch(msg.topic)
             if not match:
@@ -340,6 +354,8 @@ class MQTTClient:
             try:
                 if kind == "reading":
                     _handle_reading(node_id, raw)
+                elif kind == "alert":
+                    _handle_alert(raw)
                 else:
                     _handle_status(node_id, raw)
             except Exception:

@@ -166,7 +166,8 @@ def create_app() -> Quart:
     from api.profile import profile_bp
     from api.readings import readings_bp
     from api.nodes import nodes_bp
-    # from api.alerts import alerts_bp
+    from api.alerts import alerts_bp
+    from api.ws.routes import ws_bp
     # from api.export import export_bp
     # from api.admin import admin_bp
 
@@ -175,7 +176,8 @@ def create_app() -> Quart:
     _app.register_blueprint(readings_bp, url_prefix="/api/v1/readings")
     _app.register_blueprint(forecast_bp, url_prefix="/api/v1/forecast")
     _app.register_blueprint(nodes_bp, url_prefix="/api/v1/nodes")
-    # _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
+    _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
+    _app.register_blueprint(ws_bp, url_prefix="/ws")
     # _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
     # _app.register_blueprint(admin_bp, url_prefix="/api/v1/admin")
 

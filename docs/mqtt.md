@@ -2,7 +2,7 @@
 
 This document describes the MQTT topics exchanged between Empyrean devices, the broker, the backend, and downstream subscribers. It is the reference for the device-to-backend contract used by the ingestion pipeline.
 
-> **Status:** MQTT ingestion is **implemented** (Phase 4). `mqtt/client.py` subscribes to the reading + status topics (QoS 1), `mqtt/validator.py` validates payloads (Pydantic v2), `mqtt/config.py` publishes config changes back to devices, and `python -m mqtt.client` runs the consumer standalone. The alert-broadcast topic (`air/alerts`) is wired in a later phase (WebSocket).
+> **Status:** MQTT ingestion is **implemented** (Phase 4). `mqtt/client.py` subscribes to the reading + status topics (QoS 1), `mqtt/validator.py` validates payloads (Pydantic v2), `mqtt/config.py` publishes config changes back to devices, and `python -m mqtt.client` runs the consumer standalone. The alert bridge (`air/alerts`) is **live** (Phase 9): `mqtt/client.py` subscribes to `air/alerts` and forwards messages to WebSocket clients via the connection manager, while the Celery worker publishes to `air/alerts` on threshold-breach alert create/upgrade.
 
 ## Client lifecycle (M-10)
 
@@ -27,7 +27,7 @@ The client uses a fixed client id (`empyrean-backend`) with a **persistent sessi
 | `air/node/{id}/reading` | Device → Broker → Backend | Full sensor reading JSON |
 | `air/node/{id}/status` | Device → Broker | Heartbeat: `{ online, battery_v, firmware }` |
 | `air/node/{id}/config` | Backend → Device | Remote config: `{ interval_s, fuzzy_enabled }` |
-| `air/alerts` | Backend → Subscribers | Alert broadcast: `{ node_id, aqi, category, timestamp }`, bridged to the frontend over WebSocket |
+| `air/alerts` | Backend → Subscribers | Alert broadcast: `{ node_id, aqi, category, severity, timestamp }`, bridged to the frontend over WebSocket |
 
 QoS level 1 (at least once) is used for all device publishes.
 
