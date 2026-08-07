@@ -40,7 +40,7 @@ import pytest
 from app import create_app
 from api.jwt import create_access_token
 from config import get_config
-from models import Base, Node, SensorReading, User
+from models import Alert, Base, Node, SensorReading, User
 from models.base import async_engine, get_sync_db
 from models.helpers import hash_password
 
@@ -408,5 +408,67 @@ def test_phase_1_to_8_nodes_api():
         assert patched["name"] == "Renamed"
         assert patched["reading_interval"] == 120
         assert patched["config_pushed"] is False
+
+    _run_async(_scenario())
+
+
+# ── Phase 9 · Alerts & WebSocket ──────────────────────────────────────────────
+
+
+def test_phase_1_to_9_alerts_ws():
+    """Phase 9: list → acknowledge an alert over HTTP; receive a WS broadcast."""
+
+    async def _scenario():
+        import asyncio
+        import json
+        from api.ws.manager import manager as _mgr
+        from models import Alert, User
+        from models.base import get_sync_db
+
+        user_id, node_id = _seed_user_and_node("p9")
+        user = User(
+            username=f"p9user_{secrets.token_hex(3)}",
+            email=f"p9user_{secrets.token_hex(3)}@example.com",
+            password_hash=hash_password("secret-pass-123", rounds=4),
+            role="user", is_active=True, notification_prefs={},
+        )
+        with get_sync_db() as session:
+            session.add(user); session.flush()
+            alert = Alert(
+                node_id=node_id, parameter="aqi", value=160.0, threshold=150.0,
+                severity="critical", message="phase9 alert",
+            )
+            session.add(alert); session.flush(); alert_id = alert.alert_id
+
+        client = create_app().test_client()
+        headers = {"Authorization": f"Bearer {create_access_token(user_id, 'user')}"}
+
+        # list shows the unacked alert
+        resp = await client.get("/api/v1/alerts", headers=headers)
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert any(a["alert_id"] == alert_id for a in body["alerts"])
+
+        # acknowledge
+        resp = await client.patch(f"/api/v1/alerts/{alert_id}/acknowledge", headers=headers)
+        assert resp.status_code == 200
+        assert (await resp.get_json())["acknowledged_at"] is not None
+
+        # WebSocket receives a broadcast over the real transport. quartz-CORS
+        # requires an allowed Origin on the handshake, and the test client returns
+        # before the server has registered the socket, so wait for it first.
+        _ws_origin = {"Origin": "http://localhost:5173"}
+        async with client.websocket(
+            f"/ws/alerts?token={create_access_token(user_id, 'user')}", headers=_ws_origin
+        ) as ws:
+            for _ in range(100):
+                if _mgr.connected_count >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert _mgr.connected_count >= 1
+            _mgr.broadcast({"node_id": node_id, "aqi": 160, "severity": "critical"})
+            msg = json.loads(await asyncio.wait_for(ws.receive(), timeout=2))
+            assert msg["node_id"] == node_id
+            assert msg["severity"] == "critical"
 
     _run_async(_scenario())

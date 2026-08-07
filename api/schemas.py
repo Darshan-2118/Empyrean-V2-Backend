@@ -314,3 +314,25 @@ class UpdateNodeRequest(BaseModel):
     firmware_version: str | None = Field(None, max_length=50)
     reading_interval: int | None = Field(None, ge=1, le=86400)
     is_active: bool | None = None
+
+
+# ── Alert schemas ─────────────────────────────────────────────────────────────
+
+
+class AlertResponse(BaseModel):
+    """One threshold-breach alert (GET /alerts, PATCH acknowledge)."""
+
+    alert_id: int
+    node_id: str
+    parameter: str
+    value: float
+    threshold: float
+    severity: str
+    message: str | None = None
+    triggered_at: datetime
+    acknowledged_at: datetime | None = None
+    acknowledged_by: int | None = None
+
+    @field_serializer("triggered_at", "acknowledged_at")
+    def _iso_datetime(self, value: datetime | None) -> str | None:
+        return value.isoformat().replace("+00:00", "Z") if value else None

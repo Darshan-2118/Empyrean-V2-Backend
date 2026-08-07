@@ -12,8 +12,12 @@ Empyrean-V2-Backend/
 │   ├── rate_limit.py       # @rate_limit Redis fixed-window decorator
 │   ├── readings.py         # GET /readings/latest + /readings/history
 │   ├── forecast.py         # GET /forecast (60-min AQI prediction)
+│   ├── nodes.py            # GET/POST /nodes + PATCH /nodes/:node_id
+│   ├── alerts.py           # GET /alerts + PATCH /alerts/:alert_id/acknowledge
 │   ├── schemas.py          # Pydantic request/response DTOs
-│   └── ws/                 # WebSocket alert broadcasting (empty — planned)
+│   └── ws/                 # WebSocket alert broadcasting (manager + routes)
+│       ├── manager.py      # Thread-safe connection manager — broadcast from MQTT thread
+│       └── routes.py       # /ws/alerts endpoint — JWT auth before accept
 ├── config/
 │   └── __init__.py         # App configuration (pydantic-settings, Dev/Prod)
 ├── docs/                   # Project documentation
@@ -50,9 +54,10 @@ Empyrean-V2-Backend/
 │   ├── alert.py            # Alert model
 │   └── setting.py          # SystemSetting model
 ├── mqtt/                   # MQTT ingestion consumer & payload validation
-│   ├── client.py           # paho MQTT client — subscribes to readings/status, dispatches to Celery
+│   ├── client.py           # paho MQTT client — reads readings/status, dispatches to Celery, bridges air/alerts to WS
 │   ├── validator.py        # Pydantic payload validation (ReadingPayload / StatusPayload)
-│   └── config.py           # publish_config — push device config over MQTT
+│   ├── config.py           # publish_config — push device config over MQTT
+│   └── publisher.py        # fire-and-forget paho publisher — Celery worker publishes air/alerts broadcasts
 ├── scripts/                # Dev tools & utilities
 │   ├── verify.py           # Full-stack verification (Python)
 │   ├── check.bat           # Verify wrapper for cmd/PowerShell
@@ -83,13 +88,13 @@ Empyrean-V2-Backend/
 
 Key top-level directories:
 
-- `api/` — Quart route handlers (auth, profile, readings, forecast), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), and Pydantic request/response schemas; `api/ws/` (WebSocket alert broadcasting) is currently empty — planned.
+- `api/` — Quart route handlers (auth, profile, readings, forecast, nodes, alerts), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), and Pydantic request/response schemas; `api/ws/` holds the WebSocket alert broadcasting layer (thread-safe connection manager + JWT-authenticated `/ws/alerts` endpoint).
 - `config/` — environment-based app configuration via pydantic-settings.
 - `docs/` — project documentation (this file included).
 - `fuzzy/` — Tsukamoto fuzzy inference engine: membership functions (`membership.py`), the 27-rule base + consequent ramps (`rules.py`), and defuzzification + `infer()`/`fuzzy_score()` entrypoints (`tsukamoto.py`).
 - `migrations/` — Alembic environment (`env.py`) and versioned migration files.
 - `models/` — SQLAlchemy ORM models (users, nodes, sensor readings, aggregates, alerts, settings) plus engine/session setup and shared helpers.
-- `mqtt/` — MQTT ingestion: paho client (`client.py`) subscribing to `air/node/+/reading` and `air/node/+/status`, dispatching validated readings to the Celery `process_reading` task and updating `Node.last_seen` on heartbeats; Pydantic payload validation (`validator.py`); device config publisher (`config.py`).
+- `mqtt/` — MQTT ingestion: paho client (`client.py`) subscribing to `air/node/+/reading` and `air/node/+/status`, dispatching validated readings to the Celery `process_reading` task and updating `Node.last_seen` on heartbeats, and bridging `air/alerts` broadcasts to WebSocket clients; Pydantic payload validation (`validator.py`); device config publisher (`config.py`); fire-and-forget `air/alerts` publisher (`publisher.py`) used by the Celery alert task.
 - `scripts/` — dev tooling: full-stack verification, health check, seeding, DB helpers, and a temporary phase-1–7 smoke (`smoke_phases.py`).
 - `tasks/` — Celery worker + beat task definitions: per-reading enrichment (`process_reading.py`, `aqi.py`), hourly aggregation + data retention (`aggregation.py`), alert threshold checks (`alerts.py`), and linear-regression AQI forecasting (`forecast.py`).
 - `tests/` — pytest suite.

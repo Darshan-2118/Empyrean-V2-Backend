@@ -10,7 +10,7 @@ REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits a
 
 In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `Admin` = valid JWT with `role = "admin"` required.
 
-> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/forecast`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–8). The endpoint groups below (alerts, export, admin) are planned for later phases and currently return 404.
+> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/alerts/*`, `/forecast`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–9). The endpoint groups below (export, admin) are planned for later phases and currently return 404.
 
 ### Authentication
 
@@ -40,12 +40,21 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 
 ### Alerts
 
-> **Not implemented yet** — these endpoints return `404` until a later phase.
+> **Live since Phase 9.** `GET /alerts` returns **unacknowledged** threshold-breach alerts, newest first, with `limit` (`1..200`), `offset`, and `severity` (`warning`|`critical`) filters. The full unacknowledged list is cached under `alerts:unacked` (TTL 30s) and filters/pagination are applied in-memory after the cache read, so the cache key never varies with query params. `PATCH /alerts/:alert_id/acknowledge` marks an alert acknowledged (**idempotent** — acknowledging an already-acknowledged alert is a no-op) and invalidates the cache. Alert *creation* runs in the Celery beat task (`tasks.alerts.check_thresholds`), not here.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/alerts` | GET | Yes | Unacknowledged threshold-breach alerts (`limit`, `offset`, `severity`) |
 | `/alerts/:alert_id/acknowledge` | PATCH | Yes | Marks an alert acknowledged |
+
+### WebSocket — `/ws/alerts`
+
+A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages to every connected client through the connection manager; it never echoes or responds to client frames (push only, no client→server messaging).
+
+- **Auth:** JWT via the `Authorization: Bearer <access_token>` header (non-browser clients) or the `?token=<access_token>` query param (browser WebSockets cannot set headers).
+- **Handshake:** the JWT is validated **before** `accept()` — an unauthenticated or invalid-token handshake is closed rather than accepted.
+- **Payload:** the `air/alerts` MQTT message `{ node_id, aqi, category, severity, timestamp }`, broadcast as JSON.
+- The socket is only live once the MQTT broker publishes to `air/alerts`; with no broker a client connects but receives nothing until a broadcast arrives.
 
 ### Forecast
 

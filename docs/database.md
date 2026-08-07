@@ -104,14 +104,14 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 
 ## Redis Key Schema
 
-> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. The remaining keys land with their phases (alerts → p9).
+> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. Phase 9 added `alerts:unacked` (30s TTL). The remaining keys land with their phases.
 
 | Key Pattern | TTL | Value |
 |---|---|---|
 | `readings:latest` | 60s | Latest enriched reading per active node (JSON array) |
 | `readings:latest:{node_id}` | 60s | Latest enriched reading (JSON) — write-through from `tasks.process_reading`; the same write-through also `DEL`etes the global `readings:latest` key (L-28) so the served cache is never stale past a just-persisted reading |
 | `nodes:all` | 300s | All node metadata (JSON array); PATCH `/nodes/:node_id` invalidates `readings:latest` when `is_active` changes |
-| `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — p9 |
+| `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — added in Phase 9; written by `GET /alerts`, invalidated by `PATCH /alerts/:alert_id/acknowledge` |
 | `ratelimit:{endpoint}:{ip}:{minute}` | 60s | Request count (int) — per endpoint, per IP, per UTC minute (e.g. `ratelimit:auth.login:192.0.2.10:202608051530`); each endpoint has its own per-IP budget, so one endpoint cannot exhaust another's |
 | `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) — read/written by the `/forecast` endpoint & `generate_forecast` |
 | `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `tasks.forecast.retrain_model` |

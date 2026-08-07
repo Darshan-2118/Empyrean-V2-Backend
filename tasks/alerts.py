@@ -26,6 +26,7 @@ from celery_app import celery_app
 from config import get_config
 from models import Alert, Node, SensorReading, SystemSetting
 from models.base import get_sync_db
+from mqtt.publisher import publish_alert
 
 logger = logging.getLogger("empyrean.tasks.alerts")
 
@@ -162,7 +163,7 @@ def check_thresholds() -> dict:
         # AQI per active node (same recency bound as _latest_aqi, M-5).
         cutoff = datetime.now(timezone.utc) - _AQI_RECENCY
         latest_rows = session.execute(
-            select(SensorReading.node_id, SensorReading.aqi)
+            select(SensorReading.node_id, SensorReading.aqi, SensorReading.aqi_category)
             .join(Node, Node.node_id == SensorReading.node_id)
             .where(
                 Node.is_active.is_(True),
@@ -174,7 +175,8 @@ def check_thresholds() -> dict:
         ).all()
 
         created = 0
-        for node_id, aqi in latest_rows:
+        publishes: list[dict[str, object]] = []  # deferred until after commit
+        for node_id, aqi, category in latest_rows:
             if aqi is None:
                 continue  # no reading / no aqi for this node yet
 
@@ -205,6 +207,23 @@ def check_thresholds() -> dict:
                     "Created/upgraded %s alert for node %s (aqi=%.0f >= %.0f)",
                     severity, node_id, aqi, threshold,
                 )
+                # Defer the broadcast: publish only once the transaction has
+                # committed (get_sync_db commits on with-block exit) so a WS
+                # client that receives the push will also find the alert row in
+                # GET /alerts. publish_alert never raises, so a broker outage
+                # cannot fail the beat task or roll back the committed rows.
+                publishes.append(
+                    {
+                        "node_id": node_id,
+                        "aqi": float(aqi),
+                        "category": category,
+                        "severity": severity,
+                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    }
+                )
+
+    for publish in publishes:
+        publish_alert(**publish)
 
     logger.info("check_thresholds created %s alert(s)", created)
     return {"created": created}
