@@ -1,7 +1,7 @@
 """
-Temporary phase 1–8 smoke script (health + working).
+Temporary phase 1–10 smoke script (health + working).
 
-Runs a quick liveness check for each completed phase (1–8) of the Empyrean
+Runs a quick liveness check for each completed phase (1–10) of the Empyrean
 backend. Lightweight by design: it exercises imports, the app factory, the
 blueprint/route map, the core pure-logic entry points (fuzzy inference, MQTT
 payload validation + topic-authoritative dispatch with a stubbed broker, JWT
@@ -231,6 +231,63 @@ def phase_8_nodes_api() -> tuple[list[str], str]:
         return [f"nodes check failed: {exc}"], ""
 
 
+def phase_9_alerts_ws() -> tuple[list[str], str]:
+    """Alerts API + WebSocket: routes wired; manager + Alert DTO importable."""
+    problems: list[str] = []
+    try:
+        from app import create_app
+
+        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        for fragment in ("/api/v1/alerts", "/ws/alerts"):
+            if not any(fragment in r for r in rules):
+                problems.append(f"missing route containing {fragment!r}")
+
+        from api.schemas import AlertResponse  # noqa: F401
+        from api.ws.manager import manager
+
+        if not hasattr(manager, "broadcast"):
+            problems.append("WS manager has no broadcast()")
+        return problems, "routes wired | manager + AlertResponse importable"
+    except Exception as exc:  # noqa: BLE001
+        return [f"alerts/ws check failed: {exc}"], ""
+
+
+def phase_10_admin() -> tuple[list[str], str]:
+    """Admin API: routes wired; settings registry + schema + RBAC importable."""
+    problems: list[str] = []
+    try:
+        from app import create_app
+
+        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        for fragment in ("/api/v1/admin/health", "/api/v1/admin/settings"):
+            if not any(fragment in r for r in rules):
+                problems.append(f"missing route containing {fragment!r}")
+
+        import api.admin as admin_mod
+        from api.jwt import admin_required  # noqa: F401
+        from api.schemas import AdminSettingsUpdate
+
+        for key in (
+            "aqi_warning_threshold",
+            "aqi_critical_threshold",
+            "data_retention_days",
+            "alerts_enabled",
+            "alert_email",
+        ):
+            if key not in admin_mod._SETTING_DEFS:
+                problems.append(f"settings registry missing {key}")
+
+        # The schema forbids unknown keys (PATCH typo protection).
+        try:
+            AdminSettingsUpdate(**{"bogus_key": 1})
+            problems.append("AdminSettingsUpdate accepted an unknown key")
+        except Exception:
+            pass
+        return problems, "3 routes wired | registry + schema + RBAC importable"
+    except Exception as exc:  # noqa: BLE001
+        return [f"admin check failed: {exc}"], ""
+
+
 _PHASES = [
     (1, "Scaffolding & app factory", phase_1_scaffolding),
     (2, "Database models", phase_2_database_models),
@@ -240,11 +297,13 @@ _PHASES = [
     (6, "Fuzzy inference engine", phase_6_fuzzy_engine),
     (7, "Celery tasks", phase_7_celery_tasks),
     (8, "Nodes API", phase_8_nodes_api),
+    (9, "Alerts & WebSocket", phase_9_alerts_ws),
+    (10, "Admin endpoints", phase_10_admin),
 ]
 
 
 def main() -> bool:
-    print("Empyrean phase 1-8 smoke (TEMPORARY - replaced by the full script in a later stage)")
+    print("Empyrean phase 1-10 smoke (TEMPORARY - replaced by the full script in a later stage)")
     print("=" * 66)
     all_ok = True
     for number, name, fn in _PHASES:

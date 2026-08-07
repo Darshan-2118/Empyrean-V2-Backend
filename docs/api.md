@@ -10,7 +10,7 @@ REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits a
 
 In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `Admin` = valid JWT with `role = "admin"` required.
 
-> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/alerts/*`, `/forecast`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–9). The endpoint groups below (export, admin) are planned for later phases and currently return 404.
+> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/alerts/*`, `/forecast`, `/admin/*`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–10). The endpoint group below (export) is planned for a later phase and currently returns 404.
 
 ### Authentication
 
@@ -81,12 +81,92 @@ A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages t
 
 ### Admin
 
-> **Not implemented yet** — these endpoints return `404` until a later phase.
+> **Live since Phase 10.** All admin routes require `role = "admin"` (`@admin_required`) — a non-admin token gets `403`, no token gets `401`. Like `/profile/*`, they are **not** rate-limited (privileged, low-volume calls). Both endpoints return RFC 7807 problem+json on error.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/admin/health` | GET | Admin | Status of MQTT broker, TimescaleDB, Redis, Celery worker/beat, DB & Redis size |
 | `/admin/settings` | GET/PATCH | Admin | AQI thresholds, data retention, alert email, alerts enabled flag |
+
+#### GET `/admin/health`
+
+Per-component system health. **Fail-soft:** an unreachable component reports `degraded` inside the body — the endpoint itself **always returns `200`** (matching the liveness `/health`), so the caller, not the status code, interprets component state. Overall `status` is `ok` only when every check is `ok`, else `degraded`.
+
+**Success response** `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database":      { "status": "ok",       "detail": "PostgreSQL reachable" },
+    "timescaledb":   { "status": "ok",       "detail": "sensor_readings is a hypertable" },
+    "redis":         { "status": "ok",       "detail": "PING ok, 42 keys" },
+    "mqtt":          { "status": "degraded", "detail": "ingestion client not running (MQTT_ENABLED unset or startup failed)" },
+    "celery_worker": { "status": "degraded", "detail": "no worker responded to ping" },
+    "celery_beat":   { "status": "degraded", "detail": "no heartbeat yet — beat has not ticked since startup" }
+  },
+  "sizes": {
+    "database_bytes": 12345678,
+    "redis_keys": 42,
+    "redis_used_memory_bytes": 1048576
+  }
+}
+```
+
+- `database` — `SELECT 1` + `pg_database_size(current_database())` (`error` only if the DB is unreachable).
+- `timescaledb` — confirms `sensor_readings` is a real hypertable; extension absent ⇒ `degraded` (system works, just un-optimized).
+- `redis` — `PING` + `DBSIZE` + `INFO memory` (used_memory).
+- `mqtt` — the ingestion client's broker connection (`is_connected()`).
+- `celery_worker` — `celery_app.control.ping(timeout=2)` in a thread; ≥1 reply ⇒ `ok`.
+- `celery_beat` — freshness of the `celery:heartbeat:beat` stamp that `tasks.alerts.check_thresholds` (the 60s beat task) writes; ≤180s old (3× the schedule) ⇒ `ok`. This is the liveness proof that beat is actually firing scheduled work, since beat publishes no heartbeat of its own.
+
+**Errors:** `401` (no token), `403` (non-admin).
+
+#### GET `/admin/settings`
+
+All effective system settings. `system_settings` rows win; known knobs with no row yet fall back to config (or a fixed default) with `source: "config"` so the admin sees the effective value. Non-registry rows already in the table are also returned.
+
+**Success response** `200 OK`:
+
+```json
+{
+  "settings": [
+    { "key": "aqi_warning_threshold", "value": "100", "description": "AQI value that triggers a warning alert", "updated_at": "2026-08-07T10:00:00Z", "updated_by": 1, "source": "db" },
+    { "key": "aqi_critical_threshold", "value": "150", "description": "AQI value that triggers a critical alert", "updated_at": null, "updated_by": null, "source": "config" },
+    { "key": "data_retention_days", "value": "365", "description": "How long raw readings are retained before purging", "updated_at": null, "updated_by": null, "source": "config" },
+    { "key": "alerts_enabled", "value": "true", "description": "Master toggle for alert generation", "updated_at": null, "updated_by": null, "source": "config" },
+    { "key": "alert_email", "value": "", "description": "Email address that receives critical alerts", "updated_at": null, "updated_by": null, "source": "config" }
+  ]
+}
+```
+
+#### PATCH `/admin/settings`
+
+Update the known knobs; only provided fields change. Values are stored as text in `system_settings` (bools → `"true"`/`"false"`, `null` email → `""`). Changes take effect on the next beat/cleanup tick — the Celery tasks read `system_settings` fresh each run (e.g. `PATCH {data_retention_days: 30}` is honored by the `data_retention_cleanup` task).
+
+**Request body** (all fields optional):
+
+```json
+{
+  "aqi_warning_threshold": 90,
+  "aqi_critical_threshold": 160,
+  "data_retention_days": 30,
+  "alerts_enabled": false,
+  "alert_email": "ops@example.com"
+}
+```
+
+| Key | Type | Range / Rule |
+|---|---|---|
+| `aqi_warning_threshold` | int | 0–500; must stay `< aqi_critical_threshold` |
+| `aqi_critical_threshold` | int | 0–500 |
+| `data_retention_days` | int | 1–3650 |
+| `alerts_enabled` | bool | — |
+| `alert_email` | `string` | valid email, or `null` to clear |
+
+**Success response** `200 OK` — the fresh full settings list (same shape as GET), with each changed row now `source: "db"` and `updated_by` stamped with the admin's user id.
+
+**Errors:** `401` (no token), `403` (non-admin), `422` (validation: out-of-range value, invalid email, unknown key — `extra="forbid"` rejects typos — or `aqi_warning_threshold >= aqi_critical_threshold`), `400` (missing/non-object body).
 
 ---
 

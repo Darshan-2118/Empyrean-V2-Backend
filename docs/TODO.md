@@ -3,9 +3,9 @@
 ## Overview
 Complete implementation checklist for the Empyrean IoT Air Quality Mapping System backend. Each phase builds on the previous one.
 
-> **Status 2026-08-07:** Phases 1–9 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**182 passed**). Phases 10–14 below remain.
+> **Status 2026-08-07:** Phases 1–10 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**210 passed**). Phases 11–14 below remain.
 >
-> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–8 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas; DB-probe degrades to SKIP). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (10 tests, phases 1–9).
+> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–10 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas, Alerts/WS + Admin routes, settings registry + schema). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (11 tests, phases 1–10) plus the focused suites `tests/test_admin.py` (Phase 10) and `tests/test_alerts.py` (Phase 9).
 
 ---
 
@@ -144,10 +144,10 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 10: Admin Endpoints
 
-- [ ] **GET `/api/v1/admin/health`** — system health check (MQTT, TimescaleDB, Redis, Celery worker/beat, DB & Redis size)
-- [ ] **GET `/api/v1/admin/settings`** — view system settings (Admin only)
-- [ ] **PATCH `/api/v1/admin/settings`** — update AQI thresholds, data retention, alert config
-- [ ] **Admin middleware** — role-based access control for admin routes
+- [x] **GET `/api/v1/admin/health`** — system health check (MQTT, TimescaleDB, Redis, Celery worker/beat, DB & Redis size)
+- [x] **GET `/api/v1/admin/settings`** — view system settings (Admin only)
+- [x] **PATCH `/api/v1/admin/settings`** — update AQI thresholds, data retention, alert config
+- [x] **Admin middleware** — role-based access control for admin routes
 
 ---
 
@@ -208,7 +208,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 | **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation ✅ | M2, M3 |
 | **M5: API Layer** | Readings + forecast + nodes + alerts live; export pending | M2, M4 |
 | **M6: Real-time** | WebSocket alert broadcasting ✅ | M5 |
-| **M7: Admin & Ops** | Admin endpoints, health monitoring | M5 |
+| **M7: Admin & Ops** | Admin endpoints, health monitoring ✅ | M5 |
 | **M8: Hardening** | Tests, error handling, production deployment | M1–M7 |
 | **M8.1 (2026-08-06)** | Known-issues backlog resolved (C/H/M/L/N tiers) ✅ · `pytest -q` = 155 passed · temp phase smoke `scripts/smoke_phases.py` · Phase 13 exhaustive testing deferred | M1–M7 |
 

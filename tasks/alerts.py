@@ -27,6 +27,7 @@ from config import get_config
 from models import Alert, Node, SensorReading, SystemSetting
 from models.base import get_sync_db
 from mqtt.publisher import publish_alert
+from tasks._redis import BEAT_HEARTBEAT_KEY, get_sync_redis
 
 logger = logging.getLogger("empyrean.tasks.alerts")
 
@@ -47,6 +48,26 @@ _SEVERITY_RANK_SQL = (
     "CASE {table}.severity WHEN 'critical' THEN 2 "
     "WHEN 'warning' THEN 1 ELSE 0 END"
 )
+
+
+def _stamp_beat_heartbeat() -> None:
+    """Record that the beat scheduler fired a task (liveness for /admin/health).
+
+    ``check_thresholds`` is the most frequent beat task (every 60s), so it is
+    the natural heartbeat proving beat is actually dispatching scheduled work.
+    Stamped through the shared sync Redis client under ``BEAT_HEARTBEAT_KEY``
+    with a 1h TTL; ``GET /admin/health`` reports ``celery_beat`` healthy while
+    the stamp is fresh (≤ 3× the schedule interval). Fail-soft: no client or a
+    write error ⇒ warn and continue — a dead Redis must not fail the task.
+    """
+    client = get_sync_redis()
+    if client is None:
+        return
+    try:
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        client.set(BEAT_HEARTBEAT_KEY, stamp, ex=3600)
+    except Exception:
+        logger.warning("Failed to stamp beat heartbeat in Redis")
 
 
 def _read_settings(session) -> dict:
@@ -143,6 +164,8 @@ def check_thresholds() -> dict:
 
     Returns ``{"created": n}``.
     """
+    _stamp_beat_heartbeat()  # liveness for /admin/health (Phase 10)
+
     with get_sync_db() as session:
         settings = _read_settings(session)
 

@@ -4,7 +4,7 @@ Seed script — populates the database with initial data for development.
 Creates:
 - Admin user: ``admin`` / ``admin@empyrean.local`` (password from env
   ``SEED_ADMIN_PASSWORD``)
-- Default system settings (AQI thresholds, alerts toggle)
+- Default system settings (AQI thresholds, data retention, alerts toggle)
 - A sample node (``ESP32-01``)
 
 Safety:
@@ -104,6 +104,11 @@ def seed(force: bool = False) -> None:
                 key="aqi_critical_threshold",
                 value="150",
                 description="AQI value that triggers a critical alert",
+            ),
+            SystemSetting(
+                key="data_retention_days",
+                value="365",
+                description="How long raw readings are retained before purging",
             ),
             SystemSetting(
                 key="alerts_enabled",

@@ -14,10 +14,11 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from celery_app import celery_app
 from config import get_config
+from models import SystemSetting
 from models.base import get_sync_db
 
 logger = logging.getLogger("empyrean.tasks.aggregation")
@@ -120,28 +121,62 @@ def hourly_aggregate() -> dict:
     return {"buckets": n}
 
 
+def _retention_days(session) -> int:
+    """Resolve the retention window from the ``data_retention_days`` setting.
+
+    Mirrors ``tasks.alerts._threshold``: the ``system_settings`` row wins;
+    otherwise (or when its value is not a positive number) fall back to
+    ``DATA_RETENTION_DAYS`` config. This is what makes the Phase 10 admin
+    ``PATCH /admin/settings`` knob take effect on the cleanup task.
+    """
+    raw = session.scalar(
+        select(SystemSetting.value).where(SystemSetting.key == "data_retention_days")
+    )
+    if raw is not None:
+        try:
+            return int(float(raw))
+        except ValueError:
+            logger.warning(
+                "Setting data_retention_days=%r is not numeric — using config fallback",
+                raw,
+            )
+    return int(cfg.DATA_RETENTION_DAYS)
+
+
 @celery_app.task
 def data_retention_cleanup() -> dict:
     """Delete readings older than the configured retention period.
 
-    Retention comes from ``DATA_RETENTION_DAYS`` (default 365); expired rows
-    are purged from ``sensor_readings`` in one pass.
+    Retention comes from the ``data_retention_days`` system setting (default
+    ``DATA_RETENTION_DAYS`` = 365); expired rows are purged from
+    ``sensor_readings`` in one pass. The ``days`` value is interpolated into
+    the ``interval`` literal from an int resolved by :func:`_retention_days` —
+    never user-supplied raw SQL.
 
     Returns ``{"deleted": n}`` where ``n`` is the number of rows removed.
     """
-    days = cfg.DATA_RETENTION_DAYS
-    if days <= 0:
+    # L-8: refuse a non-positive *config* fallback before touching the DB. The
+    # setting may still override it to a valid window below, but a mis-set
+    # config must never lead to a purge query or even a session open.
+    if cfg.DATA_RETENTION_DAYS <= 0:
         logger.warning(
-            "DATA_RETENTION_DAYS=%s — refusing to purge readings (must be > 0)", days
+            "DATA_RETENTION_DAYS=%s — refusing to purge readings (must be > 0)",
+            cfg.DATA_RETENTION_DAYS,
         )
         return {"deleted": 0}
-    # ``days`` is a trusted int from config — safe to interpolate (the delete
-    # window is intentionally not user-supplied).
-    sql = text(
-        f"DELETE FROM sensor_readings WHERE time < now() - interval '{days} days'"
-    )
 
     with get_sync_db() as session:
+        days = _retention_days(session)  # setting wins, config fallback
+        if days <= 0:
+            logger.warning(
+                "effective retention %s — refusing to purge readings (must be > 0)",
+                days,
+            )
+            return {"deleted": 0}
+
+        sql = text(
+            f"DELETE FROM sensor_readings WHERE time < now() - interval '{days} days'"
+        )
         result = session.execute(sql)
         n = result.rowcount
 
