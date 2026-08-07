@@ -24,7 +24,7 @@ In production these become `https://<your-domain>/api/v1` and `wss://<your-domai
 
 1. Frontend POSTs `username`/`password` to `/auth/login`, receives `access_token`, `refresh_token`, `expires_in`, and `role`.
 2. Frontend stores tokens in memory (not localStorage, per the security requirements) and attaches `Authorization: Bearer <access_token>` to every subsequent request.
-3. `role` (`user` / `admin`) drives which routes/nav items the frontend renders. The `/alerts` endpoints (GET list, PATCH acknowledge) are **live** (Phase 9) and require any authenticated user. The admin-only endpoints (`/admin/*`, `/export`) are **not yet implemented and return `404`** (see [api.md](api.md)) — gate the UI on `role` now, and wire those calls when the endpoints land in a later phase. The admin `PATCH /nodes/:node_id` **is** implemented (Phase 8) — admins can rename a node or change its reading interval / active status from the UI.
+3. `role` (`user` / `admin`) drives which routes/nav items the frontend renders. The `/alerts` endpoints (GET list, PATCH acknowledge) are **live** (Phase 9) and require any authenticated user. The admin endpoints **`/admin/health`** and **`/admin/settings`** (GET/PATCH) are **live since Phase 10** and are admin-only — gate the admin UI on `role === "admin"` and wire those calls to the settings/health screens; a non-admin token gets `403`. (`/export` is still planned and returns `404`.) The admin `PATCH /nodes/:node_id` **is** implemented (Phase 8) — admins can rename a node or change its reading interval / active status from the UI.
 4. When a request comes back `401` with an expired-token detail, the frontend should silently call `/auth/refresh` with the stored `refresh_token`, get a new `access_token`, and retry the original request once. If refresh also fails (`401`), force logout and redirect to `/`.
 
 ## 4. Live data contract
@@ -48,7 +48,7 @@ hypercorn app:app --bind 0.0.0.0:8000
 cd Empyrean-V2-Frontend && npm run dev
 ```
 
-Confirm connectivity with `curl http://localhost:8000/api/v1/admin/health` (once authenticated) or by checking the browser network tab for successful `/readings/latest` calls with no CORS errors.
+Confirm connectivity with `curl -H "Authorization: Bearer <admin_access_token>" http://localhost:8000/api/v1/admin/health` (admin token only — a non-admin or missing token gets `403`/`401`) or by checking the browser network tab for successful `/readings/latest` calls with no CORS errors.
 
 ## 6. Keeping the contract in sync
 

@@ -472,3 +472,106 @@ def test_phase_1_to_9_alerts_ws():
             assert msg["severity"] == "critical"
 
     _run_async(_scenario())
+
+
+# ── Phase 10 · Admin endpoints ────────────────────────────────────────────────
+
+
+def test_phase_1_to_10_admin():
+    """Phase 10: admin settings GET/PATCH + health, with 401/403/422 gates."""
+
+    async def _scenario():
+        from sqlalchemy import delete, select
+
+        from api.jwt import create_access_token
+        from models import SystemSetting, User
+        from models.base import get_sync_db
+
+        user_id, node_id = _seed_user_and_node("p10")
+        admin = User(
+            username=f"p10admin_{secrets.token_hex(3)}",
+            email=f"p10admin_{secrets.token_hex(3)}@example.com",
+            password_hash=hash_password("secret-pass-123", rounds=4),
+            role="admin", is_active=True, notification_prefs={},
+        )
+        with get_sync_db() as session:
+            session.add(admin); session.flush(); admin_id = admin.id
+
+        client = create_app().test_client()
+        admin_headers = {"Authorization": f"Bearer {create_access_token(admin_id, 'admin')}"}
+        user_headers = {"Authorization": f"Bearer {create_access_token(user_id, 'user')}"}
+
+        try:
+            # GET settings — effective values surface even before any row exists
+            # (config fallback, source="config").
+            resp = await client.get("/api/v1/admin/settings", headers=admin_headers)
+            assert resp.status_code == 200
+            by_key = {s["key"]: s for s in (await resp.get_json())["settings"]}
+            assert by_key["aqi_warning_threshold"]["value"] == "100"
+            assert by_key["aqi_critical_threshold"]["value"] == "150"
+            assert "data_retention_days" in by_key
+
+            # PATCH persists a threshold (upsert) and stamps updated_by.
+            resp = await client.patch(
+                "/api/v1/admin/settings", headers=admin_headers,
+                json={"aqi_warning_threshold": 90},
+            )
+            assert resp.status_code == 200
+            updated = (await resp.get_json())["settings"]
+            assert next(s for s in updated if s["key"] == "aqi_warning_threshold")["value"] == "90"
+
+            with get_sync_db() as session:
+                row = session.scalar(
+                    select(SystemSetting).where(SystemSetting.key == "aqi_warning_threshold")
+                )
+                assert row is not None and row.value == "90" and row.updated_by == admin_id
+
+            # Cross-field guard: warning must stay below critical.
+            resp = await client.patch(
+                "/api/v1/admin/settings", headers=admin_headers,
+                json={"aqi_warning_threshold": 200, "aqi_critical_threshold": 150},
+            )
+            assert resp.status_code == 422
+
+            # Unknown key → 422 (extra="forbid" typo protection).
+            resp = await client.patch(
+                "/api/v1/admin/settings", headers=admin_headers, json={"bogus_key": 1},
+            )
+            assert resp.status_code == 422
+
+            # RBAC gates: non-admin → 403, anonymous → 401.
+            resp = await client.get("/api/v1/admin/settings", headers=user_headers)
+            assert resp.status_code == 403
+            resp = await client.get("/api/v1/admin/health")
+            assert resp.status_code == 401
+
+            # Health: always 200 with per-component checks + sizes (fail-soft).
+            resp = await client.get("/api/v1/admin/health", headers=admin_headers)
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["status"] in ("ok", "degraded")
+            for component in (
+                "database", "timescaledb", "redis", "mqtt", "celery_worker", "celery_beat",
+            ):
+                assert component in body["checks"]
+                assert body["checks"][component]["status"] in ("ok", "degraded", "error")
+            assert "database_bytes" in body["sizes"]
+        finally:
+            # Settings are global singletons (not uniquely-keyed per test) — undo
+            # anything this test may have created/updated so later tests see the
+            # same empty table.
+            with get_sync_db() as session:
+                session.execute(
+                    delete(SystemSetting).where(
+                        SystemSetting.key.in_([
+                            "aqi_warning_threshold",
+                            "aqi_critical_threshold",
+                            "data_retention_days",
+                            "alerts_enabled",
+                            "alert_email",
+                        ])
+                    )
+                )
+                session.commit()
+
+    _run_async(_scenario())

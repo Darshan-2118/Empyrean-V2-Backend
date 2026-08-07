@@ -12,6 +12,7 @@ from datetime import datetime
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     EmailStr,
     Field,
     field_serializer,
@@ -336,3 +337,24 @@ class AlertResponse(BaseModel):
     @field_serializer("triggered_at", "acknowledged_at")
     def _iso_datetime(self, value: datetime | None) -> str | None:
         return value.isoformat().replace("+00:00", "Z") if value else None
+
+
+# ── Admin schemas ─────────────────────────────────────────────────────────────
+
+
+class AdminSettingsUpdate(BaseModel):
+    """Body for PATCH /admin/settings (admin re-configuration; all optional).
+
+    ``extra="forbid"`` rejects unknown keys so a typo'd knob name surfaces as a
+    422 instead of being silently ignored. Numeric keys accept either JSON
+    numbers or numeric strings (pydantic coerces the latter); the route stores
+    everything as text in ``system_settings`` and normalizes on the way out.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    aqi_warning_threshold: int | None = Field(None, ge=0, le=500)
+    aqi_critical_threshold: int | None = Field(None, ge=0, le=500)
+    data_retention_days: int | None = Field(None, ge=1, le=3650)
+    alerts_enabled: bool | None = None
+    alert_email: EmailStr | None = None

@@ -14,6 +14,7 @@ Empyrean-V2-Backend/
 │   ├── forecast.py         # GET /forecast (60-min AQI prediction)
 │   ├── nodes.py            # GET/POST /nodes + PATCH /nodes/:node_id
 │   ├── alerts.py           # GET /alerts + PATCH /alerts/:alert_id/acknowledge
+│   ├── admin.py            # Admin: /admin/health + /admin/settings (GET/PATCH), settings registry
 │   ├── schemas.py          # Pydantic request/response DTOs
 │   └── ws/                 # WebSocket alert broadcasting (manager + routes)
 │       ├── manager.py      # Thread-safe connection manager — broadcast from MQTT thread
@@ -63,7 +64,7 @@ Empyrean-V2-Backend/
 │   ├── check.bat           # Verify wrapper for cmd/PowerShell
 │   ├── check_health.py     # Environment health check
 │   ├── seed.py             # Dev seed script
-│   ├── smoke_phases.py     # TEMPORARY phase 1–7 health/working smoke (replaced in Phase 13)
+│   ├── smoke_phases.py     # TEMPORARY phase 1–10 health/working smoke (replaced in Phase 13)
 │   └── db.sh               # Database helper (bash/Git Bash)
 ├── tasks/                  # Celery worker + beat task definitions
 │   ├── aqi.py              # EPA AQI computation from PM2.5/PM10 (pure math)
@@ -75,7 +76,8 @@ Empyrean-V2-Backend/
 │   ├── __init__.py
 │   ├── conftest.py         # Fixtures & test DB setup
 │   ├── test_smoke.py       # Smoke tests
-│   └── test_fuzzy.py       # Fuzzy engine unit tests (pure, no DB/Redis)
+│   ├── test_fuzzy.py       # Fuzzy engine unit tests (pure, no DB/Redis)
+│   ├── test_admin.py       # Phase 10 — settings registry, schema, fail-soft health, retention wiring
 ├── certs/                  # MQTT TLS certificates (gitignored)
 ├── app.py                  # Quart application factory
 ├── celery_app.py           # Celery application instance
@@ -88,14 +90,14 @@ Empyrean-V2-Backend/
 
 Key top-level directories:
 
-- `api/` — Quart route handlers (auth, profile, readings, forecast, nodes, alerts), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), and Pydantic request/response schemas; `api/ws/` holds the WebSocket alert broadcasting layer (thread-safe connection manager + JWT-authenticated `/ws/alerts` endpoint).
+- `api/` — Quart route handlers (auth, profile, readings, forecast, nodes, alerts, admin), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), and Pydantic request/response schemas; `api/ws/` holds the WebSocket alert broadcasting layer (thread-safe connection manager + JWT-authenticated `/ws/alerts` endpoint). `admin.py` is the Phase 10 admin tier: fail-soft system health plus the `system_settings` registry (GET/PATCH, admin-only).
 - `config/` — environment-based app configuration via pydantic-settings.
 - `docs/` — project documentation (this file included).
 - `fuzzy/` — Tsukamoto fuzzy inference engine: membership functions (`membership.py`), the 27-rule base + consequent ramps (`rules.py`), and defuzzification + `infer()`/`fuzzy_score()` entrypoints (`tsukamoto.py`).
 - `migrations/` — Alembic environment (`env.py`) and versioned migration files.
 - `models/` — SQLAlchemy ORM models (users, nodes, sensor readings, aggregates, alerts, settings) plus engine/session setup and shared helpers.
 - `mqtt/` — MQTT ingestion: paho client (`client.py`) subscribing to `air/node/+/reading` and `air/node/+/status`, dispatching validated readings to the Celery `process_reading` task and updating `Node.last_seen` on heartbeats, and bridging `air/alerts` broadcasts to WebSocket clients; Pydantic payload validation (`validator.py`); device config publisher (`config.py`); fire-and-forget `air/alerts` publisher (`publisher.py`) used by the Celery alert task.
-- `scripts/` — dev tooling: full-stack verification, health check, seeding, DB helpers, and a temporary phase-1–7 smoke (`smoke_phases.py`).
+- `scripts/` — dev tooling: full-stack verification, health check, seeding, DB helpers, and a temporary phase-1–10 smoke (`smoke_phases.py`).
 - `tasks/` — Celery worker + beat task definitions: per-reading enrichment (`process_reading.py`, `aqi.py`), hourly aggregation + data retention (`aggregation.py`), alert threshold checks (`alerts.py`), and linear-regression AQI forecasting (`forecast.py`).
 - `tests/` — pytest suite.
 - `certs/` — MQTT TLS certificates (gitignored).

@@ -420,6 +420,15 @@ class MQTTClient:
             self._worker_thread = None
         logger.info("MQTT client stopped")
 
+    def is_connected(self) -> bool:
+        """True when the underlying paho client reports a live broker connection.
+
+        Read by the admin health check (``GET /admin/health``); the paho loop
+        updates this state on CONNACK and on disconnect, so it is the current
+        connection status rather than "has ever connected".
+        """
+        return bool(self._client.is_connected())
+
 
 def main() -> None:
     """Standalone entrypoint: ``python -m mqtt.client``.

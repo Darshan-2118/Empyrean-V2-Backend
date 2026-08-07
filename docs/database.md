@@ -100,11 +100,11 @@ Currently a regular table (will become a TimescaleDB continuous aggregate later)
 | `updated_at` | `TIMESTAMPTZ` | |
 | `updated_by` | `INTEGER FK → users` | ON DELETE SET NULL |
 
-Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=150`, `alerts_enabled=true`
+Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=150`, `data_retention_days=365`, `alerts_enabled=true`
 
 ## Redis Key Schema
 
-> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. Phase 9 added `alerts:unacked` (30s TTL). The remaining keys land with their phases.
+> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. Phase 9 added `alerts:unacked` (30s TTL). Phase 10 added `celery:heartbeat:beat`. The remaining keys land with their phases.
 
 | Key Pattern | TTL | Value |
 |---|---|---|
@@ -112,6 +112,7 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 | `readings:latest:{node_id}` | 60s | Latest enriched reading (JSON) — write-through from `tasks.process_reading`; the same write-through also `DEL`etes the global `readings:latest` key (L-28) so the served cache is never stale past a just-persisted reading |
 | `nodes:all` | 300s | All node metadata (JSON array); PATCH `/nodes/:node_id` invalidates `readings:latest` when `is_active` changes |
 | `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — added in Phase 9; written by `GET /alerts`, invalidated by `PATCH /alerts/:alert_id/acknowledge` |
+| `celery:heartbeat:beat` | 3600s | ISO-8601 UTC timestamp of the last beat tick — written by `tasks.alerts.check_thresholds` (the 60s beat task, so this doubles as beat liveness); read by `GET /admin/health`, which reports `celery_beat` healthy while the stamp is ≤180s old (3× the schedule) |
 | `ratelimit:{endpoint}:{ip}:{minute}` | 60s | Request count (int) — per endpoint, per IP, per UTC minute (e.g. `ratelimit:auth.login:192.0.2.10:202608051530`); each endpoint has its own per-IP budget, so one endpoint cannot exhaust another's |
 | `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) — read/written by the `/forecast` endpoint & `generate_forecast` |
 | `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `tasks.forecast.retrain_model` |
