@@ -155,6 +155,15 @@ def create_app() -> Quart:
             500, "Internal Server Error", "An unexpected error occurred"
         )
 
+    # --- Request logging middleware (Phase 12) ---
+    # One INFO line per HTTP request on the dedicated ``empyrean.request``
+    # logger — method, path (no query string), status, duration_ms. Registered
+    # on _app (the cors-wrapped app) alongside the error handlers; WebSocket
+    # handshakes are not HTTP requests and are never logged.
+    from api.request_log import register_request_logging
+
+    register_request_logging(_app)
+
     # --- Health endpoint ---
     @_app.route("/health")
     async def health():

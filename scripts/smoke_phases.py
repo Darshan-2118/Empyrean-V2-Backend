@@ -1,7 +1,7 @@
 """
-Temporary phase 1–11 smoke script (health + working).
+Temporary phase 1–12 smoke script (health + working).
 
-Runs a quick liveness check for each completed phase (1–11) of the Empyrean
+Runs a quick liveness check for each completed phase (1–12) of the Empyrean
 backend. Lightweight by design: it exercises imports, the app factory, the
 blueprint/route map, the core pure-logic entry points (fuzzy inference, MQTT
 payload validation + topic-authoritative dispatch with a stubbed broker, JWT
@@ -288,6 +288,41 @@ def phase_10_admin() -> tuple[list[str], str]:
         return [f"admin check failed: {exc}"], ""
 
 
+def phase_12_error_middleware() -> tuple[list[str], str]:
+    """Validation + request-logging middleware: importable and wired on the app."""
+    problems: list[str] = []
+    try:
+        import asyncio
+
+        from api.request_log import register_request_logging  # noqa: F401
+        from api.validation import validate_body, validated_body  # noqa: F401
+        from app import create_app
+
+        # before/after_request hooks are installed (request logging).
+        app = create_app()
+        if not any((app.before_request_funcs or {}).values()) or not any(
+            (app.after_request_funcs or {}).values()
+        ):
+            problems.append("request-logging before/after hooks not registered")
+
+        # A body-less POST to a validate_body route is a 400, never a 500.
+        async def _probe():
+            client = create_app().test_client()
+            resp = await client.post(
+                "/api/v1/auth/register",
+                data=b"",
+                headers={"Content-Type": "application/json"},
+            )
+            return resp.status_code
+
+        status = asyncio.run(_probe())
+        if status != 400:
+            problems.append(f"missing-body register did not return 400 (got {status})")
+        return problems, "hooks wired | validate_body 400 on missing body"
+    except Exception as exc:  # noqa: BLE001
+        return [f"middleware check failed: {exc}"], ""
+
+
 def phase_11_export() -> tuple[list[str], str]:
     """Export: route wired; CSV generator header-first; shared ISO parser live."""
     problems: list[str] = []
@@ -344,11 +379,12 @@ _PHASES = [
     (9, "Alerts & WebSocket", phase_9_alerts_ws),
     (10, "Admin endpoints", phase_10_admin),
     (11, "Export & CSV", phase_11_export),
+    (12, "Error handling & middleware", phase_12_error_middleware),
 ]
 
 
 def main() -> bool:
-    print("Empyrean phase 1-11 smoke (TEMPORARY - replaced by the full script in a later stage)")
+    print("Empyrean phase 1-12 smoke (TEMPORARY - replaced by the full script in a later stage)")
     print("=" * 66)
     all_ok = True
     for number, name, fn in _PHASES:

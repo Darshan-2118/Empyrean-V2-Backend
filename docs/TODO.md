@@ -3,9 +3,9 @@
 ## Overview
 Complete implementation checklist for the Empyrean IoT Air Quality Mapping System backend. Each phase builds on the previous one.
 
-> **Status 2026-08-11:** Phases 1–11 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**210 passed** on 2026-08-07, with the Phase 11 suites `tests/test_export.py` and `test_phase_1_to_11_export` added on top). Phases 12–14 below remain.
+> **Status 2026-08-11:** Phases 1–12 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**239 passed** on 2026-08-11; the Phase 12 suites `tests/test_request_validation.py`, `tests/test_request_logging.py` and `test_phase_1_to_12_error_middleware` added on top of the Phase 11 baseline of **219 passed**). Phases 13–14 below remain.
 >
-> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–11 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas, Alerts/WS + Admin routes, settings registry + schema, Export CSV generator + shared ISO parser). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (12 tests, phases 1–11) plus the focused suites `tests/test_export.py` (Phase 11), `tests/test_admin.py` (Phase 10) and `tests/test_alerts.py` (Phase 9).
+> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–12 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas, Alerts/WS + Admin routes, settings registry + schema, Export CSV generator + shared ISO parser, validation + request-logging middleware). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (13 tests, phases 1–12) plus the focused suites `tests/test_request_validation.py` + `tests/test_request_logging.py` (Phase 12), `tests/test_export.py` (Phase 11), `tests/test_admin.py` (Phase 10) and `tests/test_alerts.py` (Phase 9).
 
 ---
 
@@ -163,9 +163,9 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 - [x] **RFC 7807 Problem JSON** — standardized error responses (`application/problem+json`)
 - [x] **Global error handlers** — 400, 401, 403, 404, 422, 429, 500 error handlers
-- [ ] **Request validation middleware** — Pydantic schema validation on all inputs (partial)
+- [x] **Request validation middleware** — Pydantic schema validation on all inputs (`@validate_body` decorator, RFC 7807 422s)
 - [x] **CORS configuration** — allow frontend origins, credentials support
-- [ ] **Request logging middleware** — log method, path, status, duration
+- [x] **Request logging middleware** — log method, path, status, duration (`empyrean.request` logger, one line per HTTP request)
 
 ---
 

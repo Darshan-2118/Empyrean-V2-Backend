@@ -4,12 +4,14 @@ This is the layout of the Empyrean backend repo. The tree below was verified aga
 
 ```
 Empyrean-V2-Backend/
-├── api/                    # Quart route handlers + JWT helpers + schemas + Redis cache/rate-limit
+├── api/                    # Quart route handlers + JWT helpers + schemas + Redis cache/rate-limit + middleware
 │   ├── auth.py             # Register/login/refresh/logout
 │   ├── jwt.py              # JWT encode/decode + @jwt_required / @admin_required
 │   ├── profile.py          # Profile CRUD + change password
 │   ├── cache.py            # Redis read-through cache helpers (readings/forecast)
 │   ├── rate_limit.py       # @rate_limit Redis fixed-window decorator
+│   ├── validation.py       # @validate_body Pydantic request-body middleware (Phase 12)
+│   ├── request_log.py      # App-wide request logging: method/path/status/duration (Phase 12)
 │   ├── readings.py         # GET /readings/latest + /readings/history
 │   ├── forecast.py         # GET /forecast (60-min AQI prediction)
 │   ├── nodes.py            # GET/POST /nodes + PATCH /nodes/:node_id
@@ -92,7 +94,7 @@ Empyrean-V2-Backend/
 
 Key top-level directories:
 
-- `api/` — Quart route handlers (auth, profile, readings, forecast, nodes, alerts, admin, export), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), the shared ISO-8601 query-param parser (`_time.py`), and Pydantic request/response schemas; `api/ws/` holds the WebSocket alert broadcasting layer (thread-safe connection manager + JWT-authenticated `/ws/alerts` endpoint). `admin.py` is the Phase 10 admin tier: fail-soft system health plus the `system_settings` registry (GET/PATCH, admin-only). `export.py` is the Phase 11 streaming CSV download of raw readings (`/export`).
+- `api/` — Quart route handlers (auth, profile, readings, forecast, nodes, alerts, admin, export), JWT encode/decode + route-protection decorators, Redis read-through cache helpers (`cache.py`) and rate-limit decorator (`rate_limit.py`), the shared ISO-8601 query-param parser (`_time.py`), and Pydantic request/response schemas; `api/ws/` holds the WebSocket alert broadcasting layer (thread-safe connection manager + JWT-authenticated `/ws/alerts` endpoint). `admin.py` is the Phase 10 admin tier: fail-soft system health plus the `system_settings` registry (GET/PATCH, admin-only). `export.py` is the Phase 11 streaming CSV download of raw readings (`/export`). Phase 12 adds the request-body validation middleware (`validation.py`, the `@validate_body` decorator applied to every JSON-body endpoint) and the app-wide request-logging hooks (`request_log.py`, one `empyrean.request` line per HTTP request).
 - `config/` — environment-based app configuration via pydantic-settings.
 - `docs/` — project documentation (this file included).
 - `fuzzy/` — Tsukamoto fuzzy inference engine: membership functions (`membership.py`), the 27-rule base + consequent ramps (`rules.py`), and defuzzification + `infer()`/`fuzzy_score()` entrypoints (`tsukamoto.py`).

@@ -340,7 +340,7 @@ Authorization: Bearer <access_token>
 
 ## Request validation
 
-All request fields are validated server-side; a failed validation returns `422` (RFC 7807 problem+json).
+All request-body fields are validated server-side through the Phase 12 `@validate_body` middleware (`api/validation.py`): every JSON-body endpoint is wrapped with its Pydantic schema, and the validated model is passed to the handler. A missing or malformed body returns `400`; any other schema violation returns `422` (RFC 7807 problem+json). The per-field rules below are what the schemas enforce.
 
 | Field | Endpoints | Rule |
 |---|---|---|
@@ -636,6 +636,14 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 `/profile/*` (GET/PATCH/change-password/DELETE) is **not** rate-limited. The JWT **authentication** endpoints — `register`, `login`, `refresh`, `logout` — **are** rate-limited; the caps in the table above apply to them.
 
 > Auth caps are deliberately tight (brute-force defence) — a frontend that retries login more than 10×/min (or refresh on every tab focus) will be answered `429`.
+
+---
+
+## Request Logging
+
+Phase 12 installs app-wide `before_request` / `after_request` hooks (`api/request_log.py`) that emit exactly **one INFO record per HTTP request** on the dedicated `empyrean.request` logger, carrying four fields — `method`, `path`, `status`, `duration_ms`. The logger is separate from the app logger so it can be tuned or filtered independently.
+
+Security rules: request bodies, `Authorization` headers, and query strings are never logged — `path` is the path only (no `?token=...`), and client IPs are omitted entirely (never read from a client-supplied `X-Forwarded-For`, same rule as rate limiting). WebSocket handshakes are not HTTP requests and are not logged. For the streaming `/export` endpoint the duration covers validation + response setup, not the stream send.
 
 Every response from a rate-limited endpoint carries:
 

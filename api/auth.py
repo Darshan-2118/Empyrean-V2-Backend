@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import bcrypt
-from quart import Blueprint, jsonify, request
+from quart import Blueprint, jsonify
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 
@@ -24,6 +24,7 @@ from api.jwt import (
 )
 from api.rate_limit import rate_limit
 from api.schemas import AuthResponse, LoginRequest, RefreshRequest, RegisterRequest, UserBrief
+from api.validation import validate_body, validated_body
 from config import get_config
 from models.base import AsyncSessionLocal
 from models.helpers import hash_password
@@ -64,25 +65,6 @@ def _dummy_compare(pwd_bytes: bytes) -> None:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-
-async def _json_body(model: type[Any]) -> tuple[Any | None, Any | None]:
-    """Parse the request body into ``model``, returning ``(data, error_response)``.
-
-    ``error_response`` is a ready-to-return RFC 7807 ``(body, status, headers)``
-    tuple when the body is missing or fails validation, else ``None``.
-
-    Distinction: ``request.get_json(silent=True)`` returning ``None`` (missing
-    body OR malformed JSON) -> 400; any non-``None`` value, including an empty
-    ``{}`` object, falls through to schema validation -> 422 on failure.
-    """
-    body = await request.get_json(silent=True)
-    if body is None:
-        return None, _problem_json(400, "Bad Request", "Request body is required")
-    try:
-        return model(**body), None
-    except Exception as exc:
-        return None, _problem_json(422, "Unprocessable Entity", str(exc))
 
 
 def _refresh_expiry(now: datetime, cfg: Any) -> datetime:
@@ -137,11 +119,10 @@ async def _issue_auth_tokens(user: User) -> tuple:
 
 @auth_bp.route("/register", methods=["POST"])
 @rate_limit(5, 60)  # M-12: stricter per-IP cap — account creation is a spam vector
+@validate_body(RegisterRequest)
 async def register():
     """Register a new user and auto-login (return JWT tokens)."""
-    data, err = await _json_body(RegisterRequest)
-    if err is not None:
-        return err
+    data = validated_body()
 
     # ── Create user ──────────────────────────────────────────────────────────
     # bcrypt cost-12 hashing is ~500 ms — run it off the event loop (H-6).
@@ -177,11 +158,10 @@ async def register():
 
 @auth_bp.route("/login", methods=["POST"])
 @rate_limit(10, 60)  # M-12: brute-force throttle (10/min per IP)
+@validate_body(LoginRequest)
 async def login():
     """Authenticate with username/password, return JWT tokens."""
-    data, err = await _json_body(LoginRequest)
-    if err is not None:
-        return err
+    data = validated_body()
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -221,11 +201,10 @@ async def login():
 
 @auth_bp.route("/refresh", methods=["POST"])
 @rate_limit(10, 60)  # M-12: per-IP cap on token rotation (brute-force surface)
+@validate_body(RefreshRequest)
 async def refresh():
     """Exchange a valid refresh token for a new JWT pair (token rotation)."""
-    data, err = await _json_body(RefreshRequest)
-    if err is not None:
-        return err
+    data = validated_body()
 
     token_hash = hash_refresh_token(data.refresh_token)
     now = datetime.now(timezone.utc)
@@ -292,11 +271,10 @@ async def refresh():
 
 @auth_bp.route("/logout", methods=["POST"])
 @rate_limit(10, 60)  # M-12: per-IP cap on token revocation (write-flood surface)
+@validate_body(RefreshRequest)
 async def logout():
     """Revoke a refresh token."""
-    data, err = await _json_body(RefreshRequest)
-    if err is not None:
-        return err
+    data = validated_body()
 
     token_hash = hash_refresh_token(data.refresh_token)
 

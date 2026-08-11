@@ -2,7 +2,7 @@
 
 This document describes the high-level architecture of the Empyrean backend — a real-time, geospatially-aware IoT air-quality platform. It covers the system's services, end-to-end data flow, component responsibilities, and scalability considerations.
 
-> **Status:** Phases 1–11 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints, export) are implemented. Phases 12–14 (error-handling/middleware hardening, exhaustive testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, readings/forecast API layers, the admin/health tier, and the streaming export endpoint are live.
+> **Status:** Phases 1–12 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints, export, error-handling & middleware) are implemented. Phases 13–14 (exhaustive testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, readings/forecast API layers, the admin/health tier, the streaming export endpoint, and the request-validation / request-logging middleware are live.
 
 > **Deployment status:** the physical hardware is still in development, so the current live deployment runs a single node (`ESP32-01`). The architecture below — node registration, per-node MQTT topics, `node_id`-partitioned TimescaleDB storage — already supports many concurrent nodes and needs no backend changes to scale up as more physical nodes come online; see NFR target of ≥ 50 nodes under Performance & Reliability Targets in [security.md](security.md).
 
@@ -50,7 +50,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 |---|---|---|
 | MQTT Broker | Eclipse Mosquitto | Message routing, TLS termination, device authentication, QoS management |
 | MQTT Consumer | paho-mqtt (`mqtt/client.py`) | Subscribe to device topics, validate payloads, dispatch readings to Celery, heartbeat handling, config push |
-| API Server | Quart (async Flask) | REST endpoints, JWT auth, WebSocket push, request validation |
+| API Server | Quart (async Flask) | REST endpoints, JWT auth, WebSocket push, request validation, request logging |
 | Task Queue | Celery + Redis | Async fuzzy inference, anomaly detection, scheduled aggregation, alerts |
 | Primary DB | TimescaleDB (PostgreSQL) | Time-series storage, hypertable partitioning, continuous aggregates |
 | Cache | Redis | Latest-reading cache, rate limiting, Celery broker |
