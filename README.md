@@ -22,7 +22,7 @@ All detailed docs live in [`docs/`](docs/):
 |---|---|
 | [Getting Started](docs/getting-started.md) | Prerequisites, setup, health check, verification, migrations, seeding, production |
 | [Architecture](docs/architecture.md) | Services, end-to-end data flow, component responsibilities |
-| [API Reference](docs/api.md) | Auth, profile, readings, and forecast endpoints (nodes/alerts/export/admin planned) |
+| [API Reference](docs/api.md) | Auth, profile, readings, forecast, nodes, alerts, export, and admin endpoints |
 | [Database Schema](docs/database.md) | Table definitions + Redis key schema |
 | [MQTT Topic Schema](docs/mqtt.md) | Device topics & payloads, QoS, hardware/firmware reference |
 | [Fuzzy Engine](docs/fuzzy-engine.md) | Tsukamoto inference engine — inputs, rule base, defuzzification |

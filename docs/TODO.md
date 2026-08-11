@@ -3,9 +3,9 @@
 ## Overview
 Complete implementation checklist for the Empyrean IoT Air Quality Mapping System backend. Each phase builds on the previous one.
 
-> **Status 2026-08-07:** Phases 1–10 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**210 passed**). Phases 11–14 below remain.
+> **Status 2026-08-11:** Phases 1–11 are complete and the phase-regression backlog in `docs/known-issues.md` is **fully resolved** (68 `FIXED`, 1 `WONTDO`/accepted; 0 open) — verified by a full `pytest -q` gate (**210 passed** on 2026-08-07, with the Phase 11 suites `tests/test_export.py` and `test_phase_1_to_11_export` added on top). Phases 12–14 below remain.
 >
-> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–10 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas, Alerts/WS + Admin routes, settings registry + schema). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (11 tests, phases 1–10) plus the focused suites `tests/test_admin.py` (Phase 10) and `tests/test_alerts.py` (Phase 9).
+> **Health smoke (temporary):** `scripts/smoke_phases.py` runs a lightweight phase 1–11 health/working check (imports, app factory, routes, JWT, MQTT validation+dispatch with a stubbed broker, fuzzy inference, Celery task registration, Nodes API routes + registry/schemas, Alerts/WS + Admin routes, settings registry + schema, Export CSV generator + shared ISO parser). It is a stopgap and will be replaced by the full Smoke/verification script in Phase 13. The cumulative behavioral harness is `tests/test_phase_coverage.py` (12 tests, phases 1–11) plus the focused suites `tests/test_export.py` (Phase 11), `tests/test_admin.py` (Phase 10) and `tests/test_alerts.py` (Phase 9).
 
 ---
 
@@ -153,9 +153,9 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 
 ## Phase 11: Export & Utilities
 
-- [ ] **GET `/api/v1/export`** — CSV download of raw readings for a date range
-- [ ] **CSV generator** — streaming CSV response for large exports
-- [ ] **Health check endpoint** — basic `/health` or `/api/v1/admin/health` for monitoring
+- [x] **GET `/api/v1/export`** — CSV download of raw readings for a date range (streaming, span-capped at 365 days, any authenticated user)
+- [x] **CSV generator** — streaming CSV response for large exports (~64 KB chunks from a server-side cursor)
+- [x] **Health check endpoint** — already satisfied by the liveness `/health` (app.py) and `/api/v1/admin/health` (api/admin.py, Phase 10); no new work was needed
 
 ---
 
@@ -206,7 +206,7 @@ Complete implementation checklist for the Empyrean IoT Air Quality Mapping Syste
 | **M2: Auth** | Registration, login, JWT, profile management ✅ | M1 |
 | **M3: Ingestion** | MQTT consumer, payload validation, reading intake ✅ | M1 |
 | **M4: Core Processing** | Fuzzy inference engine, Celery tasks, AQI computation ✅ | M2, M3 |
-| **M5: API Layer** | Readings + forecast + nodes + alerts live; export pending | M2, M4 |
+| **M5: API Layer** | Readings + forecast + nodes + alerts + export live ✅ | M2, M4 |
 | **M6: Real-time** | WebSocket alert broadcasting ✅ | M5 |
 | **M7: Admin & Ops** | Admin endpoints, health monitoring ✅ | M5 |
 | **M8: Hardening** | Tests, error handling, production deployment | M1–M7 |

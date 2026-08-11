@@ -2,7 +2,7 @@
 
 Base URL: `/api/v1`
 
-REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
 ---
 
@@ -10,7 +10,7 @@ REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits a
 
 In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `Admin` = valid JWT with `role = "admin"` required.
 
-> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/alerts/*`, `/forecast`, `/admin/*`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–10). The endpoint group below (export) is planned for a later phase and currently returns 404.
+> **Status:** `/auth/*`, `/profile*`, `/readings/*`, `/nodes/*`, `/alerts/*`, `/forecast`, `/admin/*`, `/export`, and `/health` are implemented (phases 1–3 + Phase 5 + Phases 7–11).
 
 ### Authentication
 
@@ -64,11 +64,35 @@ A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages t
 
 ### Export
 
-> **Not implemented yet** — this endpoint returns `404` until a later phase.
+> **Live since Phase 11.** `GET /export` streams the **raw** `sensor_readings` rows in a date range as an RFC 4180 CSV attachment (`Content-Disposition: attachment`). It is **not** admin-only — any authenticated user can download raw data (matching `/readings/*`). The response is **streamed in ~64 KB chunks** from a server-side cursor, so a one-year export never loads into memory; all validation errors (`422`) are returned **before** streaming starts, never mid-CSV.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
-| `/export` | GET | Yes | CSV download of raw readings for a date range |
+| `/export` | GET | Yes | Streaming CSV download of raw readings (`from`, `to`, `node_id`) |
+
+#### GET `/export`
+
+**Query params** (all optional, mirroring `/readings/history`):
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `from` | ISO-8601 datetime | 24h ago | Start of range (inclusive). Naive timestamps treated as UTC. |
+| `to` | ISO-8601 datetime | now | End of range (inclusive). Naive timestamps treated as UTC. |
+| `node_id` | string | all nodes | Restrict to a single node. Unknown node → empty CSV. |
+
+The span `to − from` is capped at **365 days** (`MAX_EXPORT_SPAN`, matching the default data-retention window); a wider request gets `422` rather than a silent truncation.
+
+**CSV schema** — 15 columns, header row = the model column names in order:
+
+```
+time,node_id,temperature,humidity,pressure,voc_ohm,mq135_ppm,pm1,pm25,pm10,battery_v,fuzzy_score,aqi,aqi_category,is_anomaly
+```
+
+Cells: `time` is ISO-8601 UTC with a trailing `Z` (e.g. `2026-08-10T12:00:00Z`); `None` → empty string; `is_anomaly` → lowercase `true`/`false`; everything else via `str()` (floats like `42.0`, `aqi` int like `101`). Rows are ordered by `time`, then `node_id` (chronological, deterministic). Comma-containing values are auto-quoted (RFC 4180).
+
+**Response headers:** `Content-Type: text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="readings_export_<from>_<to>.csv"` (bounds formatted `%Y%m%dT%H%M%SZ`, no colons/spaces), `Cache-Control: no-store`, plus `X-RateLimit-*` from the 200/min per-IP cap.
+
+**Errors:** `401` (missing/invalid token), `422` (malformed `from`/`to`, `from` ≥ `to`, or span over 365 days), `429` (rate limited) — all RFC 7807 problem+json.
 
 ### Profile
 
@@ -604,6 +628,7 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 | `GET /readings/latest` | 200 |
 | `GET /readings/history` | 200 |
 | `GET /forecast` | 200 |
+| `GET /export` | 200 |
 | `GET /nodes` | 200 |
 | `POST /nodes` | 200 |
 | `PATCH /nodes/:node_id` | 200 |

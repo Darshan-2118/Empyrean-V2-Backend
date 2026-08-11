@@ -1,15 +1,15 @@
 """
-Temporary phase 1–10 smoke script (health + working).
+Temporary phase 1–11 smoke script (health + working).
 
-Runs a quick liveness check for each completed phase (1–10) of the Empyrean
+Runs a quick liveness check for each completed phase (1–11) of the Empyrean
 backend. Lightweight by design: it exercises imports, the app factory, the
 blueprint/route map, the core pure-logic entry points (fuzzy inference, MQTT
 payload validation + topic-authoritative dispatch with a stubbed broker, JWT
-round-trip), and does a best-effort DB health probe. It deliberately does NOT
-run the full behavioral suite — that is the phase-coverage harness
-(``tests/test_phase_coverage.py``) and, later, the dedicated Phase 13 testing
-phase. It is TEMPORARY and will be replaced by a proper full smoke/verification
-script in a later stage.
+round-trip, the CSV export generator + shared ISO parser), and does a
+best-effort DB health probe. It deliberately does NOT run the full behavioral
+suite — that is the phase-coverage harness (``tests/test_phase_coverage.py``)
+and, later, the dedicated Phase 13 testing phase. It is TEMPORARY and will be
+replaced by a proper full smoke/verification script in a later stage.
 
 Every phase that needs a live service (Postgres) degrades to ``[SKIP]`` when
 that service is unreachable — the script never hard-fails on infrastructure you
@@ -288,6 +288,50 @@ def phase_10_admin() -> tuple[list[str], str]:
         return [f"admin check failed: {exc}"], ""
 
 
+def phase_11_export() -> tuple[list[str], str]:
+    """Export: route wired; CSV generator header-first; shared ISO parser live."""
+    problems: list[str] = []
+    try:
+        import asyncio
+        from datetime import datetime, timezone
+
+        from api.export import _CSV_COLUMNS, _csv_chunks
+        from api._time import parse_iso_datetime
+        from app import create_app
+
+        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        if not any("/api/v1/export" in r for r in rules):
+            problems.append("missing route containing '/api/v1/export'")
+
+        # DB-free CSV generator over an empty async source → header-first body.
+        async def _empty_rows():
+            return
+            yield None  # pragma: no cover — makes this an async generator
+
+        async def _collect():
+            return "".join([c async for c in _csv_chunks(_empty_rows())])
+
+        body = asyncio.run(_collect())
+        if not body.startswith(_CSV_COLUMNS[0]):
+            problems.append("CSV header not written first")
+        if body.count("\n") != 1:
+            problems.append("empty export should be header-only")
+
+        # Shared ISO parser round-trip + malformed rejection.
+        default = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        parsed = parse_iso_datetime("2026-08-10T12:00:00Z", default=default)
+        if parsed != datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc):
+            problems.append("parse_iso_datetime returned the wrong instant")
+        try:
+            parse_iso_datetime("not-a-date", default=default)
+            problems.append("parse_iso_datetime accepted malformed input")
+        except ValueError:
+            pass
+        return problems, "route wired | CSV header-first | ISO parser OK"
+    except Exception as exc:  # noqa: BLE001
+        return [f"export check failed: {exc}"], ""
+
+
 _PHASES = [
     (1, "Scaffolding & app factory", phase_1_scaffolding),
     (2, "Database models", phase_2_database_models),
@@ -299,11 +343,12 @@ _PHASES = [
     (8, "Nodes API", phase_8_nodes_api),
     (9, "Alerts & WebSocket", phase_9_alerts_ws),
     (10, "Admin endpoints", phase_10_admin),
+    (11, "Export & CSV", phase_11_export),
 ]
 
 
 def main() -> bool:
-    print("Empyrean phase 1-10 smoke (TEMPORARY - replaced by the full script in a later stage)")
+    print("Empyrean phase 1-11 smoke (TEMPORARY - replaced by the full script in a later stage)")
     print("=" * 66)
     all_ok = True
     for number, name, fn in _PHASES:
