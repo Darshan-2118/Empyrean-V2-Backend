@@ -575,3 +575,62 @@ def test_phase_1_to_10_admin():
                 session.commit()
 
     _run_async(_scenario())
+
+
+# ── Phase 11 · Export & CSV ──────────────────────────────────────────────────
+
+
+def test_phase_1_to_11_export():
+    """Phase 11: streaming CSV export serves seeded rows with a live JWT.
+
+    Drives ``GET /api/v1/export`` over HTTP with a real JWT: asserts 200 with
+    the header row + seeded reading + Content-Disposition, then the 401
+    anonymous gate and the 422 reversed-range gate.
+    """
+
+    async def _scenario():
+        import csv
+        import io
+
+        user_id, node_id = _seed_user_and_node("p11")
+        base = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+        with get_sync_db() as session:
+            session.add(SensorReading(
+                node_id=node_id,
+                time=base,
+                temperature=22.5, humidity=50.0, pm25=35.0,
+                aqi=101, aqi_category="Unhealthy for Sensitive Groups",
+                fuzzy_score=60.0, is_anomaly=False,
+            ))
+
+        from_iso = base.isoformat().replace("+00:00", "Z")
+        to_iso = (base + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+        client = create_app().test_client()
+        headers = {"Authorization": f"Bearer {create_access_token(user_id, 'user')}"}
+
+        resp = await client.get(
+            f"/api/v1/export?node_id={node_id}&from={from_iso}&to={to_iso}",
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        assert resp.mimetype == "text/csv"
+        assert "attachment; filename=" in resp.headers["Content-Disposition"]
+        assert "readings_export_20260810T120000Z_20260810T120500Z.csv" in resp.headers["Content-Disposition"]
+        rows = list(csv.reader(io.StringIO((await resp.get_data()).decode("utf-8"))))
+        assert rows[0][0] == "time"
+        assert any(r[1] == node_id for r in rows)
+        assert any(r[12] == "101" for r in rows)  # aqi cell
+
+        # anonymous → 401
+        anon = await client.get("/api/v1/export")
+        assert anon.status_code == 401
+
+        # reversed range → 422
+        rev = await client.get(
+            f"/api/v1/export?from={to_iso}&to={from_iso}",
+            headers=headers,
+        )
+        assert rev.status_code == 422
+
+    _run_async(_scenario())

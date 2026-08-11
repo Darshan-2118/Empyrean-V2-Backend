@@ -2,7 +2,7 @@
 
 This document describes the high-level architecture of the Empyrean backend — a real-time, geospatially-aware IoT air-quality platform. It covers the system's services, end-to-end data flow, component responsibilities, and scalability considerations.
 
-> **Status:** Phases 1–10 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints) are implemented. Phases 11+ (export API, testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, readings/forecast API layers, and the admin/health tier are live.
+> **Status:** Phases 1–11 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints, export) are implemented. Phases 12–14 (error-handling/middleware hardening, exhaustive testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, readings/forecast API layers, the admin/health tier, and the streaming export endpoint are live.
 
 > **Deployment status:** the physical hardware is still in development, so the current live deployment runs a single node (`ESP32-01`). The architecture below — node registration, per-node MQTT topics, `node_id`-partitioned TimescaleDB storage — already supports many concurrent nodes and needs no backend changes to scale up as more physical nodes come online; see NFR target of ≥ 50 nodes under Performance & Reliability Targets in [security.md](security.md).
 

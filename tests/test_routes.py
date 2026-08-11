@@ -24,3 +24,19 @@ def test_forecast_registered_at_documented_path():
 
     assert any("/api/v1/forecast" in s for s in rendered)
     assert not any("/api/v1/forecast/forecast" in s for s in rendered)
+
+
+def test_export_registered_at_documented_path():
+    """``GET /api/v1/export`` must be registered (not a doubled prefix).
+
+    Regression mirroring ``test_forecast_registered_at_documented_path``: the
+    export blueprint is registered under ``url_prefix="/api/v1/export"``
+    (app.py), so its route must be ``""`` (the bare-prefix form) rather than
+    ``"/export"`` — otherwise the registered path is the doubled
+    ``/api/v1/export/export`` and the documented endpoint returns 404.
+    """
+    app = create_app()
+    rendered = {str(r) for r in app.url_map.iter_rules()}
+
+    assert any("/api/v1/export" in s for s in rendered)
+    assert not any("/api/v1/export/export" in s for s in rendered)

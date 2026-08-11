@@ -17,6 +17,7 @@ from quart import Blueprint, jsonify, request
 from sqlalchemy import select, text
 from sqlalchemy.engine import RowMapping
 
+from api._time import parse_iso_datetime
 from api.cache import cache_get_json, cache_set_json
 from api.jwt import _problem_json, jwt_required
 from api.rate_limit import rate_limit
@@ -57,22 +58,6 @@ _BUCKET_MAX_SPAN = {
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-
-def _parse_iso_datetime(value: str | None, *, default: datetime) -> datetime:
-    """Parse an ISO-8601 query param, falling back to ``default``.
-
-    Treats naive timestamps as UTC; raises ``ValueError`` on malformed input.
-    """
-    if value is None:
-        return default
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"{value!r} is not a valid ISO-8601 datetime") from None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 def _latest_from_reading(r: SensorReading) -> dict:
@@ -177,10 +162,10 @@ async def history():
 
     now = datetime.now(timezone.utc)
     try:
-        from_dt = _parse_iso_datetime(
+        from_dt = parse_iso_datetime(
             request.args.get("from"), default=now - timedelta(hours=24)
         )
-        to_dt = _parse_iso_datetime(request.args.get("to"), default=now)
+        to_dt = parse_iso_datetime(request.args.get("to"), default=now)
     except ValueError as exc:
         return _problem_json(422, "Unprocessable Entity", str(exc))
 

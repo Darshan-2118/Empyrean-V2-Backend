@@ -169,7 +169,7 @@ def create_app() -> Quart:
     from api.alerts import alerts_bp
     from api.ws.routes import ws_bp
     from api.admin import admin_bp
-    # from api.export import export_bp
+    from api.export import export_bp
 
     _app.register_blueprint(auth_bp, url_prefix="/api/v1/auth")
     _app.register_blueprint(profile_bp, url_prefix="/api/v1/profile")
@@ -179,7 +179,7 @@ def create_app() -> Quart:
     _app.register_blueprint(alerts_bp, url_prefix="/api/v1/alerts")
     _app.register_blueprint(ws_bp, url_prefix="/ws")
     _app.register_blueprint(admin_bp, url_prefix="/api/v1/admin")
-    # _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
+    _app.register_blueprint(export_bp, url_prefix="/api/v1/export")
 
     return _app
 
