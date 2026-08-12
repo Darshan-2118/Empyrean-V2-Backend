@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -632,5 +633,53 @@ def test_phase_1_to_11_export():
             headers=headers,
         )
         assert rev.status_code == 422
+
+    _run_async(_scenario())
+
+
+# ── Phase 12 · Error handling & middleware ──────────────────────────────────
+
+
+def test_phase_1_to_12_error_middleware(caplog):
+    """Phase 12: RFC 7807 errors, validation 422s, and request logging.
+
+    Drives the app-level error handlers, the ``validate_body`` middleware, and
+    the ``empyrean.request`` logger over HTTP: an unknown route yields a
+    problem+json 404, a malformed body to a ``validate_body`` route yields a
+    problem+json 422, and the request-logging hooks emit a record for the
+    register request.
+    """
+    caplog.set_level(logging.INFO, logger="empyrean.request")
+
+    async def _scenario():
+        client = create_app().test_client()
+
+        # Unknown route → RFC 7807 problem+json, not HTML.
+        resp = await client.get("/api/v1/does-not-exist")
+        assert resp.status_code == 404
+        err = await resp.get_json()
+        assert err["status"] == 404
+        assert err["title"] == "Not Found"
+        assert resp.mimetype == "application/problem+json"
+
+        # Malformed body → validation middleware 422 problem+json (multiple
+        # failures: username too short, bad email, password too short).
+        resp = await client.post("/api/v1/auth/register", json={
+            "username": "x",
+            "email": "not-an-email",
+            "password": "short",
+        })
+        assert resp.status_code == 422
+        err = await resp.get_json()
+        assert err["status"] == 422
+        assert err["title"] == "Unprocessable Entity"
+
+        # The request logger emitted a record for the register request.
+        records = [r for r in caplog.records if r.name == "empyrean.request"]
+        register_logs = [
+            r for r in records if "path=/api/v1/auth/register" in r.getMessage()
+        ]
+        assert register_logs, "no request-log record for the register request"
+        assert all("status=422" in r.getMessage() for r in register_logs)
 
     _run_async(_scenario())

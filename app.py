@@ -6,6 +6,7 @@ from quart import Quart, jsonify
 from quart_cors import cors
 
 from api.jwt import _problem_json
+from api.metrics import register_metrics
 from config import get_config
 from models.base import dispose_engines
 
@@ -154,6 +155,18 @@ def create_app() -> Quart:
         return _problem_json(
             500, "Internal Server Error", "An unexpected error occurred"
         )
+
+    # --- Request logging middleware (Phase 12) ---
+    # One INFO line per HTTP request on the dedicated ``empyrean.request``
+    # logger — method, path (no query string), status, duration_ms. Registered
+    # on _app (the cors-wrapped app) alongside the error handlers; WebSocket
+    # handshakes are not HTTP requests and are never logged.
+    from api.request_log import register_request_logging
+
+    register_request_logging(_app)
+
+    # --- Prometheus metrics (Phase 14) ---
+    register_metrics(_app)
 
     # --- Health endpoint ---
     @_app.route("/health")

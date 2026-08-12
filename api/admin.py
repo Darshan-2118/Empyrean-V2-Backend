@@ -28,13 +28,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from quart import Blueprint, g, jsonify, request
+from quart import Blueprint, g, jsonify
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.cache import get_client as get_redis_client
 from api.jwt import _problem_json, admin_required
 from api.schemas import AdminSettingsUpdate
+from api.validation import validate_body, validated_body
 from config import get_config
 from models import SystemSetting
 from models.base import AsyncSessionLocal
@@ -180,20 +181,10 @@ async def get_settings():
 
 @admin_bp.route("/settings", methods=["PATCH"])
 @admin_required
+@validate_body(AdminSettingsUpdate, require_object=True)
 async def update_settings():
     """Update known settings (admin only); only provided fields change."""
-    body = await request.get_json(silent=True)
-    if body is None:
-        return _problem_json(400, "Bad Request", "Request body is required")
-    if not isinstance(body, dict):
-        return _problem_json(
-            422, "Unprocessable Entity", "Request body must be a JSON object"
-        )
-
-    try:
-        data = AdminSettingsUpdate(**body)
-    except Exception as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+    data = validated_body()
     updates = data.model_dump(exclude_unset=True)
 
     async with AsyncSessionLocal() as session:

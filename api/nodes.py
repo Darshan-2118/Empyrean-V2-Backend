@@ -15,12 +15,13 @@ import logging
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from quart import Blueprint, jsonify, request
+from quart import Blueprint, jsonify
 
 from api.cache import cache_delete, cache_get_json, cache_set_json
 from api.jwt import _problem_json, admin_required, jwt_required
 from api.rate_limit import rate_limit
 from api.schemas import NodeResponse, RegisterNodeRequest, UpdateNodeRequest
+from api.validation import validate_body, validated_body
 from models import Node
 from models.base import AsyncSessionLocal
 from mqtt.registry import get_client
@@ -92,16 +93,10 @@ async def list_nodes():
 @nodes_bp.route("", methods=["POST"])
 @rate_limit()
 @jwt_required
+@validate_body(RegisterNodeRequest)
 async def register_node():
     """Register a new sensor node (self-service; any authenticated user)."""
-    body = await request.get_json(silent=True)
-    if body is None:
-        return _problem_json(400, "Bad Request", "Request body is required")
-
-    try:
-        data = RegisterNodeRequest(**body)
-    except Exception as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+    data = validated_body()
 
     node = Node(
         node_id=data.node_id,
@@ -129,16 +124,10 @@ async def register_node():
 @nodes_bp.route("/<node_id>", methods=["PATCH"])
 @rate_limit()
 @admin_required
+@validate_body(UpdateNodeRequest)
 async def update_node(node_id: str):
     """Update metadata / config (admin only); push reading interval via MQTT."""
-    body = await request.get_json(silent=True)
-    if body is None:
-        return _problem_json(400, "Bad Request", "Request body is required")
-
-    try:
-        data = UpdateNodeRequest(**body)
-    except Exception as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+    data = validated_body()
 
     async with AsyncSessionLocal() as session:
         node = await session.get(Node, node_id)

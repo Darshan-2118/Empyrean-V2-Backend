@@ -1,0 +1,13 @@
+/var/log/nginx/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 `cat /var/run/nginx.pid`
+    endscript
+}
+# Template for app logs if ever redirected to files: /opt/empyrean/logs/*.log { daily; rotate 14; compress; delaycompress; missingok; notifempty }

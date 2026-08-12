@@ -11,12 +11,13 @@ import logging
 from datetime import datetime, timezone
 
 import bcrypt
-from quart import Blueprint, g, jsonify, request
+from quart import Blueprint, g, jsonify
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from api.jwt import _problem_json, jwt_required
 from api.schemas import ChangePasswordRequest, ProfileResponse, UpdateProfileRequest
+from api.validation import validate_body, validated_body
 from models.base import AsyncSessionLocal
 from models.helpers import hash_password
 from models.user import User
@@ -60,6 +61,7 @@ async def get_profile():
 
 @profile_bp.route("", methods=["PATCH"])
 @jwt_required
+@validate_body(UpdateProfileRequest)
 async def update_profile():
     """Update username, email, or notification preferences.
 
@@ -68,14 +70,7 @@ async def update_profile():
     are applied.
     """
     user: User = g.current_user
-    body = await request.get_json(silent=True)
-    if body is None:
-        return _problem_json(400, "Bad Request", "Request body is required")
-
-    try:
-        data = UpdateProfileRequest(**body)
-    except Exception as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+    data = validated_body()
 
     # "has_changes" is driven purely by which fields were supplied — not by
     # whether they differ from the current values — so a "{}" body is a valid
@@ -122,6 +117,7 @@ async def update_profile():
 
 @profile_bp.route("/change-password", methods=["POST"])
 @jwt_required
+@validate_body(ChangePasswordRequest)
 async def change_password():
     """Verify current password and set a new one.
 
@@ -129,14 +125,7 @@ async def change_password():
     ``current_password``/``new_password`` fields are missing.
     """
     user: User = g.current_user
-    body = await request.get_json(silent=True)
-    if body is None:
-        return _problem_json(400, "Bad Request", "Request body is required")
-
-    try:
-        data = ChangePasswordRequest(**body)
-    except Exception as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+    data = validated_body()
 
     # bcrypt cost-12 work runs off the event loop so a ~500 ms hash/compare
     # never blocks in-flight requests (H-6).
