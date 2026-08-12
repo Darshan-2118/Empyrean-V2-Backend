@@ -1,0 +1,17 @@
+[Unit]
+Description=Empyrean Quart API
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=empyrean
+Group=empyrean
+WorkingDirectory=/opt/empyrean
+EnvironmentFile=/opt/empyrean/.env
+ExecStart=/opt/empyrean/venv/bin/hypercorn app:create_app() --bind 127.0.0.1:8000 --workers 2 --access-logfile -
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

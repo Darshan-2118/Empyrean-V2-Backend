@@ -18,6 +18,7 @@ Empyrean-V2-Backend/
 │   ├── alerts.py           # GET /alerts + PATCH /alerts/:alert_id/acknowledge
 │   ├── admin.py            # Admin: /admin/health + /admin/settings (GET/PATCH), settings registry
 │   ├── export.py           # GET /export — streaming CSV download of raw readings (Phase 11)
+│   ├── metrics.py          # Prometheus metrics: /metrics endpoint + counters/histograms (Phase 14)
 │   ├── _time.py            # Shared ISO-8601 query-param parser (parse_iso_datetime)
 │   ├── schemas.py          # Pydantic request/response DTOs
 │   └── ws/                 # WebSocket alert broadcasting (manager + routes)
@@ -25,18 +26,24 @@ Empyrean-V2-Backend/
 │       └── routes.py       # /ws/alerts endpoint — JWT auth before accept
 ├── config/
 │   └── __init__.py         # App configuration (pydantic-settings, Dev/Prod)
+├── deploy/                 # Production deployment artifacts (Phase 14)
+│   ├── quart-api.service   # systemd unit — hypercorn app:create_app() on 127.0.0.1:8000
+│   ├── celery-worker.service  # systemd unit — celery_app.celery_app worker
+│   ├── celery-beat.service    # systemd unit — celery_app.celery_app beat
+│   ├── nginx.conf          # Nginx TLS termination 443→8000, /ws upgrade, /metrics restricted to 127.0.0.1
+│   ├── logrotate           # logrotate config for /var/log/nginx/ + app journal
+│   ├── deploy.sh           # Idempotent rsync + systemctl + alembic upgrade
+│   └── .env.production.example  # Template with SECRET_KEY, JWT_SECRET, DATABASE_URL, REDIS_URL, MQTT_BROKER_HOST
 ├── docs/                   # Project documentation
 │   ├── TODO.md
 │   ├── api.md
 │   ├── architecture.md
 │   ├── configuration.md
 │   ├── database.md
-│   ├── frontend-integration.md
+│   ├── deployment.md       # Production deployment guide (Phase 14)
 │   ├── fuzzy-engine.md
 │   ├── getting-started.md
-│   ├── mqtt.md
 │   ├── project-structure.md
-│   ├── schema-plan.md      # Database schema blueprint
 │   └── security.md
 ├── fuzzy/                  # Tsukamoto fuzzy inference engine
 │   ├── __init__.py         # Public API re-exports (fuzzy_score, infer)
@@ -69,7 +76,8 @@ Empyrean-V2-Backend/
 │   ├── check_health.py     # Environment health check
 │   ├── seed.py             # Dev seed script
 │   ├── smoke_phases.py     # TEMPORARY phase 1–11 health/working smoke (replaced in Phase 13)
-│   └── db.sh               # Database helper (bash/Git Bash)
+│   ├── db.sh               # Database helper (bash/Git Bash)
+│   └── bench.py            # Performance load generator (Phase 14)
 ├── tasks/                  # Celery worker + beat task definitions
 │   ├── aqi.py              # EPA AQI computation from PM2.5/PM10 (pure math)
 │   ├── process_reading.py  # Per-reading enrichment: fuzzy → AQI → anomaly → persist → cache
@@ -82,6 +90,9 @@ Empyrean-V2-Backend/
 │   ├── test_smoke.py       # Smoke tests
 │   ├── test_fuzzy.py       # Fuzzy engine unit tests (pure, no DB/Redis)
 │   ├── test_admin.py       # Phase 10 — settings registry, schema, fail-soft health, retention wiring
+│   ├── test_metrics.py     # Prometheus /metrics endpoint + counter/histogram labels (Phase 14)
+│   ├── test_bench.py       # bench.py smoke — runs against /health (Phase 14)
+│   └── test_deployment.py  # deploy/ artifact gate (Phase 14)
 ├── certs/                  # MQTT TLS certificates (gitignored)
 ├── app.py                  # Quart application factory
 ├── celery_app.py           # Celery application instance

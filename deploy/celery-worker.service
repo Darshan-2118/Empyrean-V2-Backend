@@ -1,0 +1,17 @@
+[Unit]
+Description=Empyrean Celery Worker
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=empyrean
+Group=empyrean
+WorkingDirectory=/opt/empyrean
+EnvironmentFile=/opt/empyrean/.env
+ExecStart=/opt/empyrean/venv/bin/celery -A celery_app.celery_app worker --loglevel=info
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
