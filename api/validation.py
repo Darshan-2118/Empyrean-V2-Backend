@@ -36,9 +36,6 @@ from quart import request
 from api.jwt import _problem_json
 
 
-# ── Decorator ──────────────────────────────────────────────────────────────────
-
-
 def validate_body(
     schema: type[BaseModel],
     *,

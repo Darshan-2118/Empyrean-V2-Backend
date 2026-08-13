@@ -33,9 +33,6 @@ DEFAULT_LIMIT = 200
 DEFAULT_WINDOW_SECONDS = 60
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _client_ip() -> str:
     """Client IP for rate limiting — ``request.remote_addr`` only (H-5).
 
@@ -119,9 +116,6 @@ async def _incr(client, key: str, window_seconds: int) -> int | None:
     except Exception:
         logger.warning("Redis rate-limit INCR failed for %r — failing open", key)
         return None
-
-
-# ── Decorator ──────────────────────────────────────────────────────────────────
 
 
 def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> Callable:

@@ -30,9 +30,6 @@ JWT_ALGORITHM = cfg.JWT_ALGORITHM
 ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _problem_json(status: int, title: str, detail: str | None = None):
     """Return an RFC 7807 ``application/problem+json`` response."""
     return jsonify(
@@ -43,9 +40,6 @@ def _problem_json(status: int, title: str, detail: str | None = None):
             "detail": detail or title,
         }
     ), status, {"Content-Type": "application/problem+json"}
-
-
-# ── Access token (JWT) ─────────────────────────────────────────────────────────
 
 
 def create_access_token(user_id: int, role: str) -> str:
@@ -78,9 +72,6 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return payload
 
 
-# ── Refresh token (opaque, DB-tracked) ────────────────────────────────────────
-
-
 def generate_refresh_token() -> tuple[str, str]:
     """Return ``(raw_token, sha256_hash)``.
 
@@ -94,9 +85,6 @@ def generate_refresh_token() -> tuple[str, str]:
 def hash_refresh_token(raw_token: str) -> str:
     """Hash a raw refresh token for DB lookup."""
     return hashlib.sha256(raw_token.encode()).hexdigest()
-
-
-# ── Decorators ─────────────────────────────────────────────────────────────────
 
 
 async def _authenticate_user() -> tuple[Any | None, Any | None]:

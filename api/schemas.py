@@ -68,9 +68,6 @@ def _validate_password_bytes(v: str) -> str:
     return v
 
 
-# ── Auth schemas ───────────────────────────────────────────────────────────────
-
-
 class RegisterRequest(BaseModel):
     username: str = Field(
         ..., min_length=3, max_length=50, description="Unique login name"
@@ -132,9 +129,6 @@ class UserBrief(BaseModel):
     role: str
 
 
-# ── Profile schemas ────────────────────────────────────────────────────────────
-
-
 class ProfileResponse(BaseModel):
     id: int
     username: str
@@ -187,9 +181,6 @@ class ChangePasswordRequest(BaseModel):
         return _validate_password_bytes(v)
 
 
-# ── Reading schemas ────────────────────────────────────────────────────────────
-
-
 class LatestReading(BaseModel):
     """Latest enriched reading for one node (GET /readings/latest)."""
 
@@ -232,9 +223,6 @@ class HistoryBucket(BaseModel):
         return value.isoformat().replace("+00:00", "Z") if value else None
 
 
-# ── Forecast schemas ───────────────────────────────────────────────────────────
-
-
 class ForecastPoint(BaseModel):
     """One time-stamped AQI forecast value (GET /forecast)."""
 
@@ -257,9 +245,6 @@ class ForecastResponse(BaseModel):
     node_id: str
     horizon_minutes: int
     points: list[ForecastPoint]
-
-
-# ── Node schemas ──────────────────────────────────────────────────────────────
 
 
 class NodeResponse(BaseModel):
@@ -317,9 +302,6 @@ class UpdateNodeRequest(BaseModel):
     is_active: bool | None = None
 
 
-# ── Alert schemas ─────────────────────────────────────────────────────────────
-
-
 class AlertResponse(BaseModel):
     """One threshold-breach alert (GET /alerts, PATCH acknowledge)."""
 
@@ -337,9 +319,6 @@ class AlertResponse(BaseModel):
     @field_serializer("triggered_at", "acknowledged_at")
     def _iso_datetime(self, value: datetime | None) -> str | None:
         return value.isoformat().replace("+00:00", "Z") if value else None
-
-
-# ── Admin schemas ─────────────────────────────────────────────────────────────
 
 
 class AdminSettingsUpdate(BaseModel):

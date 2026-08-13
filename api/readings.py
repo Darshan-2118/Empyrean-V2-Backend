@@ -57,9 +57,6 @@ _BUCKET_MAX_SPAN = {
 }
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _latest_from_reading(r: SensorReading) -> dict:
     """Serialize a ``SensorReading`` ORM row via the ``LatestReading`` DTO."""
     return LatestReading(
@@ -99,9 +96,6 @@ def _history_from_row(row: RowMapping) -> dict:
     ).model_dump()
 
 
-# ── GET /readings/latest ───────────────────────────────────────────────────────
-
-
 @readings_bp.route("/latest", methods=["GET"])
 @rate_limit()
 @jwt_required
@@ -135,9 +129,6 @@ async def latest():
     await cache_set_json(_LATEST_CACHE_KEY, payload, _LATEST_CACHE_TTL)
 
     return jsonify({"readings": payload}), 200
-
-
-# ── GET /readings/history ──────────────────────────────────────────────────────
 
 
 @readings_bp.route("/history", methods=["GET"])

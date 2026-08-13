@@ -24,13 +24,13 @@ All detailed docs live in [`docs/`](docs/):
 | [Architecture](docs/architecture.md) | Services, end-to-end data flow, component responsibilities |
 | [API Reference](docs/api.md) | Auth, profile, readings, forecast, nodes, alerts, export, and admin endpoints |
 | [Database Schema](docs/database.md) | Table definitions + Redis key schema |
-| [MQTT Topic Schema](docs/mqtt.md) | Device topics & payloads, QoS, hardware/firmware reference |
+| MQTT topic & payload contracts | Device topics & payloads, QoS, hardware/firmware reference (in `mqtt/`) |
 | [Fuzzy Engine](docs/fuzzy-engine.md) | Tsukamoto inference engine — inputs, rule base, defuzzification |
 | [Security & Performance](docs/security.md) | Security model, performance & reliability targets |
 | [Configuration & Services](docs/configuration.md) | Environment variables, single-system deployment |
 | [Frontend Integration](docs/frontend-integration.md) | Contract with the Empyrean-V2-Frontend repo |
 | [Project Structure](docs/project-structure.md) | Repo directory layout |
-| [Schema Plan](docs/schema-plan.md) | Database design blueprint (rationale) |
+| Database design blueprint | Rationale for schema & hypertable choices (in `models/` + alembic versions) |
 | [TODO](docs/TODO.md) | Implementation checklist |
 
 ## Quick Start

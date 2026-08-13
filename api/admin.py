@@ -96,9 +96,6 @@ def _config_fallback(key: str) -> str:
     return "true" if key == "alerts_enabled" else ""
 
 
-# ── Settings ───────────────────────────────────────────────────────────────────
-
-
 async def _load_settings() -> list[dict]:
     """Return every effective setting as ``{key, value, description, updated_at,
     updated_by, source}`` — registry knobs in order (DB row wins over config
@@ -229,9 +226,6 @@ async def update_settings():
         await session.commit()
 
     return jsonify({"settings": await _load_settings()}), 200
-
-
-# ── Health ─────────────────────────────────────────────────────────────────────
 
 
 async def _db_info() -> tuple[dict, int | None]:

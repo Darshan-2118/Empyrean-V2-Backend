@@ -27,9 +27,6 @@ logger = logging.getLogger("empyrean.profile")
 profile_bp = Blueprint("profile", __name__)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _serialise_user(user: User) -> dict:
     """Convert a ``User`` ORM instance to a ``ProfileResponse`` dict."""
     return ProfileResponse(
@@ -45,18 +42,12 @@ def _serialise_user(user: User) -> dict:
     ).model_dump()
 
 
-# ── GET /profile ───────────────────────────────────────────────────────────────
-
-
 @profile_bp.route("", methods=["GET"])
 @jwt_required
 async def get_profile():
     """Return the current user's profile."""
     user: User = g.current_user
     return jsonify(_serialise_user(user)), 200
-
-
-# ── PATCH /profile ─────────────────────────────────────────────────────────────
 
 
 @profile_bp.route("", methods=["PATCH"])
@@ -112,9 +103,6 @@ async def update_profile():
     return jsonify(_serialise_user(persistent)), 200
 
 
-# ── POST /profile/change-password ──────────────────────────────────────────────
-
-
 @profile_bp.route("/change-password", methods=["POST"])
 @jwt_required
 @validate_body(ChangePasswordRequest)
@@ -159,9 +147,6 @@ async def change_password():
     return jsonify({"message": "Password changed successfully"}), 200
 
 
-# ── DELETE /profile ────────────────────────────────────────────────────────────
-
-
 @profile_bp.route("", methods=["DELETE"])
 @jwt_required
 async def delete_profile():
@@ -169,7 +154,6 @@ async def delete_profile():
     user: User = g.current_user
     user.is_active = False
 
-    # Revoke all active refresh tokens
     from models.refresh_token import RefreshToken
 
     async with AsyncSessionLocal() as session:

@@ -52,4 +52,8 @@ deploy/*.key
 
 # Internal collaboration / skill working files (never part of the product)
 .team/
+.superpowers/
 docs/superpowers/
+
+# Local IDE / assistant working state (config + scheduler locks; never commit)
+.claude/

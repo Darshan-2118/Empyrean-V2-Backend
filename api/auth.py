@@ -64,9 +64,6 @@ def _dummy_compare(pwd_bytes: bytes) -> None:
     bcrypt.checkpw(pwd_bytes, _dummy_password_hash().encode("utf-8"))
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _refresh_expiry(now: datetime, cfg: Any) -> datetime:
     """Refresh-token expiry time for ``now``, truncated to the second."""
     return now.replace(second=0, microsecond=0) + timedelta(
@@ -92,10 +89,7 @@ def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
 
 
 async def _issue_auth_tokens(user: User) -> tuple:
-    """Create a JWT pair, persist the refresh token, return a 201 response.
-
-    Shared by register and login.
-    """
+    """Create a JWT pair, persist the refresh token, return a 201 response."""
     access = create_access_token(user.id, user.role)
     raw_refresh, token_hash = generate_refresh_token()
 
@@ -114,9 +108,6 @@ async def _issue_auth_tokens(user: User) -> tuple:
     return jsonify(_auth_payload(user, access, raw_refresh)), 201
 
 
-# ── POST /auth/register ────────────────────────────────────────────────────────
-
-
 @auth_bp.route("/register", methods=["POST"])
 @rate_limit(5, 60)  # M-12: stricter per-IP cap — account creation is a spam vector
 @validate_body(RegisterRequest)
@@ -124,7 +115,6 @@ async def register():
     """Register a new user and auto-login (return JWT tokens)."""
     data = validated_body()
 
-    # ── Create user ──────────────────────────────────────────────────────────
     # bcrypt cost-12 hashing is ~500 ms — run it off the event loop (H-6).
     pwd_hash = await asyncio.to_thread(hash_password, data.password)
 
@@ -149,11 +139,7 @@ async def register():
                 "Username or email already taken",
             )
 
-    # ── Auto-login ───────────────────────────────────────────────────────────
     return await _issue_auth_tokens(user)
-
-
-# ── POST /auth/login ───────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/login", methods=["POST"])
@@ -189,14 +175,10 @@ async def login():
             logger.warning("Failed login: inactive user %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
-        # Update last_login_at
         user.last_login_at = datetime.now(timezone.utc)
         await session.commit()
 
     return await _issue_auth_tokens(user)
-
-
-# ── POST /auth/refresh ─────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/refresh", methods=["POST"])
@@ -261,12 +243,8 @@ async def refresh():
         session.add(new_rt)
         await session.commit()
 
-    # Build response
     access = create_access_token(user.id, user.role)
     return jsonify(_auth_payload(user, access, raw_new)), 200
-
-
-# ── POST /auth/logout ──────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/logout", methods=["POST"])
