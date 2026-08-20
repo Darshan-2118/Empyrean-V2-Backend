@@ -68,3 +68,62 @@ def _fit_model(points: list[tuple[float, float, int]]) -> dict | None:
     }
 
 # --- Redis and forecasting logic remains unchanged ---
+
+
+@celery_app.task(name="tasks.forecast.retrain_model", **_TASK_AUTORETRY)
+def retrain_model() -> dict:
+    """Retrain forecast models for all active nodes and store in Redis."""
+    logger.info("Starting forecast model retraining for all active nodes")
+    redis_client = get_sync_redis()
+    if redis_client is None:
+        logger.warning("Redis client not available, skipping model retraining")
+        return {"trained": 0, "skipped": "no_redis"}
+
+    try:
+        # Get all active nodes
+        with get_sync_db() as session:
+            active_nodes = session.scalars(select(Node).where(Node.is_active.is_(True))).all()
+            node_ids = [node.node_id for node in active_nodes]
+        logger.info("Found %d active nodes for forecast retraining", len(node_ids))
+
+        trained_count = 0
+        for node_id in node_ids:
+            try:
+                # Get training points for this node
+                points = _training_points(node_id)
+                if len(points) < _MIN_TRAIN_SAMPLES:
+                    logger.debug("Insufficient training points for node %s (%d < %d)",
+                                node_id, len(points), _MIN_TRAIN_SAMPLES)
+                    continue
+
+                # Fit model
+                model_dict = _fit_model(points)
+                if model_dict is None:
+                    logger.warning("Model fitting failed for node %s", node_id)
+                    continue
+
+                # Store model in Redis
+                model_key = f"forecast_model:{node_id}"
+                import json
+                model_json = json.dumps(model_dict)
+                redis_client.set(model_key, model_json, ex=_MODEL_KEY_TTL)
+                logger.debug("Stored forecast model for node %s in Redis with key %s",
+                            node_id, model_key)
+                trained_count += 1
+
+            except Exception as e:
+                logger.exception("Error retraining forecast model for node %s: %s", node_id, e)
+                continue
+
+        logger.info("Forecast model retraining completed. Trained models: %d/%d",
+                   trained_count, len(node_ids))
+        return {"trained": trained_count, "total_nodes": len(node_ids)}
+
+    except Exception as e:
+        logger.exception("Error during forecast model retraining: %s", e)
+        return {"trained": 0, "error": str(e)}
+    finally:
+        try:
+            redis_client.close()
+        except Exception:
+            pass

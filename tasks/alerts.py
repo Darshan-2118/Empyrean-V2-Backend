@@ -294,6 +294,7 @@ def check_thresholds() -> dict:
         created = 0
         publishes: list[dict[str, object]] = []  # deferred until after commit
         emails: list[tuple[str, float, str, str]] = []  # (node, aqi, severity, msg)
+        email_recipient: str | None = None
         for node_id, aqi, category in latest_rows:
             if aqi is None:
                 continue  # no reading / no aqi for this node yet
@@ -343,17 +344,18 @@ def check_thresholds() -> dict:
                 # Email only critical breaches, and only when an address is set.
                 if severity == "critical":
                     emails.append((node_id, float(aqi), severity, message))
+                    # Get email recipient while session is still open
+                    if email_recipient is None:
+                        email_recipient = _alert_email(session)
 
     for publish in publishes:
         publish_alert(**publish)
 
     # Fail-soft email alerts for critical breaches (#11). Never raises; the
     # alert rows + WS/MQTT broadcasts above are already committed independently.
-    if emails:
-        recipient = _alert_email(session)
-        if recipient:
-            for node_id, aqi, severity, message in emails:
-                _send_alert_email(recipient, node_id, aqi, severity, message)
+    if emails and email_recipient:
+        for node_id, aqi, severity, message in emails:
+            _send_alert_email(email_recipient, node_id, aqi, severity, message)
 
     logger.info("check_thresholds created %s alert(s)", created)
     return {"created": created}

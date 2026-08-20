@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 import sys
 import re
+import os
 
-with open(r'C:\Users\darsh\Github\Empyrean-V2-Backend\docs\backlogs.md', 'r', encoding='utf-8') as f:
+# Construct path to backlogs.md relative to this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+backlog_path = os.path.join(script_dir, '..', 'docs', 'backlogs.md')
+
+with open(backlog_path, 'r', encoding='utf-8') as f:
     content = f.read()
 
 # Find section boundaries

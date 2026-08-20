@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from quart import Blueprint, g, jsonify, request
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import guany
 from api.cache import get_client as get_redis_client, cache_delete, cache_get_json, cache_set_json
 from api.jwt import _problem_json, admin_required
 from api.rate_limit import is_rate_limit_available, rate_limit

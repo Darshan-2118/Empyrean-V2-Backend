@@ -205,18 +205,21 @@ def toggle_circuit_breaker(enabled: bool) -> None:
 
 @celery_app.task_prerun.connect
 def on_task_prerun(sender, task_id, task, **kwargs):
-    """Called before every task starts. Records the attempt (#15)."""
-    if hasattr(task, "autoretry_for") and task.autoretry_for:
-        _record_task_failure(task.name)
+    """Called before every task starts. No failure recording here to avoid double-counting."""
+    # Failure recording moved to task_postrun to count only actual failures
+    pass
 
 
 @celery_app.task_postrun.connect
 def on_task_postrun(sender, task_id, task, retval, state, **kwargs):
-    """Called after every task completes. Optionally resets circuit (#15)."""
+    """Called after every task completes. Record failures and reset on success."""
     if hasattr(task, "autoretry_for") and task.autoretry_for:
-        # Don't reset on failure - the circuit breaker tracks failures
-        # A successful completion means we clear the current attempt count
-        _record_task_failure(task.name)
+        if state == 'FAILURE':
+            # Record failure for circuit breaker
+            _record_task_failure(task.name)
+        else:
+            # Task succeeded (or retried/reset): clear failure count for this task
+            reset_circuit_breaker(task.name)
 
 
 # ── Task middleware to integrate circuit breaker (#15) ───────────────────────
