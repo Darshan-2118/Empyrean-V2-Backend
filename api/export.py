@@ -66,6 +66,11 @@ _CHUNK_BYTES = 64 * 1024
 MAX_CONCURRENT_EXPORTS = 4
 _exports_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXPORTS)
 
+# Per-export timeout in seconds. Prevents slow-client DoS attack where a
+# client opens an export and holds the connection indefinitely. This timeout
+# applies to the entire export stream, not individual chunks (#5).
+MAX_EXPORT_TIMEOUT = 300  # 5 minutes
+
 # The 15 SensorReading columns in model order; the header row uses these names.
 _CSV_COLUMNS = [
     "time",
@@ -126,11 +131,26 @@ async def _csv_chunks(rows: AsyncIterable[SensorReading]) -> AsyncIterator[str]:
 
     DB-free and directly unit-testable: ``rows`` is any async iterable of
     objects exposing the 15 SensorReading attributes.
+    
+    Enforces MAX_EXPORT_TIMEOUT to prevent slow-client DoS (#5).
     """
+    import time
+    start_time = time.time()
+    
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\r\n")
     writer.writerow(_CSV_COLUMNS)
     async for row in rows:
+        # Check timeout on each row iteration
+        elapsed = time.time() - start_time
+        if elapsed > MAX_EXPORT_TIMEOUT:
+            logger.warning(
+                "Export timeout exceeded after %.1f seconds, terminating stream",
+                elapsed
+            )
+            yield out.getvalue()
+            return
+        
         writer.writerow(_format_row(row))
         if out.tell() >= _CHUNK_BYTES:
             yield out.getvalue()

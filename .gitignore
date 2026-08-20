@@ -50,6 +50,13 @@ certs/*.pem
 deploy/*.pem
 deploy/*.key
 
+# Vendored tools (e.g. Windows redis-server extracted locally)
+vendor/
+
 # Internal collaboration / skill working files (never part of the product)
 .team/
+.superpowers/
 docs/superpowers/
+
+# Local IDE / assistant working state (config + scheduler locks; never commit)
+.claude/

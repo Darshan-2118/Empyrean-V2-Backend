@@ -17,12 +17,14 @@ fallback to config.
 from __future__ import annotations
 
 import logging
+import smtplib
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from celery_app import celery_app
+from celery_app import _TASK_AUTORETRY, celery_app
 from config import get_config
 from models import Alert, Node, SensorReading, SystemSetting
 from models.base import get_sync_db
@@ -37,6 +39,9 @@ cfg = get_config()
 _AQI_WARNING_SETTING = "aqi_warning_threshold"
 _AQI_CRITICAL_SETTING = "aqi_critical_threshold"
 _ALERTS_ENABLED_SETTING = "alerts_enabled"
+
+# Maximum length for alert messages (matches DB Text(10000) constraint)
+_MAX_ALERT_MESSAGE_LENGTH = 10000
 
 # M-5: a reading older than this cannot fire/refire an alert, so an offline
 # node's last high-AQI reading stops alerting after the window passes.
@@ -121,7 +126,26 @@ def _upsert_alert(
     (warning → critical). A new alert of equal/lower severity conflicts and is
     suppressed (the ``WHERE`` is false → no-op). Returns ``True`` when a row
     was inserted or upgraded, ``False`` when suppressed.
+
+    Issue #3: Severity comparison is now atomic with the upsert using raw SQL
+    to ensure the severity ordering check cannot be bypassed by race conditions.
+
+    Validates message length to prevent storage exhaustion (Issue #24).
     """
+    # Validate message length to prevent storage exhaustion
+    if message and len(message) > _MAX_ALERT_MESSAGE_LENGTH:
+        logger.warning(
+            "Alert message for node %s exceeds %d chars, truncating",
+            node_id, _MAX_ALERT_MESSAGE_LENGTH
+        )
+        message = message[:_MAX_ALERT_MESSAGE_LENGTH]
+
+    # Severity rank mapping: critical=2, warning=1, other=0
+    severity_rank_map = {"critical": 2, "warning": 1}
+    new_severity_rank = severity_rank_map.get(severity, 0)
+    
+    # Build the ON CONFLICT DO UPDATE with severity comparison in the WHERE clause
+    # This ensures only higher-severity alerts replace existing ones
     existing_rank = _SEVERITY_RANK_SQL.format(table="alerts")
     new_rank = _SEVERITY_RANK_SQL.format(table="EXCLUDED")
     stmt = (
@@ -142,14 +166,84 @@ def _upsert_alert(
                 "threshold": threshold,
                 "severity": severity,
                 "message": message,
+                "created_at": datetime.now(timezone.utc),
             },
             where=text(f"{existing_rank} < {new_rank}"),
         )
     )
-    return bool(session.execute(stmt).rowcount)
+    result = session.execute(stmt)
+    return bool(result.rowcount)
 
 
-@celery_app.task
+# Settings key for the email-address that receives critical alerts, and the
+# config field we fall back to when no row is set (mirrors the other knobs).
+_ALERT_EMAIL_SETTING = "alert_email"
+
+
+def _alert_email(session) -> str | None:
+    """Resolve the critical-alert recipient address from ``system_settings`` (#11).
+
+    The ``alert_email`` setting is the only recipient source (it is validated as
+    an EmailStr by the admin API and stored as a row). Returns ``None`` when no
+    address is configured, in which case email alerting is skipped entirely —
+    fail-soft, never raises on a missing recipient. SMTP_* carry only transport
+    credentials.
+    """
+    row = session.scalar(
+        select(SystemSetting.value).where(SystemSetting.key == _ALERT_EMAIL_SETTING)
+    )
+    if row:
+        return str(row)
+    return None
+
+
+def _send_alert_email(recipient: str, node_id: str, aqi: float, severity: str, message: str) -> None:
+    """Send a critical-breached alert email, fail-soft (#11).
+
+    Reads SMTP transport from config. Any failure (unconfigured, auth error,
+    network) is logged and swallowed so a beat task can never fail on email —
+    the alert row and MQTT/WS broadcasts are committed independently.
+    """
+    if not recipient:
+        return
+    host, port, user, password, sender, use_tls = (
+        cfg.SMTP_HOST,
+        cfg.SMTP_PORT,
+        cfg.SMTP_USERNAME,
+        cfg.SMTP_PASSWORD,
+        cfg.SMTP_FROM or recipient,
+        cfg.SMTP_USE_TLS,
+    )
+    if not host:
+        logger.debug("SMTP_HOST not configured — skipping email alert for %s", node_id)
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"[Empyrean] {severity.title()} AQI alert — node {node_id}"
+        msg["From"] = sender
+        msg["To"] = recipient
+        msg.set_content(
+            f"AQI threshold breach on node {node_id}.\n\n"
+            f"Severity: {severity}\n"
+            f"AQI: {aqi:.0f}\n"
+            f"{message}\n\n"
+            f"Generated at {datetime.now(timezone.utc).isoformat()}"
+        )
+        with smtplib.SMTP(host, port, timeout=10) as smtp:
+            if use_tls:
+                smtp.starttls()
+            if user:
+                smtp.login(user, password)
+            smtp.send_message(msg)
+        logger.info("Sent %s alert email for node %s to %s", severity, node_id, recipient)
+    except Exception:
+        logger.warning(
+            "Failed to send alert email for node %s to %s — skipped",
+            node_id, recipient,
+        )
+
+
+@celery_app.task(name="empyrean.tasks.alerts.check_thresholds", **_TASK_AUTORETRY)
 def check_thresholds() -> dict:
     """Create threshold-breach alerts for active nodes' latest readings.
 
@@ -199,6 +293,8 @@ def check_thresholds() -> dict:
 
         created = 0
         publishes: list[dict[str, object]] = []  # deferred until after commit
+        emails: list[tuple[str, float, str, str]] = []  # (node, aqi, severity, msg)
+        email_recipient: str | None = None
         for node_id, aqi, category in latest_rows:
             if aqi is None:
                 continue  # no reading / no aqi for this node yet
@@ -214,16 +310,17 @@ def check_thresholds() -> dict:
             # unacknowledged alert of >= severity suppresses this one; a higher-
             # severity breach upgrades the existing row. ``created`` reflects
             # rows actually inserted or upgraded (suppressions count as 0).
+            message = (
+                f"AQI {aqi:.0f} exceeded the {severity} threshold "
+                f"{threshold:.0f} on node {node_id}"
+            )
             if _upsert_alert(
                 session,
                 node_id,
                 aqi,
                 threshold,
                 severity,
-                message=(
-                    f"AQI {aqi:.0f} exceeded the {severity} threshold "
-                    f"{threshold:.0f} on node {node_id}"
-                ),
+                message=message,
             ):
                 created += 1
                 logger.info(
@@ -244,9 +341,21 @@ def check_thresholds() -> dict:
                         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     }
                 )
+                # Email only critical breaches, and only when an address is set.
+                if severity == "critical":
+                    emails.append((node_id, float(aqi), severity, message))
+                    # Get email recipient while session is still open
+                    if email_recipient is None:
+                        email_recipient = _alert_email(session)
 
     for publish in publishes:
         publish_alert(**publish)
+
+    # Fail-soft email alerts for critical breaches (#11). Never raises; the
+    # alert rows + WS/MQTT broadcasts above are already committed independently.
+    if emails and email_recipient:
+        for node_id, aqi, severity, message in emails:
+            _send_alert_email(email_recipient, node_id, aqi, severity, message)
 
     logger.info("check_thresholds created %s alert(s)", created)
     return {"created": created}

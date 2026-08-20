@@ -67,6 +67,16 @@ async def forecast():
         #    this still leaves the forecast warm for the next request.
         try:
             raw_points = await asyncio.to_thread(generate_forecast, node_id)
+        except ModuleNotFoundError as exc:
+            # sklearn (a hard dependency) is the usual cause. Callers can't fix a
+            # 500 — return a clean 503 "forecast unavailable" (#10).
+            logger.error("Forecast unavailable for node %s: %s", node_id, exc)
+            return _problem_json(
+                503,
+                "Service Unavailable",
+                "Forecast computation is unavailable (missing scikit-learn). "
+                "Install scikit-learn to enable forecasts.",
+            )
         except Exception:
             logger.exception("Forecast computation failed for node %s", node_id)
             return _problem_json(500, "Internal Server Error", "Forecast failed")

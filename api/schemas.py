@@ -58,17 +58,17 @@ def _validate_password_bytes(v: str) -> str:
     ``max_length=72`` on the ``Field`` counts *characters*; bcrypt hashes and
     compares at most 72 *bytes*, so e.g. a 72-char password of multi-byte
     characters silently prefix-collides with a shorter one. Validate the byte
-    length explicitly to enforce the real limit (M-14).
+    length explicitly to enforce the real limit (M-14, Issue #27).
     """
-    if len(v.encode("utf-8")) > MAX_PASSWORD_LEN:
+    byte_len = len(v.encode("utf-8"))
+    if byte_len > MAX_PASSWORD_LEN:
+        char_len = len(v)
         raise ValueError(
-            f"password is too long: bcrypt supports at most "
-            f"{MAX_PASSWORD_LEN} bytes in UTF-8"
+            f"password exceeds bcrypt's 72-byte limit: {char_len} characters = "
+            f"{byte_len} bytes in UTF-8 (max 72 bytes). "
+            f"Please use a shorter password or fewer multi-byte characters."
         )
     return v
-
-
-# ── Auth schemas ───────────────────────────────────────────────────────────────
 
 
 class RegisterRequest(BaseModel):
@@ -132,9 +132,6 @@ class UserBrief(BaseModel):
     role: str
 
 
-# ── Profile schemas ────────────────────────────────────────────────────────────
-
-
 class ProfileResponse(BaseModel):
     id: int
     username: str
@@ -187,9 +184,6 @@ class ChangePasswordRequest(BaseModel):
         return _validate_password_bytes(v)
 
 
-# ── Reading schemas ────────────────────────────────────────────────────────────
-
-
 class LatestReading(BaseModel):
     """Latest enriched reading for one node (GET /readings/latest)."""
 
@@ -232,9 +226,6 @@ class HistoryBucket(BaseModel):
         return value.isoformat().replace("+00:00", "Z") if value else None
 
 
-# ── Forecast schemas ───────────────────────────────────────────────────────────
-
-
 class ForecastPoint(BaseModel):
     """One time-stamped AQI forecast value (GET /forecast)."""
 
@@ -257,9 +248,6 @@ class ForecastResponse(BaseModel):
     node_id: str
     horizon_minutes: int
     points: list[ForecastPoint]
-
-
-# ── Node schemas ──────────────────────────────────────────────────────────────
 
 
 class NodeResponse(BaseModel):
@@ -317,9 +305,6 @@ class UpdateNodeRequest(BaseModel):
     is_active: bool | None = None
 
 
-# ── Alert schemas ─────────────────────────────────────────────────────────────
-
-
 class AlertResponse(BaseModel):
     """One threshold-breach alert (GET /alerts, PATCH acknowledge)."""
 
@@ -337,9 +322,6 @@ class AlertResponse(BaseModel):
     @field_serializer("triggered_at", "acknowledged_at")
     def _iso_datetime(self, value: datetime | None) -> str | None:
         return value.isoformat().replace("+00:00", "Z") if value else None
-
-
-# ── Admin schemas ─────────────────────────────────────────────────────────────
 
 
 class AdminSettingsUpdate(BaseModel):

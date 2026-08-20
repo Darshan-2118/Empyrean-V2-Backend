@@ -6,6 +6,9 @@ the Celery worker is a separate process and builds its own short-lived paho
 client **lazily** (module-level singleton per worker process) to publish
 threshold-breach alerts to ``air/alerts``. Fail-open by design: a broker outage
 is logged, never raised, so a beat task can never fail on a publish.
+
+Issue #25: Added exponential backoff retry for publish failures with a queue
+for failed messages to prevent data loss during transient broker outages.
 """
 
 from __future__ import annotations
@@ -13,6 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any
 
 import paho.mqtt.client as mqtt
 
@@ -23,6 +30,16 @@ logger = logging.getLogger("empyrean.mqtt")
 _ALERTS_TOPIC = "air/alerts"
 _QOS = 1
 _CLIENT_ID = "empyrean-alert-publisher"
+
+# Retry configuration
+_MAX_RETRY_ATTEMPTS = 5
+_BASE_RETRY_DELAY = 1.0  # seconds
+_MAX_RETRY_DELAY = 30.0  # seconds
+_RETRY_JITTER = 0.1  # 10% jitter
+
+# Queue for failed messages
+_MAX_FAILED_QUEUE_SIZE = 100
+_failed_queue: deque[tuple[dict[str, Any], int]] = deque(maxlen=_MAX_FAILED_QUEUE_SIZE)  # (payload, attempt_count)
 
 _lock = threading.Lock()
 _client: mqtt.Client | None = None
@@ -49,6 +66,51 @@ def _get_client() -> mqtt.Client | None:
     return _client
 
 
+def _calculate_retry_delay(attempt: int) -> float:
+    """Calculate exponential backoff delay with jitter."""
+    import random
+    delay = min(_BASE_RETRY_DELAY * (2 ** attempt), _MAX_RETRY_DELAY)
+    # Add jitter: ±10%
+    jitter = delay * _RETRY_JITTER * (2 * random.random() - 1)
+    return delay + jitter
+
+
+def _retry_failed_messages() -> None:
+    """Retry failed messages from the queue with exponential backoff."""
+    global _failed_queue
+    if not _failed_queue:
+        return
+
+    cfg = get_config()
+    client = _get_client()
+    if client is None:
+        return  # Can't retry without a client
+
+    retried = []
+    for payload, attempt in list(_failed_queue):
+        if attempt >= _MAX_RETRY_ATTEMPTS:
+            logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
+            continue
+
+        delay = _calculate_retry_delay(attempt)
+        time.sleep(delay)
+
+        info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
+        if info.rc == 0:
+            logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
+            retried.append((payload, attempt))
+        else:
+            logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
+            # Update attempt count
+            _failed_queue.remove((payload, attempt))
+            _failed_queue.append((payload, attempt + 1))
+
+    # Remove successfully retried messages
+    for item in retried:
+        if item in _failed_queue:
+            _failed_queue.remove(item)
+
+
 def publish_alert(
     node_id: str, aqi: float, category: str | None, severity: str, timestamp: str
 ) -> None:
@@ -56,16 +118,52 @@ def publish_alert(
 
     Best-effort: never raises to the caller. A down broker is logged; the alert
     row is committed independently by the caller.
+
+    Issue #25: Failed publishes are queued for exponential backoff retry to
+    prevent data loss during transient broker outages.
     """
     with _lock:
         client = _get_client()
         if client is None:
-            logger.warning("No MQTT publisher available — dropping air/alerts publish for %s", node_id)
+            logger.warning("No MQTT publisher available — queueing air/alerts publish for %s", node_id)
+            _queue_failed_message(node_id, aqi, category, severity, timestamp)
             return
-        payload = json.dumps(
-            {"node_id": node_id, "aqi": aqi, "category": category,
-             "severity": severity, "timestamp": timestamp}
-        )
-        info = client.publish(_ALERTS_TOPIC, payload, qos=_QOS)
+
+        payload = {"node_id": node_id, "aqi": aqi, "category": category,
+                   "severity": severity, "timestamp": timestamp}
+
+        info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
         if info.rc != 0:
-            logger.warning("air/alerts publish rc=%s for %s", info.rc, node_id)
+            logger.warning("air/alerts publish rc=%s for %s — queueing for retry", info.rc, node_id)
+            _queue_failed_message(node_id, aqi, category, severity, timestamp)
+            return
+
+        # Publish succeeded - try to retry any queued messages
+        _retry_failed_messages()
+
+
+def _queue_failed_message(
+    node_id: str, aqi: float, category: str | None, severity: str, timestamp: str
+) -> None:
+    """Queue a failed message for retry with exponential backoff."""
+    payload = {"node_id": node_id, "aqi": aqi, "category": category,
+               "severity": severity, "timestamp": timestamp}
+
+    if len(_failed_queue) >= _MAX_FAILED_QUEUE_SIZE:
+        # Drop oldest message if queue is full
+        dropped = _failed_queue.popleft()
+        logger.error("Failed message queue full — dropping oldest alert for node %s", dropped[0].get("node_id", "unknown"))
+
+    _failed_queue.append((payload, 0))  # (payload, attempt_count)
+    logger.info("Queued failed alert for node %s (queue size: %d)", node_id, len(_failed_queue))
+
+
+def get_publisher_stats() -> dict:
+    """Get publisher statistics for monitoring (Issue #25)."""
+    with _lock:
+        return {
+            "client_connected": _client is not None and _client.is_connected(),
+            "failed_queue_size": len(_failed_queue),
+            "max_queue_size": _MAX_FAILED_QUEUE_SIZE,
+            "max_retry_attempts": _MAX_RETRY_ATTEMPTS,
+        }

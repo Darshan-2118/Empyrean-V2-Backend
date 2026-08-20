@@ -2,7 +2,7 @@
 
 Base URL: `/api/v1`
 
-REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment, and `GET /metrics`, which returns Prometheus text exposition format (`text/plain`)**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
 ---
 
@@ -36,11 +36,11 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 |---|---|---|---|
 | `/nodes` | GET | Yes | All registered nodes with metadata. Redis-cached, TTL 300s. |
 | `/nodes` | POST | Yes | Self-service registration of a new sensor node (any authenticated user). Invalidates the `nodes:all` cache. |
-| `/nodes/:node_id` | PATCH | Admin | Update name, location, reading interval, or active status (pushes config to device via MQTT). Invalidates the `nodes:all` cache. |
+| `/nodes/:node_id` | PATCH | Admin | Update name, location, reading interval, or active status (pushes config to device via MQTT, fail-open). Invalidates the `nodes:all` cache. Response includes `config_pushed` (bool): whether the MQTT config push to the device succeeded (`false` if the broker/client was unavailable, but the update is still persisted). |
 
 ### Alerts
 
-> **Live since Phase 9.** `GET /alerts` returns **unacknowledged** threshold-breach alerts, newest first, with `limit` (`1..200`), `offset`, and `severity` (`warning`|`critical`) filters. The full unacknowledged list is cached under `alerts:unacked` (TTL 30s) and filters/pagination are applied in-memory after the cache read, so the cache key never varies with query params. `PATCH /alerts/:alert_id/acknowledge` marks an alert acknowledged (**idempotent** — acknowledging an already-acknowledged alert is a no-op) and invalidates the cache. Alert *creation* runs in the Celery beat task (`tasks.alerts.check_thresholds`), not here.
+> **Live since Phase 9.** `GET /alerts` returns **unacknowledged** threshold-breach alerts, newest first, with `limit` (`1..200`), `offset`, and `severity` (`warning`|`critical`) filters. The response body is `{"alerts": [...], "total": <int>}`, where `total` is the count of all unacknowledged alerts before pagination. The full unacknowledged list is cached under `alerts:unacked` (TTL 30s) and filters/pagination are applied in-memory after the cache read, so the cache key never varies with query params. `PATCH /alerts/:alert_id/acknowledge` marks an alert acknowledged (**idempotent** — acknowledging an already-acknowledged alert is a no-op) and invalidates the cache. Alert *creation* runs in the Celery beat task (`tasks.alerts.check_thresholds`), not here.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|

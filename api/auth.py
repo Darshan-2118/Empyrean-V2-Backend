@@ -37,19 +37,17 @@ auth_bp = Blueprint("auth", __name__)
 
 # bcrypt hash of a dummy password, compared against when a login username does
 # not exist — so unknown usernames take the same time as a wrong password and
-# the endpoint does not leak which usernames are registered. Computed lazily on
-# first failed-login use, not at module import, so a process import never pays
-# a full cost-12 hash (~500 ms) (L-33).
-_DUMMY_PASSWORD_HASH: str | None = None
+# the endpoint does not leak which usernames are registered. Computed at module
+# import time (not lazily) so all unknown-username logins take the same time
+# (500ms), preventing timing-based username enumeration (#8). The ~500ms cost
+# only happens once at startup, not per-request.
+_DUMMY_PASSWORD_HASH: str = bcrypt.hashpw(
+    b"timing-equalizer", bcrypt.gensalt(rounds=12)
+).decode()
 
 
 def _dummy_password_hash() -> str:
-    """Return the dummy bcrypt hash, computing it on first use (L-33)."""
-    global _DUMMY_PASSWORD_HASH
-    if _DUMMY_PASSWORD_HASH is None:
-        _DUMMY_PASSWORD_HASH = bcrypt.hashpw(
-            b"timing-equalizer", bcrypt.gensalt(rounds=12)
-        ).decode()
+    """Return the pre-computed dummy bcrypt hash (#8)."""
     return _DUMMY_PASSWORD_HASH
 
 
@@ -62,9 +60,6 @@ def _dummy_compare(pwd_bytes: bytes) -> None:
     the timing must match a real password check.
     """
     bcrypt.checkpw(pwd_bytes, _dummy_password_hash().encode("utf-8"))
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 
 def _refresh_expiry(now: datetime, cfg: Any) -> datetime:
@@ -92,10 +87,7 @@ def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
 
 
 async def _issue_auth_tokens(user: User) -> tuple:
-    """Create a JWT pair, persist the refresh token, return a 201 response.
-
-    Shared by register and login.
-    """
+    """Create a JWT pair, persist the refresh token, return a 201 response."""
     access = create_access_token(user.id, user.role)
     raw_refresh, token_hash = generate_refresh_token()
 
@@ -114,9 +106,6 @@ async def _issue_auth_tokens(user: User) -> tuple:
     return jsonify(_auth_payload(user, access, raw_refresh)), 201
 
 
-# ── POST /auth/register ────────────────────────────────────────────────────────
-
-
 @auth_bp.route("/register", methods=["POST"])
 @rate_limit(5, 60)  # M-12: stricter per-IP cap — account creation is a spam vector
 @validate_body(RegisterRequest)
@@ -124,7 +113,6 @@ async def register():
     """Register a new user and auto-login (return JWT tokens)."""
     data = validated_body()
 
-    # ── Create user ──────────────────────────────────────────────────────────
     # bcrypt cost-12 hashing is ~500 ms — run it off the event loop (H-6).
     pwd_hash = await asyncio.to_thread(hash_password, data.password)
 
@@ -149,11 +137,7 @@ async def register():
                 "Username or email already taken",
             )
 
-    # ── Auto-login ───────────────────────────────────────────────────────────
     return await _issue_auth_tokens(user)
-
-
-# ── POST /auth/login ───────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/login", methods=["POST"])
@@ -189,14 +173,10 @@ async def login():
             logger.warning("Failed login: inactive user %r", data.username)
             return _problem_json(401, "Unauthorized", "Invalid username or password")
 
-        # Update last_login_at
         user.last_login_at = datetime.now(timezone.utc)
         await session.commit()
 
     return await _issue_auth_tokens(user)
-
-
-# ── POST /auth/refresh ─────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/refresh", methods=["POST"])
@@ -253,6 +233,13 @@ async def refresh():
         raw_new, new_hash = generate_refresh_token()
         new_expires = _refresh_expiry(now, get_config())
 
+        # Revoke the old refresh token as part of rotation (only the specific token)
+        await session.execute(
+            sa_update(RefreshToken)
+            .where(RefreshToken.token_hash == token_hash)
+            .values(revoked=True)
+        )
+
         new_rt = RefreshToken(
             user_id=user.id,
             token_hash=new_hash,
@@ -261,12 +248,8 @@ async def refresh():
         session.add(new_rt)
         await session.commit()
 
-    # Build response
     access = create_access_token(user.id, user.role)
     return jsonify(_auth_payload(user, access, raw_new)), 200
-
-
-# ── POST /auth/logout ──────────────────────────────────────────────────────────
 
 
 @auth_bp.route("/logout", methods=["POST"])

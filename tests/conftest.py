@@ -166,7 +166,16 @@ def default_settings(db_session: Session) -> list[SystemSetting]:
         SystemSetting(key="alerts_enabled", value="true",
                       description="Master alert toggle"),
     ]
+    from sqlalchemy import select
     for s in settings:
-        db_session.add(s)
+        existing = db_session.execute(
+            select(SystemSetting).where(SystemSetting.key == s.key)
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.value, existing.description = s.value, s.description
+            idx = settings.index(s)
+            settings[idx] = existing
+        else:
+            db_session.add(s)
     db_session.flush()
     return settings

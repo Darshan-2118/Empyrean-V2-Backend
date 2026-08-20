@@ -1,0 +1,130 @@
+[
+  {
+    "script": "scripts/dev-up.bat",
+    "assumed_deps": [
+      "Python venv at scripts/../venv with celery.exe and python.exe in venv/Scripts",
+      "celery_app module (referenced via -A celery_app.celery_app)",
+      "Redis (expected already running — script only hints to start it via WSL)"
+    ],
+    "prechecks": "None. Launches each component in a separate cmd window without verifying the venv, celery.exe, or redis exist before spawning.",
+    "fail_behavior_if_dep_missing": "No validation. If venv\\Scripts\\celery.exe or python.exe are absent the spawned windows print errors but the .bat exits 0. Redis is never checked or started — only an echo hint is printed. Dependency failures surface only inside the child console windows."
+  },
+  {
+    "script": "scripts/dev-up-quick.bat",
+    "assumed_deps": [
+      "Python venv at scripts/../venv with celery.exe and python.exe",
+      "celery_app module",
+      "Redis (hinted to start via WSL; not started by this script)"
+    ],
+    "prechecks": "None. Launches Celery (worker -B) and the API in separate cmd windows with no existence checks on the venv or binaries.",
+    "fail_behavior_if_dep_missing": "No validation. Missing venv\\Scripts\\celery.exe or python.exe produces errors in the child windows only; the .bat exits 0. Redis is not checked — the script only prints a redis-cli ping hint. Silent failure from the .bat's perspective."
+  },
+  {
+    "script": "scripts/dev-down.bat",
+    "assumed_deps": [
+      "Windows taskkill command",
+      "Running processes/window titles: empyrean-api, empyrean-celery-worker, empyrean-celery-beat"
+    ],
+    "prechecks": "None. Uses taskkill with /F /T and window-title filters; suppresses all output/error.",
+    "fail_behavior_if_dep_missing": "Best-effort only: taskkill output is suppressed (>nul 2>nul). If no matching process exists the script still prints 'Stopped...' and exits 0. It never fails loudly — missing processes are silently ignored."
+  },
+  {
+    "script": "deploy/deploy.sh",
+    "assumed_deps": [
+      "bash with set -euo pipefail",
+      "rsync",
+      "ssh (passwordless key auth to SERVER_USER@SERVER_HOST)",
+      "sudo on remote host",
+      "python3, pip, alembic in remote venv",
+      "systemd and nginx on remote host",
+      "deploy/*.service unit files and deploy/.env.production.example template",
+      "requirements.txt",
+      "SERVER_HOST env var"
+    ],
+    "prechecks": "Checks only that SERVER_HOST is non-empty (exits 1 with message if missing). Otherwise relies on set -e to abort on any command failure; an ERR trap prints 'FAILED — see error output above'.",
+    "fail_behavior_if_dep_missing": "If SERVER_HOST unset: exits 1 immediately with a clear message. If rsync/ssh/sudo/python3/alembic/systemd or the deploy/* files are missing, set -e aborts the script and the ERR trap prints a FAILED banner. Failures are loud and abort the deployment."
+  },
+  {
+    "script": "scripts/verify.py",
+    "assumed_deps": [
+      "Python 3.12+ (type-hint syntax)",
+      "SQLAlchemy (for engine + text)",
+      "alembic",
+      "scripts.db_utils.make_engine",
+      "config module (get_config)",
+      "Redis (checked via check_health.py)",
+      "TimescaleDB (checked via check_health.py)",
+      "PostgreSQL (via DATABASE_URL / .env)",
+      "pytest (only when not --quick)"
+    ],
+    "prechecks": "None upfront. Each of the 4 phases is wrapped in try/except and reports OK/FAIL individually; check_postgresql probes the DB connection, check_migrations queries alembic_version.",
+    "fail_behavior_if_dep_missing": "Each phase degrades gracefully: a missing import or unreachable DB is caught and printed as FAIL with the exception message. The script exits 1 if any phase failed (or 0 if all pass). Failures are reported clearly and loudly, but the script does not crash — it continues to run remaining checks."
+  },
+  {
+    "script": "scripts/check_health.py",
+    "assumed_deps": [
+      "Python 3.12+",
+      "SQLAlchemy (inspect, text)",
+      "config.get_config (reads .env: DATABASE_URL, REDIS_URL, APP_ENV)",
+      "PostgreSQL (via make_engine)",
+      "TimescaleDB (queried for sensor_readings hypertable)",
+      "alembic + alembic.ini",
+      "redis-py (Redis.from_url)",
+      "models package, app.create_app"
+    ],
+    "prechecks": "None upfront. DB connection is probed in a try/except; dependent checks 3–6 and 8 are SKIPPED if the DB is unreachable. Redis is probed with an explicit ping. Each check self-contains its error handling.",
+    "fail_behavior_if_dep_missing": "Every check prints [OK], [FAIL], or [SKIP] with a detail string. DB-unreachable degrades dependent checks to [SKIP] (no hard failure on unstarted infra). A missing module/import causes [FAIL] with the exception text. Returns False and exits 1 if any check failed; exits 0 only when all pass."
+  },
+  {
+    "script": "scripts/check.bat",
+    "assumed_deps": [
+      "python on PATH",
+      "scripts/verify.py"
+    ],
+    "prechecks": "None beyond launching verify.py.",
+    "fail_behavior_if_dep_missing": "If python is missing or verify.py raises, %ERRORLEVEL% is nonzero; the .bat pauses and exits with that code. Dependency problems are surfaced through verify.py's own FAIL output plus the paused console."
+  },
+  {
+    "script": "scripts/smoke_phases.py",
+    "assumed_deps": [
+      "Python 3.12+",
+      "Project modules: app, models, api, tasks, fuzzy, mqtt, celery_app",
+      "PostgreSQL (optional/best-effort via models.base.sync_engine)",
+      "Redis/Celery not required for smoke (broker stubbed)"
+    ],
+    "prechecks": "None. _db_reachable() is a best-effort probe, not a requirement gate. Each phase is wrapped in try/except.",
+    "fail_behavior_if_dep_missing": "Import errors within a phase are caught and reported as [FAIL] with the exception; the script continues to the next phase. A missing DB just causes [SKIP] for DB-dependent probes (never a crash). Exits 0 if all phases pass/skip, 1 if any phase [FAIL]. Failures are loud per-phase; missing infra does not abort the run."
+  },
+  {
+    "script": "scripts/seed.py",
+    "assumed_deps": [
+      "Python 3.12+",
+      "config.get_config (APP_ENV, DATABASE_URL)",
+      "models package (User, Node, SystemSetting, get_sync_db, hash_password)",
+      "PostgreSQL (via get_sync_db session)"
+    ],
+    "prechecks": "Two explicit guards: refuses APP_ENV=production without --force (exits 3); requires SEED_ADMIN_PASSWORD env var or exits 3. No upfront DB connectivity check — it opens a session and lets failures raise.",
+    "fail_behavior_if_dep_missing": "Missing SEED_ADMIN_PASSWORD → exits 3 with a clear message. Production env without --force → exits 3. Otherwise wraps seed() in try/except; any exception logs 'Seed failed: ...' and exits 1. DB/network failures surface as caught exceptions with explicit exit code 1."
+  },
+  {
+    "script": "scripts/bench.py",
+    "assumed_deps": [
+      "Python 3 (asyncio, urllib)",
+      "A running HTTP server at the target URL (default http://127.0.0.1:8000/health)"
+    ],
+    "prechecks": "None. Only argparse for URL/concurrency/requests args. Connects directly.",
+    "fail_behavior_if_dep_missing": "If the target HTTP server is not running, asyncio open_connection raises ConnectionRefusedError or OSError; the script prints 'connection failed: {e}' to stderr and exits 1. No retry or probe beforehand. When the server is up, errors during the run are counted as 'errors' but the script still exits 0."
+  },
+  {
+    "script": "scripts/db.sh",
+    "assumed_deps": [
+      "bash (set -euo pipefail)",
+      "psql client",
+      ".env file with DATABASE_URL",
+      "alembic (for migrate subcommand)",
+      "python (for seed/check subcommands)"
+    ],
+    "prechecks": "Explicit: greps .env for a '^DATABASE_URL=' line; if absent, prints 'ERROR: DATABASE_URL not found in .env' and exits 1. No checks for psql/alembic/python presence.",
+    "fail_behavior_if_dep_missing": "DATABASE_URL missing in .env → exits 1 with a clear message. Beyond that, set -euo pipefail aborts on any command failure (e.g. psql not installed, auth failed, alembic version mismatch) and the shell prints the failing command's non-zero exit. Failures are loud and abort the requested subcommand."
+  }
+]

@@ -30,9 +30,6 @@ JWT_ALGORITHM = cfg.JWT_ALGORITHM
 ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _problem_json(status: int, title: str, detail: str | None = None):
     """Return an RFC 7807 ``application/problem+json`` response."""
     return jsonify(
@@ -43,9 +40,6 @@ def _problem_json(status: int, title: str, detail: str | None = None):
             "detail": detail or title,
         }
     ), status, {"Content-Type": "application/problem+json"}
-
-
-# ── Access token (JWT) ─────────────────────────────────────────────────────────
 
 
 def create_access_token(user_id: int, role: str) -> str:
@@ -73,12 +67,15 @@ def decode_access_token(token: str) -> dict[str, Any]:
         algorithms=[JWT_ALGORITHM],
         options={"require": ["sub", "exp"]},
     )
+    # Validate token type is explicitly "access" to prevent refresh token reuse
     if payload.get("type") != "access":
-        raise pyjwt.InvalidTokenError("Not an access token")
+        raise pyjwt.InvalidTokenError("Token type must be 'access'")
+    # Validate required claims are present and correct
+    if not isinstance(payload.get("sub"), int):
+        raise pyjwt.InvalidTokenError("Invalid subject claim")
+    if payload.get("role") not in ("admin", "user"):
+        raise pyjwt.InvalidTokenError("Invalid role claim")
     return payload
-
-
-# ── Refresh token (opaque, DB-tracked) ────────────────────────────────────────
 
 
 def generate_refresh_token() -> tuple[str, str]:
@@ -94,9 +91,6 @@ def generate_refresh_token() -> tuple[str, str]:
 def hash_refresh_token(raw_token: str) -> str:
     """Hash a raw refresh token for DB lookup."""
     return hashlib.sha256(raw_token.encode()).hexdigest()
-
-
-# ── Decorators ─────────────────────────────────────────────────────────────────
 
 
 async def _authenticate_user() -> tuple[Any | None, Any | None]:

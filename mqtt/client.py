@@ -56,18 +56,26 @@ _QOS = 1
 # at-least-once contract and the M-8 bounded-queue/retry durability path.
 _CLIENT_ID = "empyrean-backend"
 
-# Worker-queue backpressure bounds (M-9/M-8). The queue is bounded to bound
-# memory; production should pair this with the Celery acks_late path (Fixer C).
-_QUEUE_MAX = 1000
-_ENQUEUE_MAX_ATTEMPTS = 5
-_ENQUEUE_TIMEOUT = 0.5  # seconds
+# Worker-queue backpressure bounds (I-35): configurable via config/__init__.py
+# The queue is bounded to bound memory; production should pair this with the Celery acks_late path.
+_QUEUE_MAX = get_config().MQTT_QUEUE_MAX
+_ENQUEUE_MAX_ATTEMPTS = get_config().MQTT_ENQUEUE_MAX_ATTEMPTS
+_ENQUEUE_TIMEOUT = get_config().MQTT_ENQUEUE_TIMEOUT
 
-# Dispatch retry bounds for a transient Celery/Redis outage (M-8).
+# Dispatch retry bounds for a transient Celery/Redis outage (I-35): configurable
+# via config/__init__.py.
 _DISPATCH_MAX_ATTEMPTS = 3
 _DISPATCH_RETRY_DELAY = 0.5  # seconds
 
 # Truncation length for logging raw payloads (L-21).
 _LOG_TRUNCATE = 200
+
+# Track dropped readings and queue overflow events (#04 — observability)
+# Incremented when dispatch fails after retries or queue overflows
+_dropped_readings_count = 0
+_dropped_readings_lock = threading.Lock()
+_queue_overflow_count = 0
+_queue_overflow_lock = threading.Lock()
 
 
 def _truncated_repr(value: object) -> str:
@@ -76,6 +84,40 @@ def _truncated_repr(value: object) -> str:
     if len(text) > _LOG_TRUNCATE:
         return text[:_LOG_TRUNCATE] + f"...<{len(text) - _LOG_TRUNCATE} more>"
     return text
+
+
+def get_dropped_readings_count() -> int:
+    """Return the count of MQTT readings dropped since app startup (#04).
+    
+    Used by /admin/health to surface data loss events. A non-zero count
+    indicates readings failed to enqueue after bounded retry.
+    """
+    with _dropped_readings_lock:
+        return _dropped_readings_count
+
+
+def get_queue_overflow_count() -> int:
+    """Return the count of queue overflow events since app startup (#04).
+    
+    Used by /admin/health to surface when the MQTT worker queue exceeded
+    capacity and dropped messages.
+    """
+    with _queue_overflow_lock:
+        return _queue_overflow_count
+
+
+def _increment_dropped_readings() -> None:
+    """Increment dropped readings counter (#04)."""
+    global _dropped_readings_count
+    with _dropped_readings_lock:
+        _dropped_readings_count += 1
+
+
+def _increment_queue_overflow() -> None:
+    """Increment queue overflow counter (#04)."""
+    global _queue_overflow_count
+    with _queue_overflow_lock:
+        _queue_overflow_count += 1
 
 
 def _resolve_payload(data: bytes | str) -> str | None:
@@ -150,6 +192,8 @@ def _dispatch_reading(node_id: str, payload_model) -> None:
     times with backoff instead of being logged-and-dropped on the first error.
     Serialized with ``mode="json"`` so Pydantic ``datetime`` is a JSON string
     before Kombu encodes it (prevents the C-1 ``datetime`` round-trip bug).
+    
+    On final failure after all retries, increments _dropped_readings_count (#04).
     """
     serialized = payload_model.model_dump(mode="json")
     task = _get_process_reading_task()
@@ -160,10 +204,11 @@ def _dispatch_reading(node_id: str, payload_model) -> None:
         except Exception:
             if attempt == _DISPATCH_MAX_ATTEMPTS:
                 logger.exception(
-                    "Giving up dispatching reading for node %r after %d attempts",
+                    "Giving up dispatching reading for node %r after %d attempts — reading DROPPED",
                     node_id,
                     attempt,
                 )
+                _increment_dropped_readings()
                 return
             time.sleep(_DISPATCH_RETRY_DELAY * attempt)
 
@@ -189,13 +234,19 @@ def _handle_reading(node_id: str, raw: str) -> None:
 
 
 def _handle_alert(raw: str) -> None:
-    """Forward an ``air/alerts`` message to WebSocket clients (thread-safe)."""
+    """Forward an ``air/alerts`` message to WebSocket clients (thread-safe).
+
+    Broadcasts start asynchronously; success/failure is logged but not
+    propagated up to avoid compounding errors (#14).
+    """
     data = _json_loads(raw, "alert")
     if data is None:
         return
     from api.ws.manager import manager  # import here to avoid an import cycle
 
-    manager.broadcast(data)
+    success, count = manager.broadcast(data)
+    if not success:
+        logger.warning("Broadcast failed to target %d client(s)", count)
 
 
 class MQTTClient:
@@ -321,7 +372,20 @@ class MQTTClient:
             if not match:
                 logger.debug("Dropping unknown topic %r", msg.topic)
                 return
-            self._enqueue(match.group("node_id"), match.group("kind"), raw)
+            
+            node_id = match.group("node_id")
+            # Re-validate node_id against strict pattern to prevent injection (#7)
+            # Topic regex allows any character, but node_id must be safe
+            from mqtt.config import _NODE_ID_RE as VALID_NODE_ID_PATTERN
+            if not VALID_NODE_ID_PATTERN.fullmatch(node_id):
+                logger.warning(
+                    "Rejecting message with invalid node_id %r from topic %r",
+                    node_id,
+                    msg.topic
+                )
+                return
+            
+            self._enqueue(node_id, match.group("kind"), raw)
         except Exception:
             logger.exception("Unhandled error in on_message for %r", msg.topic)
 
@@ -407,17 +471,65 @@ class MQTTClient:
         return False
 
     def stop(self) -> None:
-        """Disconnect and stop the loop and worker, draining gracefully (L-24).
+        """Disconnect and stop the loop and worker, draining gracefully (I-42).
 
+        Drains the worker queue before exiting to ensure no pending readings are lost.
         ``disconnect()`` is called before ``loop_stop()`` so the clean DISCONNECT
         packet is flushed to the broker before the loop exits.
         """
-        self._client.disconnect()
-        self._client.loop_stop()
+        logger.info("Stopping MQTT client — draining queue before disconnect")
+
+        # Stop accepting new messages
         self._stop_event.set()
-        if self._worker_thread is not None:
-            self._worker_thread.join(timeout=5.0)
-            self._worker_thread = None
+
+        # Drain pending messages before disconnecting
+        drained_count = 0
+        max_drain_attempts = _QUEUE_MAX * 2  # Generous timeout to drain all
+        drain_deadline = time.monotonic() + 5.0  # 5 second cleanup window
+
+        while drained_count < max_drain_attempts:
+            try:
+                node_id, kind, raw = self._queue.get(timeout=0.1)
+                handled = False
+
+                if kind == "reading":
+                    _handle_reading(node_id, raw)
+                    handled = True
+                elif kind == "alert":
+                    _handle_alert(raw)
+                    handled = True
+                else:
+                    # Handle status (not needed for drain, just drain)
+                    pass
+
+                if handled:
+                    drained_count += 1
+
+            except queue.Empty:
+                # Queue empty, ready to exit
+                break
+            except Exception:
+                # Log errors during drain but continue
+                logger.exception("Error draining message during shutdown")
+                continue
+
+            if time.monotonic() > drain_deadline:
+                logger.warning(
+                    "MQTT queue drain timeout after %ds, %d/%d messages processed",
+                    5.0,
+                    drained_count,
+                    _QUEUE_MAX
+                )
+                break
+
+        if drained_count > 0:
+            logger.info("Drained %d pending messages before shutdown", drained_count)
+
+        logger.info("Disconnecting MQTT broker...")
+        self._client.disconnect()
+        logger.info("Stopping MQTT event loop...")
+
+        self._client.loop_stop()
         logger.info("MQTT client stopped")
 
     def is_connected(self) -> bool:

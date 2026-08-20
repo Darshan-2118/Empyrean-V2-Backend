@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from quart import Blueprint, jsonify, request
 from sqlalchemy import select, text
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import ProgrammingError
 
 from api._time import parse_iso_datetime
 from api.cache import cache_get_json, cache_set_json
@@ -57,9 +58,6 @@ _BUCKET_MAX_SPAN = {
 }
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
 def _latest_from_reading(r: SensorReading) -> dict:
     """Serialize a ``SensorReading`` ORM row via the ``LatestReading`` DTO."""
     return LatestReading(
@@ -99,9 +97,6 @@ def _history_from_row(row: RowMapping) -> dict:
     ).model_dump()
 
 
-# ── GET /readings/latest ───────────────────────────────────────────────────────
-
-
 @readings_bp.route("/latest", methods=["GET"])
 @rate_limit()
 @jwt_required
@@ -135,9 +130,6 @@ async def latest():
     await cache_set_json(_LATEST_CACHE_KEY, payload, _LATEST_CACHE_TTL)
 
     return jsonify({"readings": payload}), 200
-
-
-# ── GET /readings/history ──────────────────────────────────────────────────────
 
 
 @readings_bp.route("/history", methods=["GET"])
@@ -215,8 +207,27 @@ async def history():
     """)
 
     async with async_engine.connect() as conn:
-        result = await conn.execute(sql, params)
-        rows = result.mappings().all()
+        try:
+            result = await conn.execute(sql, params)
+            rows = result.mappings().all()
+        except ProgrammingError as exc:
+            # The history query relies on the TimescaleDB ``time_bucket``
+            # function. If the extension is not installed the query raises
+            # ``function time_bucket does not exist``. That is a 503 "misconfigured
+            # backend", not a 500 the client can do nothing about (#09).
+            if "time_bucket" in str(exc).lower():
+                logger.warning(
+                    "/readings/history failed: TimescaleDB extension missing — %s",
+                    exc,
+                )
+                return _problem_json(
+                    503,
+                    "Service Unavailable",
+                    "History requires the TimescaleDB extension (time_bucket). "
+                    "Install it with `CREATE EXTENSION timescaledb` and convert "
+                    "sensor_readings to a hypertable.",
+                )
+            raise
 
     buckets = [_history_from_row(row) for row in rows]
     return jsonify({"buckets": buckets}), 200

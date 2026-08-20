@@ -54,7 +54,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | Task Queue | Celery + Redis | Async fuzzy inference, anomaly detection, scheduled aggregation, alerts |
 | Primary DB | TimescaleDB (PostgreSQL) | Time-series storage, hypertable partitioning, continuous aggregates |
 | Cache | Redis | Latest-reading cache, rate limiting, Celery broker |
-| ML Engine | Scikit-learn + Pandas | ARIMA/linear regression forecasting, Z-score anomaly detection, preprocessing |
+| ML Engine | Scikit-learn + Pandas | Linear regression forecasting, Z-score anomaly detection, preprocessing |
 
 ## Scalability & Maintainability Notes
 

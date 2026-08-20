@@ -53,30 +53,35 @@ class ConnectionManager:
         with self._lock:
             return len(self._connections)
 
-    def broadcast(self, message: Any) -> None:
+    def broadcast(self, message: Any) -> tuple[bool, int]:
         """Send ``message`` (JSON-serialized) to every connected client.
 
-        Thread-safe: callable from the MQTT worker thread. No-op when there are
-        no clients or no loop has been captured yet. Sends are scheduled onto
-        the loop; a dead socket is dropped rather than raising.
+        Thread-safe: callable from the MQTT worker thread. Returns a tuple
+        ``(success, count)`` where ``success`` indicates whether broadcast
+        started successfully and ``count`` is the number of clients targeted.
+        Silently drops serialization errors and dead sockets (#14).
         """
         with self._lock:
             connections = list(self._connections)
             loop = self._loop
         if not connections or loop is None:
-            return
+            return (False, 0)
+
         try:
             payload = json.dumps(message)
         except (TypeError, ValueError):
             logger.warning("Cannot JSON-serialize broadcast message — dropped")
-            return
+            return (False, len(connections))
+
         try:
             asyncio.run_coroutine_threadsafe(
                 self._send_all(payload, connections), loop
             )
-        except RuntimeError:
+            return (True, len(connections))
+        except RuntimeError as e:
             # Loop is not running / already closed — nothing to deliver.
-            logger.debug("WS loop not running — dropping broadcast")
+            logger.debug("WS loop not running — dropping broadcast: %s", e)
+            return (False, len(connections))
 
     async def _send_all(self, payload: str, connections: list[Any]) -> None:
         dead: list[Any] = []
