@@ -67,8 +67,14 @@ def decode_access_token(token: str) -> dict[str, Any]:
         algorithms=[JWT_ALGORITHM],
         options={"require": ["sub", "exp"]},
     )
+    # Validate token type is explicitly "access" to prevent refresh token reuse
     if payload.get("type") != "access":
-        raise pyjwt.InvalidTokenError("Not an access token")
+        raise pyjwt.InvalidTokenError("Token type must be 'access'")
+    # Validate required claims are present and correct
+    if not isinstance(payload.get("sub"), int):
+        raise pyjwt.InvalidTokenError("Invalid subject claim")
+    if payload.get("role") not in ("admin", "user"):
+        raise pyjwt.InvalidTokenError("Invalid role claim")
     return payload
 
 

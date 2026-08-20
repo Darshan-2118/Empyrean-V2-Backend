@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from celery_app import celery_app
+from celery_app import _TASK_AUTORETRY, celery_app
 from fuzzy.tsukamoto import fuzzy_score
 from models import Node, SensorReading
 from models.base import get_sync_db
@@ -43,7 +43,7 @@ _LATEST_CACHE_TTL = 60
 _LATEST_GLOBAL_KEY = "readings:latest"
 
 
-def _to_float(value) -> float | None:
+def _to_float(value: float | str | None) -> float | None:
     """Coerce a numeric payload field to ``float``, preserving ``None``."""
     return float(value) if value is not None else None
 
@@ -104,6 +104,9 @@ def _parse_time(value: str | datetime | None) -> datetime:
     Naive timestamps are treated as UTC (the MQTT ingest phase is expected to
     send UTC already). Accepts an already-parsed ``datetime`` (C-1: Kombu's JSON
     codec reconstructs ``datetime`` on the worker) and returns it as-is.
+    
+    Timestamps must be within ±24 hours of server time to prevent data injection
+    attacks or device clock skew issues (#6).
     """
     if not value:
         return datetime.now(timezone.utc)
@@ -117,7 +120,21 @@ def _parse_time(value: str | datetime | None) -> datetime:
             return datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    
+    dt_utc = dt.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    
+    # Validate timestamp is within ±24 hours of server time
+    time_diff = abs((dt_utc - now).total_seconds())
+    if time_diff > 86400:  # 24 hours in seconds
+        logger.warning(
+            "Timestamp %r is %d seconds out of range (limit: ±24h) — using server time",
+            value,
+            time_diff
+        )
+        return now
+    
+    return dt_utc
 
 
 def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
@@ -125,8 +142,14 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
 
     Returns ``False`` when there is no pm25 value, fewer than 5 prior samples,
     or the prior values have zero variance (so no Z-score is meaningful).
+    Logs the fallback reason so operators can detect data quality issues.
     """
     if pm25 is None:
+        logger.warning(
+            "detect_anomaly: skipped — pm25 is None for node %s",
+            node_id,
+            extra={"node_id": node_id, "pm25": pm25}
+        )
         return False
 
     since = datetime.now(timezone.utc) - timedelta(hours=_ANOMALY_WINDOW_HOURS)
@@ -154,15 +177,34 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
     ).one()
 
     if not count or count < _ANOMALY_MIN_SAMPLES:
+        logger.warning(
+            "detect_anomaly: skipped — insufficient history for node %s (count=%s, min=%s)",
+            node_id,
+            count,
+            _ANOMALY_MIN_SAMPLES,
+            extra={"node_id": node_id, "history_count": count, "required_min": _ANOMALY_MIN_SAMPLES}
+        )
         return False
 
     mean = float(mean)
     variance = float(variance)
     if variance == 0:
+        logger.warning(
+            "detect_anomaly: skipped — zero variance in history for node %s",
+            node_id,
+            extra={"node_id": node_id, "variance": variance}
+        )
         return False
 
     z = abs(pm25 - mean) / (variance ** 0.5)
-    return z > _ANOMALY_Z_THRESHOLD
+    is_anomaly = z > _ANOMALY_Z_THRESHOLD
+    if is_anomaly:
+        logger.info(
+            "detect_anomaly: anomaly detected for node %s (pm25=%.2f, mean=%.2f, std=%.2f, z=%.2f > %.2f)",
+            node_id, pm25, mean, variance ** 0.5, z, _ANOMALY_Z_THRESHOLD,
+            extra={"node_id": node_id, "pm25": pm25, "mean": mean, "std": variance ** 0.5, "z": z, "threshold": _ANOMALY_Z_THRESHOLD}
+        )
+    return is_anomaly
 
 
 def _enriched_dict(reading: SensorReading) -> dict:
@@ -221,7 +263,7 @@ def _is_duplicate_reading(exc: IntegrityError) -> bool:
     return constraint == "sensor_readings_pkey"
 
 
-@celery_app.task(name="tasks.process_reading")
+@celery_app.task(name="empyrean.tasks.process_reading", **_TASK_AUTORETRY)
 def process_reading(payload: dict) -> dict:
     """Enrich, persist, and cache one sensor reading. Empty dict = dropped."""
     node_id = payload.get("node_id")

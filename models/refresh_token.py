@@ -28,7 +28,7 @@ class RefreshToken(Base):
         String(255), nullable=False, index=True,
     )
     expires_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False,
+        TIMESTAMP(timezone=True), nullable=False, index=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False,

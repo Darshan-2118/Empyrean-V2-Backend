@@ -14,6 +14,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from models.base import Base
 
 
+# Maximum message length for alert messages to prevent DoS via storage exhaustion (#24)
+_MAX_ALERT_MESSAGE_LENGTH = 10000
+
+
 class Alert(Base):
     __tablename__ = "alerts"
 

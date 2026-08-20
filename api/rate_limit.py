@@ -12,15 +12,19 @@ wrapped endpoint carries
 ``X-RateLimit-Limit`` / ``X-RateLimit-Remaining`` / ``X-RateLimit-Reset``.
 
 If Redis is unreachable the decorator **fails open** — the request is allowed
-(and still gets headers) rather than blocking the API.
+(and still gets headers) rather than blocking the API. When failing open, a
+WARNING is logged and a counter is incremented so `/admin/health` can report
+rate-limit bypass state (#03).
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable
+from threading import Lock
+from typing import Any, Callable, Dict, Tuple, Optional
 
 from quart import request
 
@@ -31,6 +35,48 @@ logger = logging.getLogger("empyrean.ratelimit")
 
 DEFAULT_LIMIT = 200
 DEFAULT_WINDOW_SECONDS = 60
+
+# In-memory fallback for when Redis is unavailable
+# Structure: {key: (count, window_start_time)}
+_in_memory_cache: Dict[str, Tuple[int, float]] = {}
+_in_memory_lock = Lock()
+
+# Track rate-limit bypass events (#03 — observability)
+# Incremented when Redis unavailable or errors; checked by /admin/health
+_bypass_events = 0
+_bypass_events_lock = Lock()
+
+
+def is_rate_limit_available() -> bool:
+    """True when the distributed (Redis-backed) limiter is usable.
+
+    False means the decorator is failing open to the per-process in-memory
+    fallback (#03) — still protective per-instance, but not a shared limit. Used
+    by ``GET /admin/health`` to surface rate-limit state.
+    """
+    return get_client() is not None
+
+
+def get_rate_limit_bypass_count() -> int:
+    """Return the count of rate-limit bypass events since app startup.
+    
+    Used by /admin/health (#03) to surface when Redis has been unavailable,
+    triggering the fail-open fallback path. A non-zero count indicates the
+    rate-limiter was not working as designed (single shared limit).
+    """
+    with _bypass_events_lock:
+        return _bypass_events
+
+
+def _increment_bypass_counter() -> None:
+    """Increment the rate-limit bypass counter (#03).
+    
+    Called when Redis is unavailable or errored, triggering the in-memory
+    fallback. Provides observability into when rate-limiting has degraded.
+    """
+    global _bypass_events
+    with _bypass_events_lock:
+        _bypass_events += 1
 
 
 def _client_ip() -> str:
@@ -121,8 +167,9 @@ async def _incr(client, key: str, window_seconds: int) -> int | None:
 def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> Callable:
     """Enforce a per-IP fixed-window request limit.
 
-    On breach returns an RFC 7807 ``429 Too Many Requests``. Fails open when
-    Redis is unavailable. Attaches ``X-RateLimit-*`` headers to every response.
+    On breach returns an RFC 7807 ``429 Too Many Requests``. When Redis is unavailable,
+    falls back to an in-memory counter to avoid failing open. Attaches
+    ``X-RateLimit-*`` headers to every response.
     """
 
     def decorator(f: Callable) -> Callable:
@@ -134,24 +181,62 @@ def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_
             reset_ts = _reset_epoch(now)
 
             client = get_client()
-            count = await _incr(client, key, window_seconds) if client is not None else None
+            if client is not None:
+                count = await _incr(client, key, window_seconds)
+                if count is not None:
+                    # Redis worked normally
+                    if count > limit:
+                        logger.warning("Rate limit exceeded for IP %s (%s/%s)", ip, count, limit)
+                        return _with_headers(
+                            _problem_json(
+                                429, "Too Many Requests", "Rate limit exceeded. Please slow down."
+                            ),
+                            limit,
+                            limit - count,
+                            reset_ts,
+                        )
+                    return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
+                # Redis error -> fall through to in-memory fallback
+                logger.warning("Redis rate-limit INCR failed for %r — failing open to in-memory fallback", key)
+                _increment_bypass_counter()
+            else:
+                # Redis client unavailable -> use in-memory fallback
+                logger.warning("Redis client is None — rate limiting failing open to in-memory fallback")
+                _increment_bypass_counter()
 
-            if count is None:
-                # Redis down — fail open, but still advertise the limits.
-                return _with_headers(await f(*args, **kwargs), limit, limit, reset_ts)
+            # Redis unavailable or error -> use in-memory fallback
+            with _in_memory_lock:
+                # Clean old entries occasionally (simple approach: clear if too big)
+                if len(_in_memory_cache) > 10000:
+                    _in_memory_cache.clear()
 
-            if count > limit:
-                logger.warning("Rate limit exceeded for IP %s (%s/%s)", ip, count, limit)
-                return _with_headers(
-                    _problem_json(
-                        429, "Too Many Requests", "Rate limit exceeded. Please slow down."
-                    ),
-                    limit,
-                    limit - count,
-                    reset_ts,
-                )
+                window_start = now.timestamp()
+                # Remove entries outside the current window
+                expired_keys = [k for k, (_, start) in _in_memory_cache.items()
+                              if window_start - start > window_seconds]
+                for k in expired_keys:
+                    del _in_memory_cache[k]
 
-            return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
+                # Get or create counter for this key
+                if key in _in_memory_cache:
+                    count, _ = _in_memory_cache[key]
+                    count += 1
+                    _in_memory_cache[key] = (count, window_start)
+                else:
+                    count = 1
+                    _in_memory_cache[key] = (count, window_start)
+
+                if count > limit:
+                    logger.warning("Rate limit exceeded for IP %s (%s/%s) [in-memory fallback]", ip, count, limit)
+                    return _with_headers(
+                        _problem_json(
+                            429, "Too Many Requests", "Rate limit exceeded. Please slow down."
+                        ),
+                        limit,
+                        limit - count,
+                        reset_ts,
+                    )
+                return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
 
         return decorated
 

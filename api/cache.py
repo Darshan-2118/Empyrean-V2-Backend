@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from redis.asyncio import Redis
@@ -38,6 +39,11 @@ cfg = get_config()
 
 _client: Redis | None = None
 
+# Throttle the per-call "cache disabled" warning so a cache that was never
+# built doesn't spam every request (see #16). One warning per this many seconds.
+_CACHE_WARN_INTERVAL_S = 60.0
+_last_cache_warn: float = 0.0
+
 
 def get_client() -> Redis | None:
     """Return the shared async Redis client, creating it lazily.
@@ -46,20 +52,40 @@ def get_client() -> Redis | None:
     URL) so callers can degrade. Note: ``from_url`` does not connect — actual
     connection errors surface on the first command and are handled per-call.
     """
-    global _client
+    global _client, _last_cache_warn
     if _client is None:
         try:
             _client = Redis.from_url(cfg.REDIS_URL, decode_responses=True)
+            logger.info("Redis cache client created for %s", cfg.REDIS_URL)
         except Exception:
             logger.exception("Failed to create Redis client — cache disabled")
             _client = None
     return _client
 
 
+def _warn_cache_disabled() -> None:
+    """Emit a throttled WARNING that the cache layer is currently unavailable.
+
+    The per-call ``client is None`` guards in the helper functions below used to
+    be silent, so a never-built cache looked identical to a cache miss and
+    masqueraded as normal DB-hot traffic (#16). Throttled so it doesn't log on
+    every request.
+    """
+    global _last_cache_warn
+    now = time.monotonic()
+    if now - _last_cache_warn >= _CACHE_WARN_INTERVAL_S:
+        logger.warning(
+            "Redis cache client unavailable — cache layer disabled; reads fall "
+            "through to PostgreSQL (set REDIS_URL and start Redis)"
+        )
+        _last_cache_warn = now
+
+
 async def cache_get(key: str) -> str | None:
     """Return the raw string value for ``key``, or ``None`` on miss / Redis down."""
     client = get_client()
     if client is None:
+        _warn_cache_disabled()
         return None
     try:
         return await client.get(key)
@@ -72,6 +98,7 @@ async def cache_set(key: str, value: str, ttl: int) -> None:
     """Set ``key`` to ``value`` with a ``ttl`` in seconds (no-op if Redis down)."""
     client = get_client()
     if client is None:
+        _warn_cache_disabled()
         return
     try:
         await client.setex(key, ttl, value)
@@ -105,6 +132,7 @@ async def cache_delete(key: str) -> None:
     """Delete ``key`` from Redis (best-effort; no-op if Redis is down)."""
     client = get_client()
     if client is None:
+        _warn_cache_disabled()
         return
     try:
         await client.delete(key)

@@ -74,6 +74,68 @@ async def update_profile():
     if not has_changes:
         return jsonify(_serialise_user(user)), 200
 
+    # ---------- Validation block ----------
+    # 1. Username validation
+    if data.username is not None:
+        if not (3 <= len(data.username) <= 32):
+            return _problem_json(
+                422, "ValidationError", "Username must be between 3 and 32 characters."
+            )
+        if not data.username.replace("_", "").isalnum():
+            return _problem_json(
+                422, "ValidationError", "Username may only contain alphanumeric characters and underscores."
+            )
+
+    # 2. Email validation
+    if data.email is not None:
+        import re
+        email_regex = r"^[^@]+@[^@]+\.[^@]+$"
+        if not re.match(email_regex, data.email):
+            return _problem_json(
+                422, "ValidationError", "Invalid email format."
+            )
+        if len(data.email) > 64:
+            return _problem_json(
+                422, "ValidationError", "Email length must not exceed 64 characters."
+            )
+
+    # 3. Notification preferences validation
+    if data.notification_prefs is not None:
+        prefs = data.notification_prefs
+        # msgs_per_hr
+        if "msgs_per_hr" in prefs:
+            msgs = prefs["msgs_per_hr"]
+            if not isinstance(msgs, int) or not (0 <= msgs <= 96):
+                return _problem_json(
+                    422, "ValidationError", "`msgs_per_hr` must be an integer between 0 and 96."
+                )
+        # alert_email_threshold
+        if "alert_email_threshold" in prefs:
+            thresh = prefs["alert_email_threshold"]
+            if not isinstance(thresh, int) or not (0 <= thresh <= 96):
+                return _problem_json(
+                    422, "ValidationError", "`alert_email_threshold` must be an integer between 0 and 96."
+                )
+        # webhooks
+        if "webhooks" in prefs:
+            webhooks = prefs["webhooks"]
+            if not isinstance(webhooks, list):
+                return _problem_json(
+                    422, "ValidationError", "`webhooks` must be a list."
+                )
+            if len(webhooks) > 50:
+                return _problem_json(
+                    422, "ValidationError", "`webhooks` may contain at most 50 items."
+                )
+            # Basic sanity check for each webhook dict
+            for i, wh in enumerate(webhooks):
+                if not isinstance(wh, dict):
+                    return _problem_json(
+                        422, "ValidationError", f"Webhook at index {i} must be a JSON object."
+                    )
+                # Optional: more detailed validation could be added here
+    # ---------------------------------------
+
     async with AsyncSessionLocal() as session:
         # Fetch a session-attached row and apply only the supplied fields —
         # the detached g.current_user cannot be committed into a fresh session,

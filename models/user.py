@@ -63,6 +63,10 @@ class User(Base):
         "SystemSetting", back_populates="updated_by_user",
         foreign_keys="SystemSetting.updated_by",
     )
+    audit_entries = relationship(
+        "AuditLog", back_populates="changed_by_user",
+        foreign_keys="AuditLog.changed_by",
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id} username='{self.username}' role='{self.role}'>"

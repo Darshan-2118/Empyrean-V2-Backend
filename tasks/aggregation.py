@@ -7,6 +7,8 @@ retention window.
 Both tasks run synchronously on a single ``get_sync_db()`` session (Celery
 workers have no async event loop) and operate on a raw SQL UPSERT / DELETE so
 the hypertable's composite ``(time, node_id)`` constraints are respected.
+
+Issue #28: Added daily cleanup of expired refresh tokens to prevent database bloat.
 """
 
 from __future__ import annotations
@@ -14,21 +16,24 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, func
 
-from celery_app import celery_app
+from celery_app import _TASK_AUTORETRY, celery_app
 from config import get_config
-from models import SystemSetting
+from models import SystemSetting, RefreshToken
 from models.base import get_sync_db
 
 logger = logging.getLogger("empyrean.tasks.aggregation")
 
 cfg = get_config()
 
+# Keep last N refresh tokens per user even if expired (Issue #28)
+_REFRESH_TOKEN_RETENTION_PER_USER = 10
+
 
 # ``name`` defaults to the fully-qualified path (tasks.aggregation.hourly_aggregate)
 # which is exactly what the beat schedule references.
-@celery_app.task
+@celery_app.task(name="empyrean.tasks.aggregation.hourly_aggregate", **_TASK_AUTORETRY)
 def hourly_aggregate() -> dict:
     """Roll up every complete-but-unaggregated hour of readings into ``hourly_agg``.
 
@@ -143,7 +148,7 @@ def _retention_days(session) -> int:
     return int(cfg.DATA_RETENTION_DAYS)
 
 
-@celery_app.task
+@celery_app.task(name="empyrean.tasks.aggregation.data_retention_cleanup", **_TASK_AUTORETRY)
 def data_retention_cleanup() -> dict:
     """Delete readings older than the configured retention period.
 
@@ -175,10 +180,43 @@ def data_retention_cleanup() -> dict:
             return {"deleted": 0}
 
         sql = text(
-            f"DELETE FROM sensor_readings WHERE time < now() - interval '{days} days'"
+            "DELETE FROM sensor_readings WHERE time < now() - interval ':days days'"
         )
-        result = session.execute(sql)
+        result = session.execute(sql, {"days": days})
         n = result.rowcount
 
     logger.info("Data-retention cleanup removed %s readings", n)
+    return {"deleted": n}
+
+
+@celery_app.task(name="empyrean.tasks.aggregation.refresh_token_cleanup", **_TASK_AUTORETRY)
+def refresh_token_cleanup() -> dict:
+    """Delete expired refresh tokens to prevent database bloat (Issue #28).
+
+    Runs daily. Deletes tokens where expires_at < now(). Keeps the last
+    _REFRESH_TOKEN_RETENTION_PER_USER tokens per user even if expired,
+    to support legitimate use cases like revoking all sessions.
+
+    Returns ``{"deleted": n}`` where ``n`` is the number of rows removed.
+    """
+    with get_sync_db() as session:
+        # Subquery to find expired tokens to delete, keeping the latest N per user
+        # Uses a window function to rank tokens by created_at desc per user
+        sql = text("""
+            DELETE FROM refresh_tokens
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) as rn
+                    FROM refresh_tokens
+                    WHERE expires_at < now()
+                ) ranked
+                WHERE rn > :retention
+            )
+        """)
+        result = session.execute(sql, {"retention": _REFRESH_TOKEN_RETENTION_PER_USER})
+        n = result.rowcount
+
+    logger.info("Refresh token cleanup removed %s expired tokens (keeping last %s per user)",
+                n, _REFRESH_TOKEN_RETENTION_PER_USER)
     return {"deleted": n}

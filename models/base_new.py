@@ -34,23 +34,7 @@ _metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
 class Base(DeclarativeBase):
-    """Declarative base with shared naming convention.
-
-    **Timezone Assumption**: All timestamp fields in this model use PostgreSQL's
-    TIMESTAMP with timezone. Data should be stored in UTC. When setting timestamps
-    directly (e.g., datetime.now(timezone.utc)), the value is automatically
-    converted to/from UTC by PostgreSQL's timezone-aware column type.
-
-    Example:
-        # ✅ GOOD - UTC timestamp (recommended)
-        from datetime import datetime, timezone
-        timestamp = datetime.now(timezone.utc)
-
-        # ❌ BAD - Local timezone (not recommended)
-        timestamp = datetime.now()  # Uses local system timezone
-
-    See: docs/timezone.md for detailed timezone handling conventions.
-    """
+    """Declarative base with shared naming convention."""
     metadata = _metadata
 
 

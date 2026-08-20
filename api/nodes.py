@@ -20,8 +20,8 @@ from quart import Blueprint, jsonify
 from api.cache import cache_delete, cache_get_json, cache_set_json
 from api.jwt import _problem_json, admin_required, jwt_required
 from api.rate_limit import rate_limit
-from api.schemas import NodeResponse, RegisterNodeRequest, UpdateNodeRequest
-from api.validation import validate_body, validated_body
+from api.schemas import NodeResponse, RegisterNodeRequest, UpdateNodeRequest, PaginationParams
+from api.validation import validate_body, validated_body, validate_query
 from models import Node
 from models.base import AsyncSessionLocal
 from mqtt.registry import get_client
@@ -75,19 +75,34 @@ def _push_config(node_id: str, interval_s: int) -> bool:
 @nodes_bp.route("", methods=["GET"])
 @rate_limit()
 @jwt_required
-async def list_nodes():
-    """All registered nodes with metadata (cached under ``nodes:all``, TTL 300s)."""
-    cached = await cache_get_json(_NODES_CACHE_KEY)
-    if cached is not None:
-        return jsonify({"nodes": cached}), 200
+@validate_query(PaginationParams)
+async def list_nodes(pagination: PaginationParams = PaginationParams()):
+    """All registered nodes with metadata (paginated; cursor-based)."""
+    # Build the base query
+    base_stmt = select(Node).order_by(Node.node_id)
 
-    stmt = select(Node).order_by(Node.node_id)
+    # Apply cursor pagination
+    stmt = base_stmt
+    if pagination.cursor:
+        stmt = stmt.where(Node.node_id > pagination.cursor)
+    stmt = stmt.limit(pagination.limit + 1)  # Fetch one extra to check for next page
+
     async with AsyncSessionLocal() as session:
         rows = list((await session.execute(stmt)).scalars().all())
 
+    # Check if there's a next page
+    has_more = len(rows) > pagination.limit
+    if has_more:
+        rows = rows[:pagination.limit]
+        next_cursor = rows[-1].node_id
+    else:
+        next_cursor = None
+
     payload = [_serialise(n) for n in rows]
-    await cache_set_json(_NODES_CACHE_KEY, payload, _NODES_CACHE_TTL)
-    return jsonify({"nodes": payload}), 200
+    response = {"nodes": payload}
+    if next_cursor:
+        response["next_cursor"] = next_cursor
+    return jsonify(response), 200
 
 
 @nodes_bp.route("", methods=["POST"])

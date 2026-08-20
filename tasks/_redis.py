@@ -12,6 +12,7 @@ are handled per-call.
 from __future__ import annotations
 
 import logging
+import time
 
 from redis import Redis
 
@@ -31,15 +32,36 @@ logger = logging.getLogger("empyrean.redis")
 BEAT_HEARTBEAT_KEY = "celery:heartbeat:beat"
 
 _client: Redis | None = None
+# Throttle the "could not (re)create client" warning so a long Redis outage
+# doesn't spam every task invocation (beat fires every 60s, forecasts on every
+# cold request). One warning per this many seconds per process.
+_CLIENT_WARN_INTERVAL_S = 60.0
+_last_client_warn: float = 0.0
 
 
 def get_sync_redis() -> Redis | None:
-    """Return the process-wide sync Redis client, creating it lazily."""
-    global _client
-    if _client is None:
-        try:
-            _client = Redis.from_url(get_config().REDIS_URL, decode_responses=True)
-        except Exception:
-            logger.exception("Failed to create Redis client — cache disabled")
-            _client = None
+    """Return the process-wide sync Redis client, creating it lazily.
+
+    Self-healing: if the initial construction failed (Redis briefly
+    unreachable at worker startup) we try again on each call instead of
+    permanently returning ``None`` for the worker's lifetime (#14). A transient
+    startup blip would otherwise permanently disable the beat heartbeat,
+    forecast cache, and latest-reading write-through until the process restarted.
+    """
+    global _client, _last_client_warn
+    if _client is not None:
+        return _client
+    try:
+        _client = Redis.from_url(get_config().REDIS_URL, decode_responses=True)
+        logger.info("Redis client created for %s", get_config().REDIS_URL)
+    except Exception:
+        now = time.monotonic()
+        if now - _last_client_warn >= _CLIENT_WARN_INTERVAL_S:
+            logger.warning(
+                "Failed to (re)create Redis client — Redis-backed features "
+                "disabled until it becomes reachable: %s",
+                get_config().REDIS_URL,
+            )
+            _last_client_warn = now
+        _client = None
     return _client

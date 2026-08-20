@@ -10,6 +10,11 @@ Token resolution order:
 1. ``Authorization: Bearer <access_token>`` header (non-browser clients), then
 2. ``?token=<access_token>`` query param (browser WebSockets cannot set headers).
 
+Origin validation:
+- WebSocket connections are validated against allowed origins to prevent
+  cross-site WebSocket hijacking
+- Uses the same origin list as CORS configuration for consistency
+
 The socket is only live once the MQTT broker publishes to ``air/alerts``; with
 no broker the client connects but receives nothing until a broadcast arrives.
 """
@@ -22,6 +27,7 @@ from quart import Blueprint, request, websocket
 
 from api.jwt import decode_access_token
 from api.ws.manager import manager
+from config import get_config
 from models import User
 from models.base import AsyncSessionLocal
 
@@ -40,9 +46,43 @@ def _access_token() -> str | None:
     return websocket.args.get("token") or None
 
 
+def _is_origin_allowed(origin: str | None) -> bool:
+    """Check if the origin is in the allowed list.
+
+    Args:
+        origin: The Origin header value from the WebSocket handshake
+
+    Returns:
+        True if origin is allowed or if no origin is provided (same-origin),
+        False otherwise
+    """
+    # Same-origin requests (no Origin header) are allowed
+    if origin is None:
+        return True
+
+    config = get_config()
+    allowed_origins = config.cors_origins_list
+
+    # Exact match against allowed origins
+    return origin in allowed_origins
+
+
 @ws_bp.websocket("/alerts")
 async def alerts_ws() -> None:
     """Authenticate, accept, then stream alert broadcasts until disconnect."""
+    # Origin validation: prevent cross-site WebSocket hijacking by checking
+    # the Origin header against the configured allowlist. Same-origin requests
+    # (no Origin header) are allowed. Rejected connections are closed before
+    # any token is processed to avoid leaking auth state.
+    origin = websocket.headers.get("Origin")
+    if not _is_origin_allowed(origin):
+        logger.warning(
+            "WebSocket /ws/alerts rejected: origin %r not in allowlist",
+            origin,
+        )
+        await websocket.close(code=4403)  # 4403 = forbidden origin
+        return
+
     token = _access_token()
     try:
         if token is None:
@@ -74,6 +114,7 @@ async def alerts_ws() -> None:
 
     try:
         # Push-only: drain any client frames; exit when the peer closes.
+        # Enforce _MAX_WS_BODY to prevent memory exhaustion from large frames.
         while True:
             try:
                 frame = await websocket.receive()
@@ -81,6 +122,14 @@ async def alerts_ws() -> None:
                 break
             if frame is None:
                 break
+            # Validate frame size
+            if isinstance(frame, (str, bytes)) and len(frame) > _MAX_WS_BODY:
+                logger.warning(
+                    "WebSocket frame size %d exceeds limit %d — closing connection",
+                    len(frame), _MAX_WS_BODY
+                )
+                await websocket.close(code=1009)  # 1009 = message too big
+                return
     finally:
         await manager.disconnect(sock)
         logger.info("WebSocket client disconnected from /ws/alerts")
