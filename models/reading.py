@@ -4,7 +4,7 @@ SensorReading model — the core time-series data from sensor nodes.
 Each row represents a single sensor reading enriched with computed values
 (fuzzy_score, aqi, aqi_category, is_anomaly).
 
-Stored as a TimescaleDB hypertable (converted by migration ``b2bab23ab3c0``),
+Stored as a TimescaleDB hypertable (converted by migration ``0002_add_timescaledb_hypertable``),
 partitioned on ``time``.
 """
 

@@ -12,8 +12,8 @@ The index guarantees at most one unacknowledged alert per (node_id, parameter);
 ``tasks.check_thresholds`` upserts against it (INSERT … ON CONFLICT) so the DB
 arbitrates races, and only a higher-severity breach replaces the existing row.
 
-Revision ID: 1785940433799
-Revises: b2bab23ab3c0
+Revision ID: 0003
+Revises: 0002
 Create Date: 2026-08-05 00:00:00.000000
 
 """
@@ -23,8 +23,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "1785940433799"
-down_revision: Union[str, None] = "b2bab23ab3c0"
+revision: str = "0003"
+down_revision: Union[str, None] = "0002"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
