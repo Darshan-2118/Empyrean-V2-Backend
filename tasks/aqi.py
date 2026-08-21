@@ -3,9 +3,7 @@
 Design notes:
     * Pure function — returns None when inputs are invalid.
     * Logs NaN/Inf/None in concentrations to surface bad sensor readings.
-"""
-
-Pure math - no Celery, no DB, so it is trivially unit-testable.
+    * Pure math - no Celery, no DB, so it is trivially unit-testable.
 
 Live sensor concentrations are used here as an *instantaneous proxy* for the
 EPA 24-hour averages (the standard AQI contract): this trades strict regulatory

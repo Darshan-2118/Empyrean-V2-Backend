@@ -1,208 +1,253 @@
-# Empyrean-V2-Backend
+# Empyrean V2 — Air Quality Monitoring & Analytics Platform
 
-## How to Run the Project
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![Framework](https://img.shields.io/badge/framework-Quart%20(ASGI)-brightgreen.svg)](https://pgjones.gitlab.io/quart/)
+[![Database](https://img.shields.io/badge/database-PostgreSQL%20%2B%20TimescaleDB-blue.svg)](https://www.timescale.com/)
+[![Broker](https://img.shields.io/badge/broker-Redis%20%2B%20MQTT-orange.svg)](https://redis.io/)
+[![Async](https://img.shields.io/badge/tasks-Celery%20%2B%20Beat-green.svg)](https://docs.celeryq.dev/)
 
-### Prerequisites
-- Python 3.10–3.12
-- `git` installed and the repo cloned
-- Redis running (the scripts below assume you start it via WSL on Windows)
-- PostgreSQL pointed at by `DATABASE_URL` in `.env`
+Empyrean V2 is a real-time air quality ingestion, analysis, alerting, and forecasting backend platform. Built on **Quart (async Python/ASGI)**, **Celery**, **PostgreSQL with TimescaleDB**, **Redis**, and **MQTT**, it ingests sensor telemetry from IoT nodes, processes fuzzy logic AQI ratings and anomaly detection, triggers instant alerts over WebSockets, and delivers time-series analytics and forecasting.
 
-### 1. Create & activate a virtual environment
+---
+
+## 🏗️ Architecture & Core Components
+
+```
+                +-------------------------+
+                |   IoT Sensor Nodes      |
+                +------------+------------+
+                             | (MQTT telemetry)
+                             v
+                +-------------------------+
+                |    MQTT Broker (TLS)    |
+                +------------+------------+
+                             |
+                             v
++-----------------------------------------------------------+
+|  Empyrean Backend Services                                |
+|                                                           |
+|  [MQTT Client Lifecycle]                                  |
+|         │ (validates schema, extracts node_id)            |
+|         ▼                                                 |
+|  [Celery Task Queue: Redis Broker]                        |
+|         │                                                 |
+|         ├──▶ [process_reading] ──▶ Anomaly Detection      |
+|         │                      ──▶ TimescaleDB Storage    |
+|         │                      ──▶ AQI Calculation        |
+|         │                      ──▶ Threshold & Alerts     |
+|         │                                                 |
+|         └──▶ [Celery Beat Schedulers]                     |
+|                ├── Node offline heartbeats                |
+|                ├── Daily statistical aggregations         |
+|                ├── Data retention cleanup                 |
+|                └── Hourly AQI forecast updates            |
+|                                                           |
+|  [Quart ASGI HTTP & WebSocket Server] (Hypercorn)         |
+|         ├── REST API: /api/v1/{auth, readings, nodes, ...}|
+|         ├── Live WebSocket: /ws/alerts, /ws/live          |
+|         ├── Prometheus Metrics: /metrics                  |
+|         └── System Health: /admin/health                  |
+|                                                           |
+|  [Persistence & Cache Layer]                              |
+|         ├── PostgreSQL + TimescaleDB (time-series)        |
+|         └── Redis (rate limiting, cache, celery broker)   |
++-----------------------------------------------------------+
+```
+
+---
+
+## 📋 Prerequisites
+
+| Component | Minimum Version | Notes |
+|-----------|-----------------|-------|
+| **Python** | `3.10` – `3.12` | Required runtime environment |
+| **PostgreSQL** | `14+` | Primary relational and time-series database |
+| **TimescaleDB** | `2.x+` (extension) | Required for `time_bucket()` time-series aggregations |
+| **Redis** | `6.0+` | Celery message broker, query caching, rate limiting |
+| **MQTT Broker** | Mosquitto / EMQX / HiveMQ | For IoT sensor telemetry ingestion |
+
+---
+
+## 🚀 Quick Start (Local Development)
+
+### 1. Clone & Set Up Python Environment
+
 ```bash
-# Windows
+# Clone repository
+git clone https://github.com/Darshan-2118/Empyrean-V2-Backend.git
+cd Empyrean-V2-Backend
+
+# Windows PowerShell / CMD
 python -m venv .venv
 .\.venv\Scripts\activate
 
 # Linux / macOS
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Install dependencies
+### 2. Install Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Set up environment variables
+### 3. Configure Environment Variables & Secrets
+
 ```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
 cp .env.example .env
 ```
-Open `.env` and adjust values you need (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, etc.). If you run Redis locally via WSL, the default `REDIS_URL=redis://localhost:6379/0` will work.
 
-> ⚠️ **Security note:** `SECRET_KEY` and `JWT_SECRET` in `.env.example` are placeholders only. Never keep them as-is or use weak/guessable values (e.g. your name). Generate strong random secrets before running the app:
-> ```bash
-> python -c "import secrets; print(secrets.token_hex(32))"
-> ```
-> Run this twice — once for `SECRET_KEY`, once for `JWT_SECRET` — and use each output as the real value in your local `.env`. Never commit `.env` or put real secrets in `.env.example`.
-
-### 4. Start Redis (via WSL on Windows)
+Generate 256-bit cryptographically secure secrets and write them to your `.env` automatically:
 ```bash
-wsl redis-server --daemonize yes
+python scripts/generate_secrets.py --write-env
 ```
 
-### 5. Apply database migrations (first time only)
+> 🔒 **Security Notice:** The application enforces strict fail-fast validation in `config/__init__.py`. It will reject development placeholders (such as `dev-secret-key`, `dev-jwt-secret`, or `change-me-*`), keys shorter than 32 bytes, or low-entropy secrets. Running `scripts/generate_secrets.py` ensures your secrets comply with production constraints.
+
+Update your `.env` file with your `DATABASE_URL`, `REDIS_URL`, and `MQTT_BROKER_HOST`.
+
+### 4. Database Setup & Migrations
+
+Ensure PostgreSQL with TimescaleDB is running, then apply database migrations:
 ```bash
 alembic upgrade head
 ```
 
-### 6. Seed the database (optional, first run)
+*(Optional)* Seed sample nodes, admin accounts, and initial configurations:
 ```bash
 python scripts/seed.py
 ```
 
-### 7. Start the services
+### 5. Running the Stack
 
-**Option A — Quick Start (recommended):**
+#### Option A: One-Click Launch (Windows)
 ```bash
 scripts\dev-up.bat
 ```
-This launches three separate console windows:
-- ✅ Celery worker + beat scheduler
-- ✅ API server (Hypercorn on port 8000)
-- ✅ Redis connectivity check
+*(Launches Celery worker, Celery beat scheduler, and the Hypercorn ASGI server in separate console windows).*
 
-**Option B — Manual component startup:**
-
-Terminal 1 — Celery worker & beat:
-```bash
-celery -A celery_app.celery_app worker -B --loglevel=info
-```
-
-Terminal 2 — API server:
-```bash
-hypercorn app:app --bind 0.0.0.0:8000
-```
-
-> On Windows, beat must run as its own process (`-B` is not supported in the same process).
-
-### 8. Stop the dev stack
+To shut down:
 ```bash
 scripts\dev-down.bat
 ```
 
+#### Option B: Manual Service Launch
+
+**Terminal 1 — Redis Server (if using WSL on Windows):**
+```bash
+wsl redis-server --daemonize yes
+```
+
+**Terminal 2 — Celery Worker:**
+```bash
+celery -A celery_app.celery_app worker --loglevel=info
+```
+
+**Terminal 3 — Celery Beat Scheduler:**
+```bash
+celery -A celery_app.celery_app beat --loglevel=info
+```
+
+**Terminal 4 — Quart ASGI API Server (Hypercorn):**
+```bash
+hypercorn "app:create_app()" --bind 0.0.0.0:8000 --reload
+```
+
 ---
 
-## ✅ How to Test the Codebase
+## 🧪 Testing & Verification
 
-Make sure the prerequisites are in place first:
-1. Virtual environment activated — `.\.venv\Scripts\activate`
-2. Dependencies installed — `pip install -r requirements.txt`
-3. Redis running — `wsl redis-server --daemonize yes`
-4. Database migrated — `alembic upgrade head`
-5. `.env` file configured (copied from `.env.example`)
+Run the comprehensive project verification script:
+```bash
+# Full verification (Database connectivity, migrations, health check, test suite)
+python scripts/verify.py
 
-### 1. Run the test suite (quickest)
+# Quick verification (Skip unit tests)
+python scripts/verify.py --quick
+```
+
+Run pytest directly:
 ```bash
 pytest
 ```
 
-### 2. Start the full stack & health check
-```bash
-# Start everything (opens separate windows for Celery worker, beat, and API server)
-scripts\dev-up.bat
-
-# Verify it's working
-curl http://localhost:8000/admin/health
-```
-You should get a JSON response reporting the health of the API, Celery, Redis, and MQTT.
-
-### 3. Manual component startup (if you want more control)
-
-Terminal 1 — Celery worker & beat:
-```bash
-celery -A celery_app.celery_app worker -B --loglevel=info
-```
-
-Terminal 2 — API server:
-```bash
-hypercorn app:app --bind 0.0.0.0:8000
-```
-
-Then run the health check:
+Verify service health via HTTP:
 ```bash
 curl http://localhost:8000/admin/health
 ```
 
-The health check endpoint (`/admin/health`) is the quickest way to verify everything is wired up correctly end-to-end.
+---
+
+## 📡 API Overview
+
+| Group | Endpoint | Method | Description |
+|-------|----------|--------|-------------|
+| **Auth** | `/api/v1/auth/register` | `POST` | Register a new user |
+| | `/api/v1/auth/login` | `POST` | Authenticate and obtain JWT token pair |
+| | `/api/v1/auth/refresh` | `POST` | Rotate and issue fresh access/refresh tokens |
+| | `/api/v1/auth/logout` | `POST` | Invalidate active refresh token |
+| | `/api/v1/auth/me` | `GET` / `PATCH` | Current user profile |
+| **Readings** | `/api/v1/readings/latest` | `GET` | Latest telemetry across nodes |
+| | `/api/v1/readings/history` | `GET` | Aggregated time-series history (`time_bucket`) |
+| | `/api/v1/readings/export` | `GET` | Export sensor telemetry (CSV / JSON) |
+| **Nodes** | `/api/v1/nodes` | `GET` / `POST` | List and register IoT sensor nodes |
+| | `/api/v1/nodes/<node_id>` | `GET` / `PATCH` | Node detail and configuration updates |
+| **Alerts** | `/api/v1/alerts` | `GET` | List active & historic alerts |
+| | `/api/v1/alerts/<id>/ack` | `POST` | Acknowledge active alert |
+| **Forecast** | `/api/v1/forecast/<node_id>` | `GET` | Short-term AQI trend forecast |
+| **System** | `/admin/health` | `GET` | Component health diagnostics |
+| | `/metrics` | `GET` | Prometheus instrumentation metrics |
+| **WebSockets** | `/ws/alerts` | `WS` | Real-time threshold breach notifications |
+| | `/ws/live` | `WS` | Live sensor telemetry stream |
 
 ---
 
-## 🛑 Stopping Redis and Celery
+## 🚢 Production Deployment
 
-### Stopping Redis
-The project uses Redis started inside the Windows Subsystem for Linux (WSL). To shut it down cleanly:
+The `deploy/` directory provides complete automation for bare-metal / VPS production environments:
+
+### 1. Architecture Requirements in Production
+- **Reverse Proxy**: Nginx with SSL/TLS termination, HTTP $\rightarrow$ HTTPS redirect, and WebSocket proxying (`deploy/nginx.conf`).
+- **Process Supervision**: Systemd units for the API, Celery worker, and beat scheduler:
+  - `deploy/quart-api.service` — Hypercorn running `app:create_app()` with 2 workers
+  - `deploy/celery-worker.service` — Celery worker task consumer
+  - `deploy/celery-beat.service` — Celery beat cron scheduler
+- **Database**: PostgreSQL with TimescaleDB extension enabled (`CREATE EXTENSION IF NOT EXISTS timescaledb;`).
+- **Telemetry Security**: MQTT Broker with TLS mutual authentication (`MQTT_USE_TLS=true`). Client certificates and CA certs are loaded from `/opt/empyrean/certs/` (`ca.crt`, `client.crt`, `client.key`) with fail-closed security.
+
+### 2. Automated Deployment Pipeline
+
+Export your target server details and execute the deployment script:
 ```bash
-# Inside the WSL terminal where Redis is running
-wsl sudo systemctl stop redis-server
+export SERVER_HOST="your-server-ip-or-domain"
+export SERVER_USER="empyrean"
+export DOMAIN="api.yourdomain.com"     # Optional: automatically templates Nginx config
+
+bash deploy/deploy.sh
 ```
 
-### Stopping Celery
-Celery runs as a separate background process (or as part of the `celery -A celery_app.celery_app worker -B` command).
-
-- **If you started Celery via a terminal window** (e.g., using `dev-up.bat` or manually), simply press **Ctrl + C** in that terminal. This sends a termination signal that stops the worker and the beat scheduler.
-- **If you need to stop it from another terminal**, terminate the Celery process by name:
-  - **Linux/macOS**:
-    ```bash
-    pkill -f celery
-    ```
-  - **Windows PowerShell**:
-    ```powershell
-    Get-Process -Name celery | Stop-Process -Force
-    ```
-  - Alternatively, open Task Manager (or `htop` on Linux) and kill the `celery` process directly.
-
-> **Tip:** Always shut down Redis and Celery before restarting the whole stack to avoid stale socket connections or "address already in use" errors.
+`deploy/deploy.sh` automatically:
+1. Syncs project code via `rsync` (excluding `.git`, `venv`, and local secrets).
+2. Provisions the virtualenv and updates dependencies.
+3. Installs and enables systemd service units.
+4. Generates/preserves `/opt/empyrean/.env` with strict `600` permissions.
+5. Templates and enables Nginx configuration (with domain and SSL paths).
+6. Runs database migrations (`alembic upgrade head`).
 
 ---
 
-## ⚙️ Development Tools
+## 💡 Deployment Readiness Checklist
 
-- Run individual components:
-  - `celery -A celery_app.celery_app worker --loglevel=info`
-  - `hypercorn app:app --bind 0.0.0.0:8000`
-- Health check: `curl http://localhost:8000/admin/health`
-- Stop the stack: `scripts\dev-down.bat`
-- Run tests: `pytest`
+Before going live, verify the following configuration checklist:
 
----
-
-## 🗂️ Project Structure
-
-Key folders:
-- `app/` — API
-- `tasks/` — Celery tasks
-- `mqtt/` — MQTT integration
-- `config/` — Settings
-- `scripts/` — Dev tools
-
----
-
-## 📦 Quick Reference
-
-| Action | Command |
-|--------|---------|
-| Create venv | `python -m venv .venv` |
-| Activate venv | `.\.venv\Scripts\activate` |
-| Install deps | `pip install -r requirements.txt` |
-| Copy env file | `cp .env.example .env` |
-| Start Redis (WSL) | `wsl redis-server --daemonize yes` |
-| Migrate DB | `alembic upgrade head` |
-| Seed DB | `python scripts/seed.py` |
-| Start dev stack | `scripts\dev-up.bat` |
-| Start dev stack (single console) | `scripts\dev-up-quick.bat` |
-| Stop dev stack | `scripts\dev-down.bat` |
-| Run tests | `pytest` |
-| Health check | `curl http://localhost:8000/admin/health` |
-| Stop Redis (WSL) | `wsl sudo systemctl stop redis-server` |
-| Stop Celery (Linux/macOS) | `pkill -f celery` |
-| Stop Celery (Windows) | `Get-Process -Name celery \| Stop-Process -Force` |
-
----
-
-## 💡 Gotchas & Tips
-
-- **Redis** — The repo expects Redis reachable via WSL on Windows. On native Windows, install Redis for Windows or run it in Docker and point `REDIS_URL` accordingly.
-- **MQTT** — Broker settings live in `.env`. Without a broker, comment out the MQTT lifecycle registration in `app_factory/factory.py` or set `MQTT_BROKER_HOST=localhost` / `MQTT_BROKER_PORT=1883` (default Mosquitto port).
-- **Celery beat** — On Windows, `-B` (beat in the same process) is not supported, so the batch script starts beat in its own window.
-- **Debugging** — If you hit a `ModuleNotFoundError`, double-check the virtual environment is activated and `pip install -r requirements.txt` succeeded.
+- [x] **TimescaleDB Installed**: PostgreSQL server has `timescaledb` extension installed and enabled on the target database.
+- [ ] **Cryptographic Secrets Generated**: Run `python scripts/generate_secrets.py --write-env` to ensure `SECRET_KEY` and `JWT_SECRET` are high-entropy 256-bit keys.
+- [ ] **Production MQTT Broker & TLS**: When `MQTT_USE_TLS=true`, place valid TLS certificates (`ca.crt`, `client.crt`, `client.key`) in `/opt/empyrean/certs/`.
+- [ ] **Nginx & SSL**: Ensure Let's Encrypt / Certbot SSL certificates exist for `${DOMAIN}` in `/etc/letsencrypt/live/${DOMAIN}/`.
+- [ ] **Metrics Protection**: Confirm `/metrics` is protected and only accessible internally (127.0.0.1) or by your Prometheus scraper.
+- [ ] **Database Migrations**: Ensure `alembic upgrade head` completed successfully on the production database.

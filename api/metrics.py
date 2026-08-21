@@ -44,12 +44,11 @@ def register_metrics(app):
 
     @app.after_request
     async def _observe(response):
-        raw_route = str(request.url_rule or "unknown")
-        sanitized_route = _sanitize(raw_route)
+        route = str(request.url_rule or "unknown")
 
         labels = (
             request.method,
-            sanitized_route,
+            route,
             str(response.status_code),
         )
         REQ_COUNT.labels(*labels).inc()

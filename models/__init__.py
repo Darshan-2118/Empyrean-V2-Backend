@@ -20,7 +20,7 @@ from models.node import Node
 from models.reading import SensorReading
 from models.aggregate import HourlyAgg
 from models.alert import Alert
-from models.setting import SystemSetting
+from models.setting import SystemSetting, AuditLog
 
 __all__ = [
     "Base",
@@ -31,5 +31,6 @@ __all__ = [
     "HourlyAgg",
     "Alert",
     "SystemSetting",
+    "AuditLog",
     "get_sync_db",
 ]

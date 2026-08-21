@@ -166,7 +166,7 @@ def _upsert_alert(
                 "threshold": threshold,
                 "severity": severity,
                 "message": message,
-                "created_at": datetime.now(timezone.utc),
+                "triggered_at": datetime.now(timezone.utc),
             },
             where=text(f"{existing_rank} < {new_rank}"),
         )

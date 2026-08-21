@@ -39,13 +39,26 @@ fi
 REMOTE
 
 # --- Systemd units + nginx ---
-ssh "$SERVER_USER@$SERVER_HOST" bash -s -- "$APP_DIR" <<'REMOTE'
+ssh "$SERVER_USER@$SERVER_HOST" bash -s -- "$APP_DIR" "${DOMAIN:-}" <<'REMOTE'
 set -e
 APP_DIR="$1"
+DOMAIN="$2"
+
 sudo install -m 0644 "$APP_DIR"/deploy/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now quart-api celery-worker celery-beat
-sudo systemctl restart nginx
+
+# Configure Nginx if DOMAIN is provided
+if [ -n "$DOMAIN" ] && [ -f "$APP_DIR/deploy/nginx.conf" ]; then
+  if command -v envsubst >/dev/null 2>&1; then
+    export DOMAIN
+    envsubst '${DOMAIN}' < "$APP_DIR/deploy/nginx.conf" | sudo tee /etc/nginx/sites-available/empyrean >/dev/null
+    sudo ln -sf /etc/nginx/sites-available/empyrean /etc/nginx/sites-enabled/empyrean
+    echo "[deploy] Nginx configuration updated for $DOMAIN"
+  fi
+fi
+
+sudo nginx -t && sudo systemctl restart nginx
 REMOTE
 
 # --- Production .env (never clobber existing secrets) ---

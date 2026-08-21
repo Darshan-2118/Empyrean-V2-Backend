@@ -23,6 +23,59 @@ from config import get_config
 
 cfg = get_config()
 
+logger = logging.getLogger(__name__)
+
+# ── Celery application instance ─────────────────────────────────────────────
+# Must be defined before anything below that references it (decorators,
+# monkeypatches, etc. all execute at import time).
+celery_app = Celery(
+    "empyrean",
+    broker=cfg.REDIS_URL,
+    backend=cfg.REDIS_URL,
+    include=[
+        "tasks.aggregation",
+        "tasks.alerts",
+        "tasks.forecast",
+        "tasks.process_reading",
+    ],
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    # At-least-once delivery (M-6): ack only after the task finishes
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_acks_on_failure_or_timeout=False,
+    # Finite time bounds (I-35): configurable via config/__init__.py
+    task_soft_time_limit=cfg.TASK_SOFT_TIME_LIMIT,
+    task_time_limit=cfg.TASK_HARD_TIME_LIMIT,
+    worker_prefetch_multiplier=1,
+    beat_schedule={
+        # ── Every 60 s ──────────────────────────────
+        "alert-threshold-check": {
+            "task": "empyrean.tasks.alerts.check_thresholds",
+            "schedule": 60.0,
+        },
+        # ── Every hour (7 minutes past) ────────────────────────────
+        "hourly-aggregation": {
+            "task": "empyrean.tasks.aggregation.hourly_aggregate",
+            "schedule": crontab(minute=7),
+        },
+        "forecast-model-retraining": {
+            "task": "tasks.forecast.retrain_model",
+            "schedule": crontab(minute=7),
+        },
+        # ── Daily at 03:23 ───────────────────────────────
+        "data-retention-cleanup": {
+            "task": "empyrean.tasks.aggregation.data_retention_cleanup",
+            "schedule": crontab(hour=3, minute=23),
+        },
+    },
+)
+
 # Shared task options (M-9 / #15): transient DB/connection blips should recover
 # automatically instead of being dropped (acks_late means a hard failure is
 # redelivered with no retry bound → permanent loss). All real tasks retry on
@@ -203,14 +256,17 @@ def toggle_circuit_breaker(enabled: bool) -> None:
 # These hooks are registered globally and automatically record task failures
 # to the circuit breaker when autoretry_for is in use.
 
-@celery_app.task_prerun.connect
+from celery.signals import task_prerun, task_postrun
+
+
+@task_prerun.connect
 def on_task_prerun(sender, task_id, task, **kwargs):
     """Called before every task starts. No failure recording here to avoid double-counting."""
     # Failure recording moved to task_postrun to count only actual failures
     pass
 
 
-@celery_app.task_postrun.connect
+@task_postrun.connect
 def on_task_postrun(sender, task_id, task, retval, state, **kwargs):
     """Called after every task completes. Record failures and reset on success."""
     if hasattr(task, "autoretry_for") and task.autoretry_for:
@@ -225,7 +281,7 @@ def on_task_postrun(sender, task_id, task, retval, state, **kwargs):
 # ── Task middleware to integrate circuit breaker (#15) ───────────────────────
 # Wraps task execution to check circuit breaker state before retrying.
 
-original_task_apply_async = celery_app.send_task.__wrapped__
+original_task_apply_async = celery_app.send_task
 
 
 def circuit_breaker_aware_send_task(name: str, task_dict=None, *args, **kwargs):
@@ -247,57 +303,3 @@ def circuit_breaker_aware_send_task(name: str, task_dict=None, *args, **kwargs):
 
 
 celery_app.send_task = circuit_breaker_aware_send_task
-
-
-celery_app = Celery(
-    "empyrean",
-    broker=cfg.REDIS_URL,
-    backend=cfg.REDIS_URL,
-    include=[
-        "tasks.aggregation",
-        "tasks.alerts",
-        "tasks.forecast",
-        "tasks.process_reading",
-    ],
-)
-
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    # At-least-once delivery (M-6): ack only after the task finishes
-    task_acks_late=True,
-    task_reject_on_worker_lost=True,
-    task_acks_on_failure_or_timeout=False,
-    # Finite time bounds (I-35): configurable via config/__init__.py
-    task_soft_time_limit=cfg.TASK_SOFT_TIME_LIMIT,
-    task_time_limit=cfg.TASK_HARD_TIME_LIMIT,
-    worker_prefetch_multiplier=1,
-    beat_schedule={
-        # ── Every 60 s ──────────────────────────────
-        "alert-threshold-check": {
-            "task": "empyrean.tasks.alerts.check_thresholds",
-            "schedule": 60.0,
-        },
-        # ── Every hour (7 minutes past) ────────────────────────────
-        "hourly-aggregation": {
-            "task": "empyrean.tasks.aggregation.hourly_aggregate",
-            "schedule": crontab(minute=7),
-        },
-        "forecast-model-retraining": {
-            "task": "tasks.forecast.retrain_model",
-            "schedule": crontab(minute=7),
-        },
-        # ── Daily at 03:23 ───────────────────────────────
-        "data-retention-cleanup": {
-            "task": "empyrean.tasks.aggregation.data_retention_cleanup",
-            "schedule": crontab(hour=3, minute=23),
-        },
-        # ── Daily at 03:30 (Issue #28: refresh token cleanup) ───────────────────────────────
-        "refresh-token-cleanup": {
-            "task": "empyrean.tasks.aggregation.refresh_token_cleanup",
-            "schedule": crontab(hour=3, minute=30),
-        },
-    },
-)

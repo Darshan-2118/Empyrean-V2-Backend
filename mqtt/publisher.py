@@ -81,42 +81,45 @@ def _calculate_retry_delay(attempt: int) -> float:
 
 
 def _retry_failed_messages() -> None:
-    """Retry failed messages from the queue with exponential backoff."""
+    """Retry failed messages from the queue with exponential backoff.
+
+    Collects messages to retry under the lock, then retries them outside the
+    lock so time.sleep() does not block other publishers.
+    """
     global _failed_queue
     if not _failed_queue:
         return
 
-    cfg = get_config()
     client = _get_client()
     if client is None:
         return  # Can't retry without a client
 
-    # Hold lock during queue modifications to prevent race conditions
+    # Snapshot and clear under the lock, then retry without holding it
     with _lock:
-        retried = []
-        for payload, attempt in list(_failed_queue):
-            if attempt >= _MAX_RETRY_ATTEMPTS:
-                logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
-                continue
+        to_retry = list(_failed_queue)
+        _failed_queue.clear()
 
-            delay = _calculate_retry_delay(attempt)
-            time.sleep(delay)
+    still_failed: list[tuple[dict[str, Any], int]] = []
+    for payload, attempt in to_retry:
+        if attempt >= _MAX_RETRY_ATTEMPTS:
+            logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
+            continue
 
-            info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
-            if info.rc == 0:
-                logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
-                retried.append((payload, attempt))
-            else:
-                logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
-                # Only update attempt count if this entry still exists (it may have been removed by a concurrent retry)
-                if (payload, attempt) in _failed_queue:
-                    _failed_queue.remove((payload, attempt))
-                    _failed_queue.append((payload, attempt + 1))
+        delay = _calculate_retry_delay(attempt)
+        time.sleep(delay)
 
-        # Remove successfully retried messages
-        for item in retried:
-            if item in _failed_queue:
-                _failed_queue.remove(item)
+        info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
+        if info.rc == 0:
+            logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
+        else:
+            logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
+            still_failed.append((payload, attempt + 1))
+
+    # Re-enqueue any that still failed
+    if still_failed:
+        with _lock:
+            for item in still_failed:
+                _failed_queue.append(item)
 
 
 def publish_alert(
@@ -130,6 +133,7 @@ def publish_alert(
     Issue #25: Failed publishes are queued for exponential backoff retry to
     prevent data loss during transient broker outages.
     """
+    published = False
     with _lock:
         client = _get_client()
         if client is None:
@@ -153,7 +157,10 @@ def publish_alert(
             _queue_failed_message(node_id, aqi, category, severity, timestamp)
             return
 
-        # Publish succeeded - try to retry any queued messages
+        published = True
+
+    # Retry queued messages OUTSIDE the lock to avoid blocking other publishers
+    if published:
         _retry_failed_messages()
 
 

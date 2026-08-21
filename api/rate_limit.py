@@ -196,47 +196,15 @@ def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_
                             reset_ts,
                         )
                     return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
-                # Redis error -> fall through to in-memory fallback
-                logger.warning("Redis rate-limit INCR failed for %r — failing open to in-memory fallback", key)
+                # Redis error -> fail open
+                logger.warning("Redis rate-limit INCR failed for %r — failing open", key)
                 _increment_bypass_counter()
             else:
-                # Redis client unavailable -> use in-memory fallback
-                logger.warning("Redis client is None — rate limiting failing open to in-memory fallback")
+                # Redis client unavailable -> fail open
                 _increment_bypass_counter()
 
-            # Redis unavailable or error -> use in-memory fallback
-            with _in_memory_lock:
-                # Clean old entries occasionally (simple approach: clear if too big)
-                if len(_in_memory_cache) > 10000:
-                    _in_memory_cache.clear()
-
-                window_start = now.timestamp()
-                # Remove entries outside the current window
-                expired_keys = [k for k, (_, start) in _in_memory_cache.items()
-                              if window_start - start > window_seconds]
-                for k in expired_keys:
-                    del _in_memory_cache[k]
-
-                # Get or create counter for this key
-                if key in _in_memory_cache:
-                    count, _ = _in_memory_cache[key]
-                    count += 1
-                    _in_memory_cache[key] = (count, window_start)
-                else:
-                    count = 1
-                    _in_memory_cache[key] = (count, window_start)
-
-                if count > limit:
-                    logger.warning("Rate limit exceeded for IP %s (%s/%s) [in-memory fallback]", ip, count, limit)
-                    return _with_headers(
-                        _problem_json(
-                            429, "Too Many Requests", "Rate limit exceeded. Please slow down."
-                        ),
-                        limit,
-                        limit - count,
-                        reset_ts,
-                    )
-                return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
+            # Fail open: allow request through with headers
+            return _with_headers(await f(*args, **kwargs), limit, limit, reset_ts)
 
         return decorated
 
