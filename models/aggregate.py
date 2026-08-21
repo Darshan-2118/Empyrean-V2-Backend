@@ -5,7 +5,7 @@ This is a regular PostgreSQL table, filled by the Celery aggregation task
 (``tasks/aggregation.py``) each hour.  It is *not* a materialized view and is
 *not* yet a TimescaleDB continuous aggregate.  Whether to migrate it to a
 continuous aggregate (the extension is already installed by migration
-``b2bab23ab3c0``) is a future decision and is not currently planned.
+``0002_add_timescaledb_hypertable``) is a future decision and is not currently planned.
 """
 
 from datetime import datetime

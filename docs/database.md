@@ -46,7 +46,7 @@ Indexed on `(user_id)` and `(token_hash)`.
 | `last_seen` | `TIMESTAMPTZ` | Updated by heartbeat |
 
 ## `sensor_readings` — the core data
-**Note:** Already a TimescaleDB hypertable (converted by migration `b2bab23ab3c0`; partitioned on `time`, default 7-day chunks). Compression/retention policies are still pending.
+**Note:** Already a TimescaleDB hypertable (converted by migration `0002_add_timescaledb_hypertable`; partitioned on `time`, default 7-day chunks). Compression/retention policies are still pending.
 
 | Column | Type | Range | Notes |
 |--------|------|-------|-------|

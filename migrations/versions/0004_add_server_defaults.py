@@ -8,8 +8,8 @@ had Python-side ORM defaults (M-17). Raw / bulk SQL inserts (e.g. ``COPY``,
 Columns untouched (already have server_default): ``*.created_at``,
 ``*.updated_at``, ``registered_at``, ``triggered_at``, ``is_anomaly``.
 
-Revision ID: 9a8b7c6d5e4f
-Revises: 1785940433799
+Revision ID: 0004
+Revises: 0003
 Create Date: 2026-08-05
 
 """
@@ -19,8 +19,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "9a8b7c6d5e4f"
-down_revision: Union[str, None] = "1785940433799"
+revision: str = "0004"
+down_revision: Union[str, None] = "0003"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

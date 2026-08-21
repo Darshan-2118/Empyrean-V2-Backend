@@ -25,7 +25,7 @@ class Alert(Base):
     # At most one *unacknowledged* alert may exist per (node_id, parameter), so
     # the DB — not a racy application-side check-then-insert — arbitrates
     # double-inserts. ``tasks.check_thresholds`` upserts against this index.
-    # Delivered by migration ``1785940433799_add_alerts_partial_unique.py``;
+    # Delivered by migration ``0003_add_alerts_partial_unique.py``;
     # this declaration keeps alembic autogenerate + ``create_all`` in sync.
     __table_args__ = (
         Index(

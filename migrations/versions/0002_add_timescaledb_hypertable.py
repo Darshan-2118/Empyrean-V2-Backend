@@ -5,8 +5,8 @@ Installs the TimescaleDB extension and converts ``sensor_readings``
 (and eventually ``hourly_agg``) to hypertables for efficient
 time-series queries.
 
-Revision ID: b2bab23ab3c0
-Revises: eb88597519c9
+Revision ID: 0002
+Revises: 0001
 Create Date: 2026-07-30 18:17:22.880079
 
 """
@@ -17,8 +17,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "b2bab23ab3c0"
-down_revision: Union[str, None] = "eb88597519c9"
+revision: str = "0002"
+down_revision: Union[str, None] = "0001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
