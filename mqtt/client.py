@@ -263,7 +263,8 @@ class MQTTClient:
         self._queue: "queue.Queue[tuple[str, str, str]]" = queue.Queue(maxsize=_QUEUE_MAX)
         self._worker_thread: threading.Thread | None = None
         self._pending_subs: dict[int, str] = {}  # mid -> topic (L-23)
-        self._ready = False  # True once both subscriptions are granted
+        self._ready = False  # True once both reading and status subscriptions are granted
+        self._subscriptions_complete = 0  # Track progress toward both subscriptions
         self._tls_configured = False  # True only after tls_set() succeeds (H-4)
 
         self._client = mqtt.Client(
@@ -345,6 +346,9 @@ class MQTTClient:
         ``subscribe()`` returning SUCCESS only means the SUBSCRIBE packet was
         sent. A broker can deny it in the SUBACK; inspecting the granted QoS is
         the authoritative check.
+
+        Only sets `_ready=True` after BOTH required subscriptions
+        (reading + status) are successfully granted.
         """
         topic = self._pending_subs.pop(mid, None)
         granted = granted_qos[0] if granted_qos else None
@@ -356,8 +360,30 @@ class MQTTClient:
                 "Subscription to %s denied by broker (no granted QoS)", topic
             )
             return
-        self._ready = True
-        logger.info("Subscribed to %s @ granted QoS %s", topic, granted)
+
+        # Track successful subscriptions
+        self._subscriptions_complete += 1
+
+        # Only mark ready after both required subscriptions succeed
+        # (reading and status — alerts is optional from a readiness perspective)
+        if topic in (_READING_TOPIC, _STATUS_TOPIC):
+            if self._subscriptions_complete == 2:
+                self._ready = True
+                logger.info(
+                    "MQTT client ready — both required topics subscribed: "
+                    "%s, %s @ granted QoS %s", _READING_TOPIC, _STATUS_TOPIC, granted
+                )
+            else:
+                logger.info(
+                    "Subscribed to %s @ granted QoS %s (%d/2 required)",
+                    topic, granted, self._subscriptions_complete
+                )
+        else:
+            # Alerts subscription completes the count but doesn't trigger ready state
+            logger.info(
+                "Alerts subscription granted @ QoS %s (ready check uses reading/status)",
+                granted
+            )
 
     def _on_message(self, client, userdata, msg) -> None:
         """Decode + route on the paho loop; heavier work goes to the worker."""

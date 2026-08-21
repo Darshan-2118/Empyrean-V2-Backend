@@ -57,7 +57,12 @@ def _get_client() -> mqtt.Client | None:
                     logger.error("MQTT TLS requested but certs unset — alerts publish disabled")
                     return None
                 c.tls_set(ca_certs=cfg.MQTT_CA_CERTS, certfile=cfg.MQTT_TLS_CERT, keyfile=cfg.MQTT_TLS_KEY)
-            c.connect(cfg.MQTT_BROKER_HOST, cfg.MQTT_BROKER_PORT, keepalive=60)
+            rc = c.connect(cfg.MQTT_BROKER_HOST, cfg.MQTT_BROKER_PORT, keepalive=60)
+            if rc != 0:
+                logger.error("MQTT connect failed (rc=%s) — disabling publisher", rc)
+                logger.error("Connection error: incomplete use of protocol, client is illegible or revoked")
+                return None
+            logger.debug("MQTT client connected to %s:%s (rc=%s)", cfg.MQTT_BROKER_HOST, cfg.MQTT_BROKER_PORT, rc)
             c.loop_start()
             _client = c
         except Exception:
@@ -86,29 +91,32 @@ def _retry_failed_messages() -> None:
     if client is None:
         return  # Can't retry without a client
 
-    retried = []
-    for payload, attempt in list(_failed_queue):
-        if attempt >= _MAX_RETRY_ATTEMPTS:
-            logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
-            continue
+    # Hold lock during queue modifications to prevent race conditions
+    with _lock:
+        retried = []
+        for payload, attempt in list(_failed_queue):
+            if attempt >= _MAX_RETRY_ATTEMPTS:
+                logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
+                continue
 
-        delay = _calculate_retry_delay(attempt)
-        time.sleep(delay)
+            delay = _calculate_retry_delay(attempt)
+            time.sleep(delay)
 
-        info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
-        if info.rc == 0:
-            logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
-            retried.append((payload, attempt))
-        else:
-            logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
-            # Update attempt count
-            _failed_queue.remove((payload, attempt))
-            _failed_queue.append((payload, attempt + 1))
+            info = client.publish(_ALERTS_TOPIC, json.dumps(payload), qos=_QOS)
+            if info.rc == 0:
+                logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
+                retried.append((payload, attempt))
+            else:
+                logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
+                # Only update attempt count if this entry still exists (it may have been removed by a concurrent retry)
+                if (payload, attempt) in _failed_queue:
+                    _failed_queue.remove((payload, attempt))
+                    _failed_queue.append((payload, attempt + 1))
 
-    # Remove successfully retried messages
-    for item in retried:
-        if item in _failed_queue:
-            _failed_queue.remove(item)
+        # Remove successfully retried messages
+        for item in retried:
+            if item in _failed_queue:
+                _failed_queue.remove(item)
 
 
 def publish_alert(
@@ -126,6 +134,13 @@ def publish_alert(
         client = _get_client()
         if client is None:
             logger.warning("No MQTT publisher available — queueing air/alerts publish for %s", node_id)
+            _queue_failed_message(node_id, aqi, category, severity, timestamp)
+            return
+
+        # Check if client is connected before publishing
+        if not client.is_connected():
+            logger.warning("MQTT client not connected (rc=%s) — queueing air/alerts publish for %s",
+                          client.is_connected(), node_id)
             _queue_failed_message(node_id, aqi, category, severity, timestamp)
             return
 

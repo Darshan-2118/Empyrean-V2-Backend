@@ -186,8 +186,14 @@ def get_sync_db() -> Generator:
         yield session
         session.commit()
     except Exception:
-        session.rollback()
+        # Log the original exception before rollback to preserve debuggability
         logger.exception("Database session rolled back due to error")
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            # Chain the rollback error to help identify the root cause
+            logger.error("Database rollback also failed: %s", rollback_error, exc_info=True)
+            raise rollback_error from None
         raise
     finally:
         session.close()

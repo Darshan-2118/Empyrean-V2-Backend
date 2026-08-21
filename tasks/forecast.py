@@ -127,3 +127,70 @@ def retrain_model() -> dict:
             redis_client.close()
         except Exception:
             pass
+
+
+def generate_forecast(node_id: str, hours_ahead: int = 1) -> dict:
+    """Generate AQI forecasts for the next {hours_ahead} hours for a node.
+
+    Uses the trained model stored in Redis to predict future AQI values.
+    Returns an empty dict if no model is available or forecast generation fails.
+
+    Args:
+        node_id: Node identifier for which to generate forecast
+        hours_ahead: Number of hours ahead to forecast (default: 1)
+
+    Returns:
+        Dictionary with forecast results or error info
+    """
+    import json
+
+    logger.info("Generating forecast for node %s, %d hours ahead", node_id, hours_ahead)
+
+    # Retrieve trained model from Redis
+    model_key = f"forecast_model:{node_id}"
+    with get_sync_redis() as redis_client:
+        model_json = redis_client.get(model_key)
+        if not model_json:
+            logger.warning("No forecast model found for node %s", node_id)
+            return {"prediction_hours": hours_ahead, "available": False, "error": "no_model"}
+
+        model = json.loads(model_json)
+
+    # Generate forecast using the trained model
+    try:
+        forecast_data = []
+        current_time = datetime.now(timezone.utc).timestamp()
+
+        for step in range(1, hours_ahead + 1):
+            forecast_time = current_time + (step * FORECAST_STEP_SECONDS)
+            month = (datetime.fromtimestamp(forecast_time, tz=timezone.utc)).month
+
+            # Linear regression: AQI = slope * x + intercept + seasonal_coeffs[month]
+            forecast_aqi = model["slope"] * forecast_time + model["intercept"]
+
+            # Add seasonal adjustment if available
+            if month in model["seasonal_coeffs"]:
+                forecast_aqi += model["seasonal_coeffs"][month]
+
+            forecast_data.append({
+                "hour_step": step,
+                "timestamp": datetime.fromtimestamp(forecast_time, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "aqi": round(forecast_aqi, 2),
+                "month": month
+            })
+
+        logger.info("Generated forecast for node %s: %d hours", node_id, hours_ahead)
+        return {
+            "prediction_hours": hours_ahead,
+            "available": True,
+            "trained_at": model["trained_at"],
+            "forecasts": forecast_data
+        }
+
+    except Exception as e:
+        logger.exception("Error generating forecast for node %s: %s", node_id, e)
+        return {
+            "prediction_hours": hours_ahead,
+            "available": False,
+            "error": str(e)
+        }
