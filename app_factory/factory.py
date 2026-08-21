@@ -17,10 +17,6 @@ from .helpers import (
     register_startup_checks,
 )
 
-# Import tracing setup
-from app.tracing import tracer_provider
-
-
 def create_app() -> Quart:
     """Application factory."""
     cfg = get_config()
@@ -43,9 +39,18 @@ def create_app() -> Quart:
     register_startup_checks(app, cfg, logger)
     register_mqtt_lifecycle(app, cfg, logger)
 
-    # Setup distributed tracing
-    from app.tracing import instrument_app
-    instrument_app(app)
+    # Setup distributed tracing — use file-path import to avoid the top-level
+    # app.py shadowing the app/ package when Python resolves 'app.tracing'.
+    try:
+        import importlib.util
+        import pathlib
+        _tracing_path = pathlib.Path(__file__).resolve().parent.parent / "app" / "tracing.py"
+        _spec = importlib.util.spec_from_file_location("app_pkg.tracing", _tracing_path)
+        _tracing = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_tracing)
+        _tracing.instrument_app(app)
+    except Exception as _trace_exc:
+        logger.warning("OpenTelemetry tracing unavailable (fail-open): %s", _trace_exc)
 
     wrapped_app = cors(app, allow_origin=cfg.cors_origins_list, allow_credentials=True)
 

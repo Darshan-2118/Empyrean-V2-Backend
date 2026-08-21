@@ -244,9 +244,11 @@ def _handle_alert(raw: str) -> None:
         return
     from api.ws.manager import manager  # import here to avoid an import cycle
 
-    success, count = manager.broadcast(data)
-    if not success:
-        logger.warning("Broadcast failed to target %d client(s)", count)
+    res = manager.broadcast(data)
+    if isinstance(res, tuple):
+        success, count = res
+        if not success:
+            logger.warning("Broadcast failed to target %d client(s)", count)
 
 
 class MQTTClient:

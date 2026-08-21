@@ -180,7 +180,7 @@ def data_retention_cleanup() -> dict:
             return {"deleted": 0}
 
         sql = text(
-            "DELETE FROM sensor_readings WHERE time < now() - interval ':days days'"
+            "DELETE FROM sensor_readings WHERE time < now() - (:days * interval '1 day')"
         )
         result = session.execute(sql, {"days": days})
         n = result.rowcount

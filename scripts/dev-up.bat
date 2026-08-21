@@ -47,13 +47,13 @@ echo Redis is reachable.
 echo.
 
 REM --- Celery worker ---
-start "empyrean-celery-worker" cmd /k venv\Scripts\celery.exe -A celery_app.celery_app worker --loglevel=info
+start "empyrean-celery-worker" cmd /k .venv\Scripts\celery.exe -A celery_app.celery_app worker --loglevel=info
 
 REM --- Celery beat (scheduler) ---
-start "empyrean-celery-beat" cmd /k venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info
+start "empyrean-celery-beat" cmd /k .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info
 
 REM --- HTTP API ---
-start "empyrean-api" cmd /k venv\Scripts\python.exe app.py
+start "empyrean-api" cmd /k .venv\Scripts\hypercorn.exe "app:create_app()" --bind 0.0.0.0:8000
 
 echo Dev stack launching in separate windows: worker / beat / api.
 echo (Start Redis yourself: wsl redis-server --daemonize yes)

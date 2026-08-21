@@ -121,21 +121,7 @@ def _parse_time(value: str | datetime | None) -> datetime:
             return datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    
-    dt_utc = dt.astimezone(timezone.utc)
-    now = datetime.now(timezone.utc)
-    
-    # Validate timestamp is within ±24 hours of server time
-    time_diff = abs((dt_utc - now).total_seconds())
-    if time_diff > 86400:  # 24 hours in seconds
-        logger.warning(
-            "Timestamp %r is %d seconds out of range (limit: ±24h) — using server time",
-            value,
-            time_diff
-        )
-        return now
-    
-    return dt_utc
+    return dt.astimezone(timezone.utc)
 
 
 def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:

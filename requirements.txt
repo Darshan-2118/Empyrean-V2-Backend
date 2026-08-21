@@ -29,7 +29,15 @@ numpy==2.1.3
 # Validation
 pydantic==2.9.2
 pydantic-settings==2.6.1
-email-validator==2.2.0  # required by pydantic EmailStr
+email-validator==2.2.0
+
+# OpenTelemetry
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+opentelemetry-instrumentation==0.65b0
+opentelemetry-instrumentation-asgi==0.65b0
+opentelemetry-instrumentation-celery==0.65b0
 
 # Testing
 pytest==8.2.0

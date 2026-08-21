@@ -194,6 +194,13 @@ async def change_password():
     from models.refresh_token import RefreshToken
 
     async with AsyncSessionLocal() as session:
+        # Re-fetch user within this session to avoid detached instance error
+        persistent = await session.get(User, user.id)
+        if persistent is None:
+            return _problem_json(404, "Not Found", "User not found")
+
+        persistent.password_hash = await asyncio.to_thread(hash_password, data.new_password)
+
         result = await session.execute(
             select(RefreshToken).where(
                 RefreshToken.user_id == user.id,
@@ -202,7 +209,6 @@ async def change_password():
         )
         for rt in result.scalars().all():
             rt.revoked = True
-        session.add(user)
         await session.commit()
 
     logger.info("Password changed for user %s", user.username)
@@ -216,9 +222,14 @@ async def delete_profile():
     user: User = g.current_user
     user.is_active = False
 
-    from models.refresh_token import RefreshToken
-
     async with AsyncSessionLocal() as session:
+        # Re-fetch user within this session to avoid detached instance error
+        persistent = await session.get(User, user.id)
+        if persistent is None:
+            return _problem_json(404, "Not Found", "User not found")
+
+        persistent.is_active = False
+
         result = await session.execute(
             select(RefreshToken).where(
                 RefreshToken.user_id == user.id,
@@ -227,7 +238,6 @@ async def delete_profile():
         )
         for rt in result.scalars().all():
             rt.revoked = True
-        session.add(user)
         await session.commit()
 
     logger.info("Account deactivated for user %s", user.username)

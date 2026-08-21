@@ -274,7 +274,7 @@ class Config(BaseSettings):
 
         If TLS is enabled, certificate and key files should be provided.
         """
-        if self.MQTT_USE_TLS and not (self.MQTT_TLS_CERT and self.MQTT_TLS_KEY):
+        if self.MQTT_ENABLED and self.MQTT_USE_TLS and not (self.MQTT_TLS_CERT and self.MQTT_TLS_KEY):
             raise ValueError(
                 "MQTT_TLS_CERT and MQTT_TLS_KEY must be set when MQTT_USE_TLS is True"
             )

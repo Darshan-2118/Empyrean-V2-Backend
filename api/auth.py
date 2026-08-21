@@ -37,17 +37,20 @@ auth_bp = Blueprint("auth", __name__)
 
 # bcrypt hash of a dummy password, compared against when a login username does
 # not exist — so unknown usernames take the same time as a wrong password and
-# the endpoint does not leak which usernames are registered. Computed at module
-# import time (not lazily) so all unknown-username logins take the same time
-# (500ms), preventing timing-based username enumeration (#8). The ~500ms cost
-# only happens once at startup, not per-request.
-_DUMMY_PASSWORD_HASH: str = bcrypt.hashpw(
-    b"timing-equalizer", bcrypt.gensalt(rounds=12)
-).decode()
+# the endpoint does not leak which usernames are registered. Computed lazily on
+# first use (L-33): None at module import, set on the first unknown-username
+# login. All subsequent unknown-username logins reuse the cached hash, so
+# timing stays consistent (500ms) after the first warm-up.
+_DUMMY_PASSWORD_HASH: str | None = None
 
 
 def _dummy_password_hash() -> str:
-    """Return the pre-computed dummy bcrypt hash (#8)."""
+    """Return the lazy dummy bcrypt hash, computing it on first call (L-33)."""
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = bcrypt.hashpw(
+            b"timing-equalizer", bcrypt.gensalt(rounds=12)
+        ).decode()
     return _DUMMY_PASSWORD_HASH
 
 

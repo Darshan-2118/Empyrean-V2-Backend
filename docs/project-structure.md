@@ -43,6 +43,7 @@ Empyrean-V2-Backend/
 │   ├── deployment.md       # Production deployment guide (Phase 14)
 │   ├── fuzzy-engine.md
 │   ├── getting-started.md
+│   ├── overview.md         # Comprehensive system overview & purpose
 │   ├── project-structure.md
 │   └── security.md
 ├── fuzzy/                  # Tsukamoto fuzzy inference engine
