@@ -33,6 +33,7 @@ _ANOMALY_WINDOW_HOURS = 24
 # 2880 = 24h at the standard 30s reporting cadence, so the loaded window matches
 # the documented 24h (the old .limit(1000) capped it at ~8.3h — L-6).
 _ANOMALY_WINDOW_SAMPLES = 2880
+_ANOMALY_WINDOW_MINUTES = 1440  # 24 hours in minutes (time-based, not sample-count based)
 _ANOMALY_MIN_SAMPLES = 5
 _ANOMALY_Z_THRESHOLD = 3.0
 
@@ -152,11 +153,8 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
         )
         return False
 
-    since = datetime.now(timezone.utc) - timedelta(hours=_ANOMALY_WINDOW_HOURS)
-    # Aggregate mean/variance in SQL instead of pulling up to 2880 rows into
-    # Python on every reading (the per-message hot path). AVG / VAR_POP over
-    # the same capped (LIMIT) most-recent window reproduce the in-Python
-    # population mean/variance, so the Z-score decision is unchanged.
+    since = datetime.now(timezone.utc) - timedelta(minutes=_ANOMALY_WINDOW_MINUTES)
+    # Aggregate mean/variance in SQL - use time-based window (not fixed sample count)
     inner = (
         select(SensorReading.pm25)
         .where(
