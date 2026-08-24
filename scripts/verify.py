@@ -6,11 +6,12 @@ Runs every check that matters before you commit, deploy, or start coding:
   1.  PostgreSQL is reachable
   2.  Alembic migration is up to date
   3.  Health check (tables, seed data, app factory)
-  4.  pytest (unit / integration tests)
+  4.  pytest (unit / integration tests)  [opt-in, pass --full]
 
 Usage:
-    python scripts/verify.py            full suite
-    python scripts/verify.py --quick    skip pytest
+    python scripts/verify.py            quick checks only (no pytest)
+    python scripts/verify.py --full     full suite including pytest
+    python scripts/verify.py --quick    alias for default (backwards compat)
 
 Exit codes:
     0  - everything passed
@@ -136,17 +137,19 @@ def check_tests() -> bool:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    quick = "--quick" in sys.argv
+    # Run pytest only when explicitly requested via --full.
+    # Default is a quick liveness check (infrastructure + app factory).
+    run_tests = "--full" in sys.argv
     results: list[tuple[str, bool | None]] = []
 
     results.append(("PostgreSQL", check_postgresql()))
     results.append(("Migrations", check_migrations()))
     results.append(("Health", check_health()))
 
-    if quick:
-        results.append(("Tests", None))  # skipped
-    else:
+    if run_tests:
         results.append(("Tests", check_tests()))
+    else:
+        results.append(("Tests", None))  # skipped by default
 
     # ── Summary ──────────────────────────────────────────────────────────────
     all_pass = all(r is True for _, r in results if r is not None)
@@ -163,7 +166,8 @@ def main():
         elif result is False:
             print(f"  {RED}FAIL{NC} {name}")
         else:
-            print(f"  {YELLOW}--{NC}   {name} (skipped)")
+            skipped_hint = "  (pass --full to run)" if name == "Tests" else ""
+            print(f"  {YELLOW}--{NC}   {name} (skipped){skipped_hint}")
 
     print("")
     sys.exit(0 if all_pass else 1)

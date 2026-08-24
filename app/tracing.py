@@ -18,6 +18,29 @@ _instrumented = False
 tracer_provider = None
 
 
+def shutdown_tracing():
+    """Flush and shut down the active tracer provider, stopping its workers.
+
+    The ``BatchSpanProcessor`` exports spans from a background thread holding
+    the current stdout. Under pytest, that stream is closed when the session
+    ends — if our thread outlives it, the exporter raises
+    ``ValueError: I/O operation on closed file`` after the test summary.
+    Calling this at process/fixture teardown flushes pending spans while the
+    stream is still open, then stops the thread cleanly.
+
+    Resolved through the OTel API rather than this module's ``tracer_provider``
+    global: ``app_factory/factory.py`` loads this file as a fresh module
+    instance per app creation, so the global may not reference the live
+    provider.
+    """
+    try:
+        provider = trace.get_tracer_provider()
+        if provider is not None and hasattr(provider, "shutdown"):
+            provider.shutdown()
+    except Exception:  # noqa: BLE001 - shutdown must never raise at teardown
+        pass
+
+
 def instrument_app(app):
     """
     Wire up OpenTelemetry tracing for the Quart app + Celery.

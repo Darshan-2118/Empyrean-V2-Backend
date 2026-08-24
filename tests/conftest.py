@@ -8,6 +8,8 @@ its own transaction that gets rolled back on exit.
 
 import os
 
+from collections.abc import Generator
+
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -22,6 +24,15 @@ cfg = get_config()
 # Honor an explicit TEST_DATABASE_URL override.
 _TEST_DB_URL = os.environ.get("TEST_DATABASE_URL") or (
     make_url(cfg.DATABASE_URL).set(database="empyrean_test").render_as_string(hide_password=False)
+)
+
+# Derive an isolated Redis URL the same way: swap the logical DB index (default
+# 15, conventionally unused) so cache/rate-limit keys written by the live dev
+# stack on db 0 can never leak into tests (and vice versa). Without this, a
+# warm ``readings:latest`` cache entry from the dev stack makes API tests see
+# stale payloads instead of rows they just seeded.
+_TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL") or (
+    make_url(cfg.REDIS_URL).set(database="15").render_as_string(hide_password=False)
 )
 
 
@@ -51,6 +62,7 @@ os.environ["DATABASE_URL"] = _TEST_DB_URL
 # N-8: get_config() caches its first Config. We built one above (from .env,
 # whose DATABASE_URL points at the real "Empyrean" DB) to derive the test URL;
 # drop that cached instance so the models import picks up the env override.
+os.environ["REDIS_URL"] = _TEST_REDIS_URL
 reset_config_cache()
 
 from models import Base, Node, SystemSetting, User
@@ -66,6 +78,14 @@ _SessionFactory = sessionmaker(bind=_engine)
 def create_test_tables():
     """Create all tables once per test session, then drop them and dispose."""
     Base.metadata.create_all(_engine)
+    # Flush the isolated test Redis DB so keys from a previous run (e.g. a
+    # stale ``readings:latest`` cache entry) can't leak into this session.
+    from redis import Redis
+
+    try:
+        Redis.from_url(_TEST_REDIS_URL).flushdb()
+    except Exception:  # noqa: BLE001 - Redis down must not block table setup
+        pass
     # N-1: ensure no async-pool connection can serve a catalog that predates
     # create_all, so a later async endpoint test never hits a stale
     # "relation does not exist". Dispose the async engine's pool upfront; at
@@ -79,6 +99,23 @@ def create_test_tables():
     except Exception:  # noqa: BLE001 - defensive: pool state must not break teardown
         pass
     yield
+    # Flush/stop the OTel BatchSpanProcessor's background exporter thread
+    # before pytest closes its captured stdout, otherwise it raises
+    # "ValueError: I/O operation on closed file" after the session ends.
+    # NOTE: imported via file path (same trick as app_factory/factory.py) —
+    # a plain `from app.tracing import ...` resolves to the top-level app.py,
+    # which is not a package.
+    import importlib.util
+    import pathlib
+
+    _tracing_path = pathlib.Path(__file__).resolve().parent.parent / "app" / "tracing.py"
+    _spec = importlib.util.spec_from_file_location("app_pkg.tracing", _tracing_path)
+    _tracing = importlib.util.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(_tracing)
+        _tracing.shutdown_tracing()
+    except Exception:  # noqa: BLE001 - teardown must never fail the session
+        pass
     Base.metadata.drop_all(_engine)
     _engine.dispose()
 
@@ -86,7 +123,7 @@ def create_test_tables():
 # ── Function-scoped: isolated transaction ─────────────────────────────────────
 
 @pytest.fixture
-def db_session() -> Session:
+def db_session() -> Generator[Session, None, None]:
     """Yield a session inside a transaction, rolling back after each test."""
     connection = _engine.connect()
     transaction = connection.begin()

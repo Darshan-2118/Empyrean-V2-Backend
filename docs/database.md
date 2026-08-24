@@ -121,6 +121,6 @@ TTLs are tuned per data volatility, not a single blanket value: live readings ne
 
 ## Related Docs
 
-- [schema-plan.md](schema-plan.md)
+- [database-setup.md](database-setup.md) — Step-by-step setup guide for PostgreSQL & TimescaleDB
 - [architecture.md](architecture.md)
 - [README](../README.md)

@@ -46,6 +46,8 @@ The easiest way to get everything running is to use the provided startup scripts
    ```bash
    psql -U postgres -c "CREATE DATABASE \"Empyrean\";"
    ```
+   > 📖 For comprehensive PostgreSQL + TimescaleDB installation across Docker, Windows, Linux, macOS, and Cloud, see [database-setup.md](database-setup.md).  
+   > 🎥 Need a visual installation walkthrough? Check out this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
 
 6. **Run migrations**
    ```bash
@@ -59,21 +61,29 @@ The easiest way to get everything running is to use the provided startup scripts
    > 💡 **Default Admin User:**
    > A hardcoded admin user is available: `Darshan` / `Darsh1812` (role: `admin`).
 
-8. **Start all services** with one command (auto-starts Redis & multi-tab terminal on Windows):
+8. **Pre-flight health check**
    ```bash
-   scripts\dev-up.bat  # Windows
+   python scripts/check_health.py
+   ```
+   > ℹ️ **Note on Redis Connectivity:**
+   > If Redis is not yet running, the Redis check will report `[FAIL]`. This is normal when using `scripts\start.bat`, which automatically provisions Redis in WSL at runtime. You can either start Redis manually (`wsl sudo -n /usr/sbin/service redis-server start`) before running the health check or re-run `python scripts/check_health.py` once the stack is running.
+
+9. **Start all services** with one command (auto-starts Redis & multi-tab terminal on Windows):
+   ```bash
+   scripts\start.bat  # Windows
    # or for Linux/Mac:
-   ./scripts/dev-up.sh # (if you create one)
+   ./scripts/start.sh # (if you create one)
    ```
 
-   The `dev-up.bat` script will:
-   - Check and automatically start Redis in WSL if not running
-   - Launch **Celery worker**, **Celery beat**, and **HTTP API** inside Windows Terminal tabs
+   The `start.bat` script will:
+   - Check and automatically start Redis in WSL (as a systemd service, passwordless via a scoped sudoers rule) if not running
+   - Wait until Redis answers PING (up to 5 s) and abort without launching anything if it never becomes ready
+   - Launch **WSL Instance** (a keep-alive that pins the WSL VM open so Redis isn't torn down mid-session), **Celery worker**, **Celery beat**, and **Empyrean Server** inside Windows Terminal tabs
    - Keep periodic schedule files clean inside the `.celery/` directory
 
    To stop all services and Redis:
    ```bash
-   scripts\dev-down.bat
+   scripts\stop.bat
    ```
 
 ### Option 2: Manual Process Management
@@ -190,9 +200,9 @@ Put TLS termination for the REST API (HTTPS) in front via nginx or Caddy on the 
 To stop the development stack:
 
 ```bash
-scripts\dev-down.bat  # Windows
-# Stops: API, Celery worker, Celery beat windows
-# Note: You must manually stop Redis: wsl redis-cli shutdown
+scripts\stop.bat  # Windows
+# Stops: Server, Celery worker, Celery beat, and WSL Instance windows,
+# then stops the Redis systemd service inside WSL.
 ```
 
 For manual processes, use Ctrl+C in each terminal window.

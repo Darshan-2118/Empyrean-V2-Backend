@@ -92,19 +92,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Environment Variables & Secrets
+### 3. Generate `.env` File & Configure Secrets
 
+Initialize your `.env` file with 256-bit cryptographically secure production secrets:
+```bash
+python scripts/generate_secrets.py --write-env
+```
+
+*(Note: `generate_secrets.py` automatically initializes `.env` from `.env.example` if it does not already exist. If `.env` is already present, it protects your configuration and displays `.env is already present` without overwriting).*
+
+Alternatively, you can copy `.env.example` manually:
 ```bash
 # Windows
 copy .env.example .env
 
 # Linux / macOS
 cp .env.example .env
-```
-
-Generate 256-bit cryptographically secure secrets and write them to your `.env` automatically:
-```bash
-python scripts/generate_secrets.py --write-env
 ```
 
 > 🔒 **Security Notice:** The application enforces strict fail-fast validation in `config/__init__.py`. It will reject development placeholders (such as `dev-secret-key`, `dev-jwt-secret`, or `change-me-*`), keys shorter than 32 bytes, or low-entropy secrets. Running `scripts/generate_secrets.py` ensures your secrets comply with production constraints.
@@ -123,30 +126,43 @@ alembic upgrade head
 python scripts/seed.py
 ```
 
+> 📖 **Need help installing or configuring PostgreSQL & TimescaleDB?**  
+> See our step-by-step [PostgreSQL & TimescaleDB Setup Guide](docs/database-setup.md) for Docker, Windows (WSL2 / Native), Linux, macOS, and Cloud setup, or watch this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
+
 > 💡 **Default Admin Access:**
 > A hardcoded admin user is available out-of-the-box for frontend integration and administrative access:
 > - **Username:** `Darshan`
 > - **Password:** `Darsh1812`
 > - **Role:** `admin` (full permissions across all regular and `@admin_required` endpoints)
 
-### 5. Running the Stack
+### 5. Pre-flight Stack Health Check
+
+Before starting the server, run the health check script to validate Python imports, database tables, TimescaleDB hypertable, Redis connectivity, and configuration:
+```bash
+python scripts/check_health.py
+```
+
+> ℹ️ **Note on Redis Connectivity:**
+> If you have not started your Redis server yet, the Redis check may report `[FAIL]`. This is expected during initial setup because `scripts\start.bat` automatically initializes the Redis service in WSL upon launch. If you prefer to verify a completely green health check beforehand, start Redis first (`wsl sudo -n /usr/sbin/service redis-server start`) or re-run `python scripts/check_health.py` after starting the stack.
+
+### 6. Running the Stack
 
 #### Option A: One-Click Launch (Windows)
 ```bash
-scripts\dev-up.bat
+scripts\start.bat
 ```
-*(Auto-starts Redis in WSL if not already running, and launches Celery worker, Celery beat scheduler, and Hypercorn API server grouped into tabs inside a single Windows Terminal).*
+*(Auto-starts Redis in WSL as a systemd service if not already running, waits until it answers PING, and launches WSL Instance (VM keep-alive), Celery worker, Celery beat scheduler, and Hypercorn API server grouped into tabs inside a single Windows Terminal).*
 
 To shut down all services and Redis:
 ```bash
-scripts\dev-down.bat
+scripts\stop.bat
 ```
 
 #### Option B: Manual Service Launch
 
 **Terminal 1 — Redis Server (if using WSL on Windows):**
 ```bash
-wsl redis-server --daemonize yes
+wsl sudo -n /usr/sbin/service redis-server start
 ```
 
 **Terminal 2 — Celery Worker:**
@@ -168,21 +184,53 @@ hypercorn "app:create_app()" --bind 0.0.0.0:8000 --reload
 
 ## 🧪 Testing & Verification
 
-Run the comprehensive project verification script:
+Empyrean ships with three levels of testing, each serving a distinct purpose. You should run them before pushing code, after changing configuration, and after setting up a new environment to catch regressions early and confirm the entire stack is wired correctly.
+
+### Layer 1 — Phase Smoke Test (fastest, no services required)
+
+Verifies that every module imports correctly, the app factory builds, all routes are registered, JWT round-trips work, the fuzzy engine returns bounded scores, and Celery task modules are discoverable. **Does not require Postgres or Redis to be running.**
+
 ```bash
-# Full verification (Database connectivity, migrations, health check, test suite)
+python scripts/smoke_phases.py
+```
+
+Phases 2–12 run concurrently, so the full 12-phase check typically completes in **under 30 seconds**. Per-phase timings are printed so regressions are immediately visible.
+
+### Layer 2 — Full Stack Verification (recommended before committing)
+
+Runs infrastructure checks (Postgres reachability, Alembic migration currency, TimescaleDB hypertable, Redis PING, seed data) followed by the app factory smoke check. **Requires the stack to be running.**
+
+```bash
+# Quick infra + health checks only (default)
 python scripts/verify.py
 
-# Quick verification (Skip unit tests)
-python scripts/verify.py --quick
+# Full suite — also runs the entire pytest test suite
+python scripts/verify.py --full
 ```
 
-Run pytest directly:
+> 💡 `check.bat` is a convenience wrapper around `verify.py` for Windows users: `scripts\check --full`
+
+### Layer 3 — pytest Unit & Integration Tests
+
+The full test suite covers phase-level behaviour, API contract enforcement, fuzzy inference edge cases, MQTT dispatch rules, and more.
+
 ```bash
+# Run the full suite
 pytest
+
+# Run with verbose output
+pytest tests/ -v
+
+# Run a specific test file
+pytest tests/test_phase_coverage.py -v
 ```
 
-Verify service health via HTTP:
+> 📖 For test organisation, coverage goals, and how to write new tests, see [docs/testing.md](docs/testing.md).
+
+### Verify Live Service Health
+
+Once the stack is running, confirm all components are healthy via the admin endpoint:
+
 ```bash
 curl http://localhost:8000/admin/health
 ```
@@ -221,8 +269,9 @@ Detailed guides and specifications are available in the [`docs/`](docs/) directo
 
 - [Architecture & Data Flow](docs/architecture.md)
 - [Getting Started Guide](docs/getting-started.md)
-- [API Reference](docs/api.md)
+- [Database & TimescaleDB Setup Guide](docs/database-setup.md)
 - [Database Schema & Migrations](docs/database.md)
+- [API Reference](docs/api.md)
 - [Fuzzy Inference Engine](docs/fuzzy-engine.md)
 - [Production Deployment Guide](docs/deployment.md)
 - [Security & Hardening](docs/security.md)

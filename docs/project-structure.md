@@ -72,8 +72,8 @@ Empyrean-V2-Backend/
 │   ├── config.py           # publish_config — push device config over MQTT
 │   └── publisher.py        # fire-and-forget paho publisher — Celery worker publishes air/alerts broadcasts
 ├── scripts/                # Dev tools & utilities
-│   ├── dev-up.bat          # Auto-starts Redis & launches Worker/Beat/API in Windows Terminal tabs
-│   ├── dev-down.bat        # Stops all dev services & shuts down Redis
+│   ├── start.bat           # Auto-starts Redis & launches WSL Instance/Worker/Beat/Server in Windows Terminal tabs
+│   ├── stop.bat            # Stops all dev services & shuts down Redis
 │   ├── generate_secrets.py # Cryptographic secret generator for .env (SECRET_KEY, JWT_SECRET)
 │   ├── verify.py           # Full-stack verification (Python)
 │   ├── check.bat           # Verify wrapper for cmd/PowerShell

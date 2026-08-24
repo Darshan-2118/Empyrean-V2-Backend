@@ -17,6 +17,16 @@ haven't started.
 
 Exit code 0 = every phase reports OK (passes or skips); 1 = at least one phase FAIL.
 
+Performance notes
+-----------------
+* ``create_app()`` is called **exactly once** and cached. The result is shared
+  across all phases that need it (1, 8, 9, 10, 11, 12), eliminating 4-5
+  redundant full-app initialisations.
+* Phases 2-12 are submitted to a ``ThreadPoolExecutor`` immediately after
+  phase 1 warms the import cache and populates the app cache. Independent
+  phases (JWT, MQTT, fuzzy, Celery, DTOs) run concurrently.
+* Per-phase wall-clock times are printed next to each result.
+
 Usage::
 
     venv/Scripts/python.exe scripts/smoke_phases.py
@@ -24,7 +34,10 @@ Usage::
 
 from __future__ import annotations
 
+import concurrent.futures
 import sys
+import threading
+import time
 from pathlib import Path
 
 # Make the project root importable.
@@ -33,6 +46,23 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 PASS, FAIL, SKIP = "[PASS]", "[FAIL]", "[SKIP]"
+
+# ── Shared app cache ──────────────────────────────────────────────────────────
+# create_app() is expensive (full Quart init + blueprint registration). We call
+# it exactly once and share the result across every phase that needs it. A lock
+# ensures only one thread initialises it even when phases run in parallel.
+_app_lock = threading.Lock()
+_cached_app = None
+
+
+def _get_app():
+    """Return the cached Quart app, creating it on the first call (thread-safe)."""
+    global _cached_app
+    with _app_lock:
+        if _cached_app is None:
+            from app import create_app
+            _cached_app = create_app()
+    return _cached_app
 
 
 def _db_reachable() -> bool:
@@ -52,9 +82,7 @@ def phase_1_scaffolding() -> tuple[list[str], str]:
     """App factory builds; health + blueprints registered."""
     problems: list[str] = []
     try:
-        from app import create_app
-
-        app = create_app()
+        app = _get_app()  # warms the cache for all subsequent phases
         rules = {str(r) for r in app.url_map.iter_rules()}
         for fragment in ("/health", "/api/v1/auth/", "/api/v1/profile", "/api/v1/readings/", "/api/v1/forecast"):
             if not any(fragment in r for r in rules):
@@ -197,9 +225,7 @@ def phase_8_nodes_api() -> tuple[list[str], str]:
     """Nodes API: routes wired; registry + cache_delete + Node DTOs live."""
     problems: list[str] = []
     try:
-        from app import create_app
-
-        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        rules = {str(r) for r in _get_app().url_map.iter_rules()}
         for fragment in ("/api/v1/nodes",):
             if not any(fragment in r for r in rules):
                 problems.append(f"missing route containing {fragment!r}")
@@ -235,9 +261,7 @@ def phase_9_alerts_ws() -> tuple[list[str], str]:
     """Alerts API + WebSocket: routes wired; manager + Alert DTO importable."""
     problems: list[str] = []
     try:
-        from app import create_app
-
-        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        rules = {str(r) for r in _get_app().url_map.iter_rules()}
         for fragment in ("/api/v1/alerts", "/ws/alerts"):
             if not any(fragment in r for r in rules):
                 problems.append(f"missing route containing {fragment!r}")
@@ -256,9 +280,7 @@ def phase_10_admin() -> tuple[list[str], str]:
     """Admin API: routes wired; settings registry + schema + RBAC importable."""
     problems: list[str] = []
     try:
-        from app import create_app
-
-        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        rules = {str(r) for r in _get_app().url_map.iter_rules()}
         for fragment in ("/api/v1/admin/health", "/api/v1/admin/settings"):
             if not any(fragment in r for r in rules):
                 problems.append(f"missing route containing {fragment!r}")
@@ -296,10 +318,9 @@ def phase_12_error_middleware() -> tuple[list[str], str]:
 
         from api.request_log import register_request_logging  # noqa: F401
         from api.validation import validate_body, validated_body  # noqa: F401
-        from app import create_app
 
         # before/after_request hooks are installed (request logging).
-        app = create_app()
+        app = _get_app()
         if not any((app.before_request_funcs or {}).values()) or not any(
             (app.after_request_funcs or {}).values()
         ):
@@ -307,7 +328,7 @@ def phase_12_error_middleware() -> tuple[list[str], str]:
 
         # A body-less POST to a validate_body route is a 400, never a 500.
         async def _probe():
-            client = create_app().test_client()
+            client = _get_app().test_client()
             resp = await client.post(
                 "/api/v1/auth/register",
                 data=b"",
@@ -332,9 +353,8 @@ def phase_11_export() -> tuple[list[str], str]:
 
         from api.export import _CSV_COLUMNS, _csv_chunks
         from api._time import parse_iso_datetime
-        from app import create_app
 
-        rules = {str(r) for r in create_app().url_map.iter_rules()}
+        rules = {str(r) for r in _get_app().url_map.iter_rules()}
         if not any("/api/v1/export" in r for r in rules):
             problems.append("missing route containing '/api/v1/export'")
 
@@ -383,21 +403,52 @@ _PHASES = [
 ]
 
 
+def _run_phase(fn) -> tuple[list[str], str, float]:
+    """Run a single phase function and return (problems, note, elapsed_seconds)."""
+    t0 = time.perf_counter()
+    problems, note = fn()
+    return problems, note, time.perf_counter() - t0
+
+
 def main() -> bool:
     print("Empyrean phase 1-12 smoke (TEMPORARY - replaced by the full script in a later stage)")
     print("=" * 66)
+
+    t_total = time.perf_counter()
+    phase_results: dict[int, tuple[list[str], str, float]] = {}
+
+    # Phase 1 runs first — it warms Python's import cache and populates
+    # _cached_app so all subsequent phases pay zero app-init cost.
+    phase_results[1] = _run_phase(phase_1_scaffolding)
+
+    # Phases 2-12 are submitted concurrently. Phases that rely on _get_app()
+    # retrieve the already-cached instance; pure-logic phases (JWT, fuzzy,
+    # Celery, DTOs) benefit from the already-warm import cache.
+    remaining = [(num, fn) for num, _name, fn in _PHASES if num != 1]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(remaining)) as pool:
+        future_map = {pool.submit(_run_phase, fn): num for num, fn in remaining}
+        for future in concurrent.futures.as_completed(future_map):
+            num = future_map[future]
+            phase_results[num] = future.result()
+
+    # Print results in phase order (collection above was unordered).
     all_ok = True
-    for number, name, fn in _PHASES:
-        problems, note = fn()
+    for number, name, _fn in _PHASES:
+        problems, note, elapsed = phase_results[number]
+        timing = f"{elapsed:.2f}s"
         if problems:
             all_ok = False
-            print(f"  {FAIL}  Phase {number}: {name}")
+            print(f"  {FAIL}  Phase {number}: {name}  [{timing}]")
             for problem in problems:
                 print(f"          - {problem}")
         else:
-            print(f"  {PASS}  Phase {number}: {name}  ({note})")
+            print(f"  {PASS}  Phase {number}: {name}  ({note})  [{timing}]")
+
+    total = time.perf_counter() - t_total
     print("=" * 66)
     print("  [OK]  ALL PHASES PASS" if all_ok else "  [FAIL]  ONE OR MORE PHASES FAILED")
+    print(f"  Total wall-clock time: {total:.2f}s")
     print("=" * 66)
     return all_ok
 
