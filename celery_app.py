@@ -60,6 +60,22 @@ celery_app.conf.update(
     task_soft_time_limit=cfg.TASK_SOFT_TIME_LIMIT,
     task_time_limit=cfg.TASK_HARD_TIME_LIMIT,
     worker_prefetch_multiplier=1,
+    # ── Broker resilience (WSL Redis can bounce during startup) ──────────────
+    # Retain Celery 5.x startup-retry behaviour in 6.0 (silences the
+    # CPendingDeprecationWarning seen on every worker boot).
+    broker_connection_retry_on_startup=True,
+    # Don't cancel in-flight tasks on a transient broker blip; acks_late +
+    # reject_on_worker_lost already give at-least-once redelivery.
+    worker_cancel_long_running_tasks_on_connection_loss=False,
+    # Keep retrying through startup/outage windows instead of giving up early,
+    # and enable TCP keepalive so an idle NAT/WSL connection isn't dropped.
+    broker_transport_options={
+        "max_retries": 10,
+        "interval_start": 1,
+        "interval_step": 1,
+        "interval_max": 5,
+        "socket_keepalive": True,
+    },
     beat_schedule={
         # ── Every 60 s ──────────────────────────────
         "alert-threshold-check": {
@@ -108,6 +124,23 @@ _ROLLING_WINDOW_SIZE = 60  # Count failures in 60s windows (5 windows)
 
 _lock = threading.Lock()
 _enabled = True
+_redis_client = None  # Lazily-initialised, reused for the process lifetime
+
+
+def _get_redis_client():
+    """Return a module-level Redis client, creating it once on first call."""
+    global _redis_client
+    if _redis_client is None:
+        with _lock:
+            if _redis_client is None:  # double-checked locking
+                from redis import Redis
+                _redis_client = Redis.from_url(
+                    cfg.REDIS_URL,
+                    decode_responses=False,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
+    return _redis_client
 
 
 def _circuit_for_task(task_name: str) -> bool:
@@ -124,16 +157,9 @@ def _circuit_for_task(task_name: str) -> bool:
     now = int(datetime.now(timezone.utc).timestamp())
     key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
 
-    from redis import Redis
-    import os
-
-    redis_url = os.getenv("REDIS_URL", cfg.REDIS_URL)
     try:
-        client = Redis.from_url(redis_url, decode_responses=False)
-    except Exception:
-        return True  # Gracefully degrade if Redis is temporarily unavailable
+        client = _get_redis_client()
 
-    try:
         # Get the current timestamp
         current_ts = client.hget(key, "ts")
         if not current_ts:
@@ -168,13 +194,8 @@ def _circuit_for_task(task_name: str) -> bool:
         return True
 
     except Exception:
-        logger.exception("Redis error checking circuit breaker for task %s", task_name)
+        logger.warning("Redis error checking circuit breaker for task %s (fail-open)", task_name)
         return True  # Fail open on Redis errors
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
 
 
 def _record_task_failure(task_name: str) -> None:
@@ -188,29 +209,15 @@ def _record_task_failure(task_name: str) -> None:
     now = int(datetime.now(timezone.utc).timestamp())
     key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
 
-    from redis import Redis
-    import os
-
-    redis_url = os.getenv("REDIS_URL", cfg.REDIS_URL)
     try:
-        client = Redis.from_url(redis_url, decode_responses=False)
-    except Exception:
-        return
-
-    try:
+        client = _get_redis_client()
         # Increment counter for this failure
         client.hincrby(key, "count", 1)
         client.hset(key, mapping={"ts": str(now)})
-
         # TTL expires the window automatically (3600s)
         client.expire(key, 3600)
     except Exception:
-        logger.exception("Redis error recording task failure for %s", task_name)
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        logger.warning("Redis error recording task failure for %s (ignored)", task_name)
 
 
 def reset_circuit_breaker(task_name: str | None = None) -> None:
@@ -218,38 +225,16 @@ def reset_circuit_breaker(task_name: str | None = None) -> None:
 
     Called after successful task execution or external intervention.
     """
-    if task_name is None:
-        from redis import Redis
-        import os
-
-        redis_url = os.getenv("REDIS_URL", cfg.REDIS_URL)
-        try:
-            client = Redis.from_url(redis_url, decode_responses=False)
+    try:
+        client = _get_redis_client()
+        if task_name is None:
             client.delete(_FAILED_ATTEMPTS_KEY)
             logger.info("Reset all circuit breaker state")
-        except Exception as e:
-            logger.exception("Redis error resetting circuit breaker: %s", e)
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
-    else:
-        from redis import Redis
-        import os
-
-        redis_url = os.getenv("REDIS_URL", cfg.REDIS_URL)
-        try:
-            client = Redis.from_url(redis_url, decode_responses=False)
+        else:
             client.delete(f"{_FAILED_ATTEMPTS_KEY}:{task_name}")
             logger.info("Reset circuit breaker for task %s", task_name)
-        except Exception as e:
-            logger.exception("Redis error resetting circuit breaker %s: %s", task_name, e)
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+    except Exception as e:
+        logger.warning("Redis error resetting circuit breaker: %s", e)
 
 
 def toggle_circuit_breaker(enabled: bool) -> None:

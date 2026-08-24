@@ -81,7 +81,7 @@ echo Redis is running.
 echo.
 
 REM --- Launch services (Windows Terminal multi-tab with fallback) ---
-REM The 4th tab ("WSL Keepalive") runs `sleep infinity` inside WSL. Its
+REM The first tab ("WSL Instance") runs `sleep infinity` inside WSL. Its
 REM attached wsl.exe process pins the VM open for as long as the terminal
 REM window exists — without it, WSL tears down the whole VM on its idle
 REM timeout, killing Redis (and every connection to it) mid-session.
@@ -90,15 +90,15 @@ if %errorlevel% equ 0 goto :launch_wt
 
 :launch_separate
 echo Windows Terminal (wt.exe) not found; launching in separate windows...
-start "empyrean-wsl-keepalive" cmd /k "title empyrean-wsl-keepalive && wsl -e sh -c "exec sleep infinity""
+start "empyrean-wsl-instance" cmd /k "scripts\wsl-instance.bat"
 start "empyrean-celery-worker" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info"
 start "empyrean-celery-beat" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info"
-start "empyrean-api" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
+start "empyrean-server" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && title empyrean-server && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
 goto :done
 
 :launch_wt
-echo Launching WSL Keepalive, Celery Worker, Beat, and API in a single Windows Terminal with tabs...
-wt -d "%CD%" --title "WSL Keepalive" wsl -e sh -c "exec sleep infinity" ; new-tab -d "%CD%" --title "Celery Worker" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-worker && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info" ; new-tab -d "%CD%" --title "Celery Beat" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-beat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info" ; new-tab -d "%CD%" --title "HTTP API" cmd /k "call .venv\Scripts\activate.bat && title empyrean-api && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
+echo Launching WSL Instance, Celery Worker, Beat, and Server in a single Windows Terminal with tabs...
+wt -d "%CD%" --title "WSL Instance" cmd /k scripts\wsl-instance.bat ; new-tab -d "%CD%" --title "Celery Worker" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-worker && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info" ; new-tab -d "%CD%" --title "Celery Beat" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-beat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info" ; new-tab -d "%CD%" --title "Empyrean Server" cmd /k "call .venv\Scripts\activate.bat && title empyrean-server && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
 
 :done
 

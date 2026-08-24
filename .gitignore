@@ -35,6 +35,10 @@ htmlcov/
 celerybeat-schedule*
 .celery/
 
+# Redis snapshots (dev cache data — never commit)
+dump.rdb
+*.rdb
+
 # Logs
 *.log
 logs/

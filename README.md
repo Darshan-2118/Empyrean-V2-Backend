@@ -126,6 +126,9 @@ alembic upgrade head
 python scripts/seed.py
 ```
 
+> 📖 **Need help installing or configuring PostgreSQL & TimescaleDB?**  
+> See our step-by-step [PostgreSQL & TimescaleDB Setup Guide](docs/database-setup.md) for Docker, Windows (WSL2 / Native), Linux, macOS, and Cloud setup, or watch this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
+
 > 💡 **Default Admin Access:**
 > A hardcoded admin user is available out-of-the-box for frontend integration and administrative access:
 > - **Username:** `Darshan`
@@ -140,26 +143,26 @@ python scripts/check_health.py
 ```
 
 > ℹ️ **Note on Redis Connectivity:**
-> If you have not started your Redis server yet, the Redis check may report `[FAIL]`. This is expected during initial setup because `scripts\dev-up.bat` automatically initializes the Redis daemon in WSL upon launch. If you prefer to verify a completely green health check beforehand, start Redis first (`wsl redis-server --daemonize yes`) or re-run `python scripts/check_health.py` after starting the stack.
+> If you have not started your Redis server yet, the Redis check may report `[FAIL]`. This is expected during initial setup because `scripts\start.bat` automatically initializes the Redis service in WSL upon launch. If you prefer to verify a completely green health check beforehand, start Redis first (`wsl sudo -n /usr/sbin/service redis-server start`) or re-run `python scripts/check_health.py` after starting the stack.
 
 ### 6. Running the Stack
 
 #### Option A: One-Click Launch (Windows)
 ```bash
-scripts\dev-up.bat
+scripts\start.bat
 ```
-*(Auto-starts Redis in WSL if not already running, and launches Celery worker, Celery beat scheduler, and Hypercorn API server grouped into tabs inside a single Windows Terminal).*
+*(Auto-starts Redis in WSL as a systemd service if not already running, waits until it answers PING, and launches WSL Instance (VM keep-alive), Celery worker, Celery beat scheduler, and Hypercorn API server grouped into tabs inside a single Windows Terminal).*
 
 To shut down all services and Redis:
 ```bash
-scripts\dev-down.bat
+scripts\stop.bat
 ```
 
 #### Option B: Manual Service Launch
 
 **Terminal 1 — Redis Server (if using WSL on Windows):**
 ```bash
-wsl redis-server --daemonize yes
+wsl sudo -n /usr/sbin/service redis-server start
 ```
 
 **Terminal 2 — Celery Worker:**
@@ -266,8 +269,9 @@ Detailed guides and specifications are available in the [`docs/`](docs/) directo
 
 - [Architecture & Data Flow](docs/architecture.md)
 - [Getting Started Guide](docs/getting-started.md)
-- [API Reference](docs/api.md)
+- [Database & TimescaleDB Setup Guide](docs/database-setup.md)
 - [Database Schema & Migrations](docs/database.md)
+- [API Reference](docs/api.md)
 - [Fuzzy Inference Engine](docs/fuzzy-engine.md)
 - [Production Deployment Guide](docs/deployment.md)
 - [Security & Hardening](docs/security.md)

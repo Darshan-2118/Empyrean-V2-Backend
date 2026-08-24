@@ -101,20 +101,29 @@ pytest tests/test_phase_coverage.py -v
 ## 4. Starting the Backend Stack
 
 ### Option A: Windows Quick Launch
-Auto-starts Redis in WSL (if not already running) and launches Celery Worker, Celery Beat Scheduler, and Hypercorn API server grouped into tabs in a single Windows Terminal:
+Auto-starts Redis in WSL as a systemd service (passwordless via a scoped sudoers rule), waits until it answers PING (up to 5 s, aborting if it never becomes ready), and launches four tabs in a single Windows Terminal:
+
+| Tab | Purpose |
+|---|---|
+| **WSL Instance** | Keep-alive (`sleep infinity`) that pins the WSL VM open — without it WSL tears down the VM on idle timeout, killing Redis mid-session |
+| **Celery Worker** | `celery ... worker --pool=solo` |
+| **Celery Beat** | `celery ... beat` scheduler |
+| **Empyrean Server** | Hypercorn API server on `0.0.0.0:8000` |
+
 ```powershell
 # Launch stack:
-.\scripts\dev-up.bat
+.\scripts\start.bat
 
 # Stop stack and Redis:
-.\scripts\dev-down.bat
+.\scripts\stop.bat
 ```
 
 ### Option B: Manual Process Launch (Separate Terminals)
-- **Terminal 1 (Redis):** `wsl redis-server --daemonize yes`
-- **Terminal 2 (Celery Worker):** `celery -A celery_app.celery_app worker --loglevel=info`
-- **Terminal 3 (Celery Beat):** `celery -A celery_app.celery_app beat --loglevel=info`
-- **Terminal 4 (API Server):** `hypercorn "app:create_app()" --bind 0.0.0.0:8000`
+- **Terminal 1 (Redis):** `wsl sudo -n /usr/sbin/service redis-server start`
+- **Terminal 2 (WSL keep-alive):** `wsl -e sh -c "exec sleep infinity"` (keeps the VM from idling out)
+- **Terminal 3 (Celery Worker):** `celery -A celery_app.celery_app worker --pool=solo --loglevel=info`
+- **Terminal 4 (Celery Beat):** `celery -A celery_app.celery_app beat --loglevel=info`
+- **Terminal 5 (API Server):** `hypercorn "app:create_app()" --bind 0.0.0.0:8000`
 
 ---
 
