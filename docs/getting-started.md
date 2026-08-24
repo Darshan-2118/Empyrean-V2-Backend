@@ -59,7 +59,14 @@ The easiest way to get everything running is to use the provided startup scripts
    > 💡 **Default Admin User:**
    > A hardcoded admin user is available: `Darshan` / `Darsh1812` (role: `admin`).
 
-8. **Start all services** with one command (auto-starts Redis & multi-tab terminal on Windows):
+8. **Pre-flight health check**
+   ```bash
+   python scripts/check_health.py
+   ```
+   > ℹ️ **Note on Redis Connectivity:**
+   > If Redis is not yet running, the Redis check will report `[FAIL]`. This is normal when using `scripts\dev-up.bat`, which automatically provisions Redis in WSL at runtime. You can either start Redis manually (`wsl redis-server --daemonize yes`) before running the health check or re-run `python scripts/check_health.py` once the stack is running.
+
+9. **Start all services** with one command (auto-starts Redis & multi-tab terminal on Windows):
    ```bash
    scripts\dev-up.bat  # Windows
    # or for Linux/Mac:

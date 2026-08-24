@@ -41,6 +41,13 @@ def generate_secure_secret(length: int = 48) -> str:
 
 
 def main():
+    root_dir = Path(__file__).resolve().parents[1]
+    env_path = root_dir / ".env"
+
+    if env_path.exists() and "--force" not in sys.argv:
+        print(".env is already present")
+        return
+
     secret_key = generate_secure_secret(48)
     jwt_secret = generate_secure_secret(48)
 
@@ -52,8 +59,7 @@ def main():
     print("-" * 60)
 
     if "--write-env" in sys.argv:
-        env_path = Path(__file__).resolve().parents[1] / ".env"
-        example_path = Path(__file__).resolve().parents[1] / ".env.example"
+        example_path = root_dir / ".env.example"
 
         if not env_path.exists() and example_path.exists():
             content = example_path.read_text(encoding="utf-8")

@@ -92,19 +92,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Environment Variables & Secrets
+### 3. Generate `.env` File & Configure Secrets
 
+Initialize your `.env` file with 256-bit cryptographically secure production secrets:
+```bash
+python scripts/generate_secrets.py --write-env
+```
+
+*(Note: `generate_secrets.py` automatically initializes `.env` from `.env.example` if it does not already exist. If `.env` is already present, it protects your configuration and displays `.env is already present` without overwriting).*
+
+Alternatively, you can copy `.env.example` manually:
 ```bash
 # Windows
 copy .env.example .env
 
 # Linux / macOS
 cp .env.example .env
-```
-
-Generate 256-bit cryptographically secure secrets and write them to your `.env` automatically:
-```bash
-python scripts/generate_secrets.py --write-env
 ```
 
 > 🔒 **Security Notice:** The application enforces strict fail-fast validation in `config/__init__.py`. It will reject development placeholders (such as `dev-secret-key`, `dev-jwt-secret`, or `change-me-*`), keys shorter than 32 bytes, or low-entropy secrets. Running `scripts/generate_secrets.py` ensures your secrets comply with production constraints.
@@ -129,7 +132,17 @@ python scripts/seed.py
 > - **Password:** `Darsh1812`
 > - **Role:** `admin` (full permissions across all regular and `@admin_required` endpoints)
 
-### 5. Running the Stack
+### 5. Pre-flight Stack Health Check
+
+Before starting the server, run the health check script to validate Python imports, database tables, TimescaleDB hypertable, Redis connectivity, and configuration:
+```bash
+python scripts/check_health.py
+```
+
+> ℹ️ **Note on Redis Connectivity:**
+> If you have not started your Redis server yet, the Redis check may report `[FAIL]`. This is expected during initial setup because `scripts\dev-up.bat` automatically initializes the Redis daemon in WSL upon launch. If you prefer to verify a completely green health check beforehand, start Redis first (`wsl redis-server --daemonize yes`) or re-run `python scripts/check_health.py` after starting the stack.
+
+### 6. Running the Stack
 
 #### Option A: One-Click Launch (Windows)
 ```bash
