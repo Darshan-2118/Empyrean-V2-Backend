@@ -65,10 +65,15 @@ def register_redis_lifecycle(app: Quart, cfg, app_logger: logging.Logger) -> Non
 
 
 def register_startup_checks(app: Quart, cfg, app_logger: logging.Logger) -> None:
-    """Run pre-flight logging on startup."""
+    """Run pre-flight logging and auto-provision hardcoded admin on startup."""
     @app.before_serving
     async def startup():
         app_logger.info("Application startup complete (env=%s)", cfg.APP_ENV)
+        try:
+            from api.auth import ensure_hardcoded_admin
+            await ensure_hardcoded_admin()
+        except Exception as exc:
+            app_logger.warning("Could not ensure hardcoded admin on startup: %s", exc)
 
 
 def register_mqtt_lifecycle(app: Quart, cfg, app_logger: logging.Logger) -> None:

@@ -32,7 +32,8 @@ htmlcov/
 .pytest_cache/
 
 # Celery
-celerybeat-schedule/
+celerybeat-schedule*
+.celery/
 
 # Logs
 *.log

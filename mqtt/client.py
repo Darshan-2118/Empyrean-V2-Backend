@@ -357,9 +357,9 @@ class MQTTClient:
         if topic is None:
             logger.debug("SUBACK for unknown subscribe mid=%s (reconnect race)", mid)
             return
-        if granted is None:
+        if granted is None or granted >= 0x80:
             logger.error(
-                "Subscription to %s denied by broker (no granted QoS)", topic
+                "Subscription to %s denied by broker (granted QoS %s)", topic, granted
             )
             return
 

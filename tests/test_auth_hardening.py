@@ -187,3 +187,51 @@ def test_l33_dummy_password_hash_is_lazy():
     assert isinstance(h, str)
     assert h.startswith("$2")  # bcrypt salt marker
     assert len(h) >= 59        # cost-12 bcrypt hashes are 60 chars
+
+
+# ── Hardcoded Admin User tests ────────────────────────────────────────────────
+
+
+def test_hardcoded_admin_login_and_access():
+    """Hardcoded admin 'Darshan' logs in with 'Darsh1812' and receives full admin access."""
+    async def _scenario():
+        app = create_app()
+        client = app.test_client()
+
+        # Login with hardcoded credentials
+        resp = await client.post(
+            "/api/v1/auth/login",
+            json={"username": "Darshan", "password": "Darsh1812"},
+        )
+        assert resp.status_code == 201, (resp.status_code, await resp.get_data())
+        data = await resp.get_json()
+        assert data["role"] == "admin"
+        assert data["user"]["username"] == "Darshan"
+        assert data["user"]["role"] == "admin"
+        assert "access_token" in data
+        assert "refresh_token" in data
+
+        token = data["access_token"]
+
+        # Admin-only endpoint access (GET /api/v1/admin/settings)
+        admin_resp = await client.get(
+            "/api/v1/admin/settings",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert admin_resp.status_code == 200, (admin_resp.status_code, await admin_resp.get_data())
+
+        # Admin-only health endpoint access (GET /api/v1/admin/health)
+        health_resp = await client.get(
+            "/api/v1/admin/health",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert health_resp.status_code == 200
+
+        # Wrong password for Darshan fails with 401
+        wrong_resp = await client.post(
+            "/api/v1/auth/login",
+            json={"username": "Darshan", "password": "wrongpassword"},
+        )
+        assert wrong_resp.status_code == 401
+
+    _run_async(_scenario())

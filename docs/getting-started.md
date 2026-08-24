@@ -33,9 +33,11 @@ The easiest way to get everything running is to use the provided startup scripts
    pip install -r requirements.txt
    ```
 
-4. **Configure environment**
+4. **Configure environment & secrets**
    ```bash
    cp .env.example .env
+   # Automatically generate cryptographically strong secrets for .env:
+   python scripts/generate_secrets.py --write-env
    # Edit .env with your actual database credentials
    # Default: DATABASE_URL=postgresql://postgres:your_password@localhost:5432/Empyrean
    ```
@@ -50,35 +52,29 @@ The easiest way to get everything running is to use the provided startup scripts
    alembic upgrade head
    ```
 
-7. **Seed initial data** (admin user, defaults, sample node)
+7. **Seed initial data** (admin users, defaults, sample node)
    ```bash
    python scripts/seed.py
    ```
+   > 💡 **Default Admin User:**
+   > A hardcoded admin user is available: `Darshan` / `Darsh1812` (role: `admin`).
 
-8. **Start Redis** (required for Celery and caching)
-   ```bash
-   # On Windows with WSL2:
-   wsl redis-server --daemonize yes
-   
-   # Alternative: Install Redis natively for your OS
-   # Ubuntu/Debian: sudo apt-get install redis-server && sudo systemctl start redis-server
-   # macOS: brew install redis && brew services start redis
-   # Windows: Download from https://redis.io/download and run redis-server.exe
-   ```
-
-9. **Start all services** with one command (opens separate windows):
+8. **Start all services** with one command (auto-starts Redis & multi-tab terminal on Windows):
    ```bash
    scripts\dev-up.bat  # Windows
    # or for Linux/Mac:
    ./scripts/dev-up.sh # (if you create one)
    ```
 
-   The `dev-up.bat` script will start:
-   - **Celery worker** - processes sensor readings, alerts, aggregations, forecasts
-   - **Celery beat** - schedules periodic tasks (health checks, model retraining, cleanup)
-   - **HTTP API** - serves the REST API on http://localhost:8000
+   The `dev-up.bat` script will:
+   - Check and automatically start Redis in WSL if not running
+   - Launch **Celery worker**, **Celery beat**, and **HTTP API** inside Windows Terminal tabs
+   - Keep periodic schedule files clean inside the `.celery/` directory
 
-   You must start Redis separately first (step 8).
+   To stop all services and Redis:
+   ```bash
+   scripts\dev-down.bat
+   ```
 
 ### Option 2: Manual Process Management
 

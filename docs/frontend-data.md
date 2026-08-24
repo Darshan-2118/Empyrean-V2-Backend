@@ -13,6 +13,10 @@
 - **Validation**:
   - Username/password format checks
   - Rate-limited to prevent brute force
+- **Default Admin Account**:
+  - `username`: `Darshan`
+  - `password`: `Darsh1812`
+  - `role`: `admin` (full permissions)
 
 ### Register Page
 - **Fields**:

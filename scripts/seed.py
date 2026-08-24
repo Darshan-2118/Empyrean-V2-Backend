@@ -93,6 +93,26 @@ def seed(force: bool = False) -> None:
             # Log the username only — never the plaintext password.
             logger.info("Created admin user: '%s' (password from SEED_ADMIN_PASSWORD)", admin.username)
 
+        # ── 1b. Hardcoded Admin user: Darshan ─────────────────────────────
+        existing_darshan = session.query(User).filter(User.username.ilike("Darshan")).first()
+        if existing_darshan:
+            if existing_darshan.role != "admin" or not existing_darshan.is_active:
+                existing_darshan.role = "admin"
+                existing_darshan.is_active = True
+                session.commit()
+            logger.info("Admin user 'Darshan' already exists — ensured admin role.")
+        else:
+            darshan = User(
+                username="Darshan",
+                email="darshan@empyrean.local",
+                password_hash=hash_password("Darsh1812"),
+                role="admin",
+                is_active=True,
+                notification_prefs={"email_on_critical": True},
+            )
+            session.add(darshan)
+            logger.info("Created admin user: 'Darshan'")
+
         # ── 2. Default system settings ────────────────────────────────────
         defaults = [
             SystemSetting(

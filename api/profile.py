@@ -20,6 +20,7 @@ from api.schemas import ChangePasswordRequest, ProfileResponse, UpdateProfileReq
 from api.validation import validate_body, validated_body
 from models.base import AsyncSessionLocal
 from models.helpers import hash_password
+from models.refresh_token import RefreshToken
 from models.user import User
 
 logger = logging.getLogger("empyrean.profile")

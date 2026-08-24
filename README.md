@@ -118,10 +118,16 @@ Ensure PostgreSQL with TimescaleDB is running, then apply database migrations:
 alembic upgrade head
 ```
 
-*(Optional)* Seed sample nodes, admin accounts, and initial configurations:
+*(Optional)* Seed sample nodes, default admin accounts, and initial configurations:
 ```bash
 python scripts/seed.py
 ```
+
+> 💡 **Default Admin Access:**
+> A hardcoded admin user is available out-of-the-box for frontend integration and administrative access:
+> - **Username:** `Darshan`
+> - **Password:** `Darsh1812`
+> - **Role:** `admin` (full permissions across all regular and `@admin_required` endpoints)
 
 ### 5. Running the Stack
 
@@ -129,9 +135,9 @@ python scripts/seed.py
 ```bash
 scripts\dev-up.bat
 ```
-*(Launches Celery worker, Celery beat scheduler, and the Hypercorn ASGI server in separate console windows).*
+*(Auto-starts Redis in WSL if not already running, and launches Celery worker, Celery beat scheduler, and Hypercorn API server grouped into tabs inside a single Windows Terminal).*
 
-To shut down:
+To shut down all services and Redis:
 ```bash
 scripts\dev-down.bat
 ```
@@ -148,7 +154,7 @@ wsl redis-server --daemonize yes
 celery -A celery_app.celery_app worker --loglevel=info
 ```
 
-**Terminal 3 — Celery Beat Scheduler:**
+**Terminal 3 — Celery Beat Scheduler (schedule files saved to `.celery/`):**
 ```bash
 celery -A celery_app.celery_app beat --loglevel=info
 ```
@@ -205,49 +211,20 @@ curl http://localhost:8000/admin/health
 | **WebSockets** | `/ws/alerts` | `WS` | Real-time threshold breach notifications |
 | | `/ws/live` | `WS` | Live sensor telemetry stream |
 
----
-
-## 🚢 Production Deployment
-
-The `deploy/` directory provides complete automation for bare-metal / VPS production environments:
-
-### 1. Architecture Requirements in Production
-- **Reverse Proxy**: Nginx with SSL/TLS termination, HTTP $\rightarrow$ HTTPS redirect, and WebSocket proxying (`deploy/nginx.conf`).
-- **Process Supervision**: Systemd units for the API, Celery worker, and beat scheduler:
-  - `deploy/quart-api.service` — Hypercorn running `app:create_app()` with 2 workers
-  - `deploy/celery-worker.service` — Celery worker task consumer
-  - `deploy/celery-beat.service` — Celery beat cron scheduler
-- **Database**: PostgreSQL with TimescaleDB extension enabled (`CREATE EXTENSION IF NOT EXISTS timescaledb;`).
-- **Telemetry Security**: MQTT Broker with TLS mutual authentication (`MQTT_USE_TLS=true`). Client certificates and CA certs are loaded from `/opt/empyrean/certs/` (`ca.crt`, `client.crt`, `client.key`) with fail-closed security.
-
-### 2. Automated Deployment Pipeline
-
-Export your target server details and execute the deployment script:
-```bash
-export SERVER_HOST="your-server-ip-or-domain"
-export SERVER_USER="empyrean"
-export DOMAIN="api.yourdomain.com"     # Optional: automatically templates Nginx config
-
-bash deploy/deploy.sh
-```
-
-`deploy/deploy.sh` automatically:
-1. Syncs project code via `rsync` (excluding `.git`, `venv`, and local secrets).
-2. Provisions the virtualenv and updates dependencies.
-3. Installs and enables systemd service units.
-4. Generates/preserves `/opt/empyrean/.env` with strict `600` permissions.
-5. Templates and enables Nginx configuration (with domain and SSL paths).
-6. Runs database migrations (`alembic upgrade head`).
+> 📖 For complete endpoint contracts, request/response schemas, and query parameters, see [docs/api.md](docs/api.md).
 
 ---
 
-## 💡 Deployment Readiness Checklist
+## 📚 Documentation
 
-Before going live, verify the following configuration checklist:
+Detailed guides and specifications are available in the [`docs/`](docs/) directory:
 
-- [x] **TimescaleDB Installed**: PostgreSQL server has `timescaledb` extension installed and enabled on the target database.
-- [ ] **Cryptographic Secrets Generated**: Run `python scripts/generate_secrets.py --write-env` to ensure `SECRET_KEY` and `JWT_SECRET` are high-entropy 256-bit keys.
-- [ ] **Production MQTT Broker & TLS**: When `MQTT_USE_TLS=true`, place valid TLS certificates (`ca.crt`, `client.crt`, `client.key`) in `/opt/empyrean/certs/`.
-- [ ] **Nginx & SSL**: Ensure Let's Encrypt / Certbot SSL certificates exist for `${DOMAIN}` in `/etc/letsencrypt/live/${DOMAIN}/`.
-- [ ] **Metrics Protection**: Confirm `/metrics` is protected and only accessible internally (127.0.0.1) or by your Prometheus scraper.
-- [ ] **Database Migrations**: Ensure `alembic upgrade head` completed successfully on the production database.
+- [Architecture & Data Flow](docs/architecture.md)
+- [Getting Started Guide](docs/getting-started.md)
+- [API Reference](docs/api.md)
+- [Database Schema & Migrations](docs/database.md)
+- [Fuzzy Inference Engine](docs/fuzzy-engine.md)
+- [Production Deployment Guide](docs/deployment.md)
+- [Security & Hardening](docs/security.md)
+- [Testing & Quality Assurance](docs/testing.md)
+- [Project Structure](docs/project-structure.md)

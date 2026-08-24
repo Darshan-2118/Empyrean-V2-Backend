@@ -80,13 +80,13 @@ pytest
 ## 4. Starting the Backend Stack
 
 ### Option A: Windows Quick Launch
-Starts Celery Worker, Celery Beat Scheduler, and Hypercorn API server in separate console windows:
+Auto-starts Redis in WSL (if not already running) and launches Celery Worker, Celery Beat Scheduler, and Hypercorn API server grouped into tabs in a single Windows Terminal:
 ```powershell
-# Make sure Redis is running first:
-wsl redis-server --daemonize yes
-
 # Launch stack:
 .\scripts\dev-up.bat
+
+# Stop stack and Redis:
+.\scripts\dev-down.bat
 ```
 
 ### Option B: Manual Process Launch (Separate Terminals)
