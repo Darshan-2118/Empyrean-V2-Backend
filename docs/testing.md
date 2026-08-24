@@ -65,14 +65,35 @@ python scripts/check_health.py
 ```
 
 ### B. Pure-Logic Smoke Phases
-Checks blueprints, JWT round-tripping, CSV exports, and MQTT validation schema:
+Verifies module imports, app factory, route registration, JWT round-trips, fuzzy engine bounds, MQTT dispatch, and CSV export logic. **No services required.**
+
+Phases 2–12 run concurrently — the full 12-phase check typically completes in under 30 seconds. Each phase reports its individual wall-clock time so regressions are immediately visible.
 ```powershell
 python scripts/smoke_phases.py
 ```
 
-### C. Full Unit & Integration Test Suite
+### C. Full Stack Verification (recommended before committing)
+Runs infrastructure checks (Postgres, Alembic migration, Redis) plus the health probe. By default pytest is **not** included so this stays fast:
 ```powershell
+# Quick infra + health checks only (default, no pytest)
+python scripts/verify.py
+
+# Full suite — includes the entire pytest test suite
+python scripts/verify.py --full
+```
+> Windows shortcut: `scripts\check` or `scripts\check --full`
+
+### D. Full Unit & Integration Test Suite
+Covers phase-level behaviour, API contract enforcement, fuzzy inference edge cases, MQTT dispatch rules, and more:
+```powershell
+# Run all tests
 pytest
+
+# Verbose output with short tracebacks
+pytest tests/ -v --tb=short
+
+# Run a specific test file
+pytest tests/test_phase_coverage.py -v
 ```
 
 ---

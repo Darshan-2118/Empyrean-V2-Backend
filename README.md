@@ -181,21 +181,53 @@ hypercorn "app:create_app()" --bind 0.0.0.0:8000 --reload
 
 ## 🧪 Testing & Verification
 
-Run the comprehensive project verification script:
+Empyrean ships with three levels of testing, each serving a distinct purpose. You should run them before pushing code, after changing configuration, and after setting up a new environment to catch regressions early and confirm the entire stack is wired correctly.
+
+### Layer 1 — Phase Smoke Test (fastest, no services required)
+
+Verifies that every module imports correctly, the app factory builds, all routes are registered, JWT round-trips work, the fuzzy engine returns bounded scores, and Celery task modules are discoverable. **Does not require Postgres or Redis to be running.**
+
 ```bash
-# Full verification (Database connectivity, migrations, health check, test suite)
+python scripts/smoke_phases.py
+```
+
+Phases 2–12 run concurrently, so the full 12-phase check typically completes in **under 30 seconds**. Per-phase timings are printed so regressions are immediately visible.
+
+### Layer 2 — Full Stack Verification (recommended before committing)
+
+Runs infrastructure checks (Postgres reachability, Alembic migration currency, TimescaleDB hypertable, Redis PING, seed data) followed by the app factory smoke check. **Requires the stack to be running.**
+
+```bash
+# Quick infra + health checks only (default)
 python scripts/verify.py
 
-# Quick verification (Skip unit tests)
-python scripts/verify.py --quick
+# Full suite — also runs the entire pytest test suite
+python scripts/verify.py --full
 ```
 
-Run pytest directly:
+> 💡 `check.bat` is a convenience wrapper around `verify.py` for Windows users: `scripts\check --full`
+
+### Layer 3 — pytest Unit & Integration Tests
+
+The full test suite covers phase-level behaviour, API contract enforcement, fuzzy inference edge cases, MQTT dispatch rules, and more.
+
 ```bash
+# Run the full suite
 pytest
+
+# Run with verbose output
+pytest tests/ -v
+
+# Run a specific test file
+pytest tests/test_phase_coverage.py -v
 ```
 
-Verify service health via HTTP:
+> 📖 For test organisation, coverage goals, and how to write new tests, see [docs/testing.md](docs/testing.md).
+
+### Verify Live Service Health
+
+Once the stack is running, confirm all components are healthy via the admin endpoint:
+
 ```bash
 curl http://localhost:8000/admin/health
 ```

@@ -138,7 +138,7 @@ def _circuit_for_task(task_name: str) -> bool:
         current_ts = client.hget(key, "ts")
         if not current_ts:
             # First attempt - initialize counter
-            client.hset(key, {"ts": str(now), "count": "0"})
+            client.hset(key, mapping={"ts": str(now), "count": "0"})
             return True
 
         current_ts = int(current_ts)
@@ -149,7 +149,7 @@ def _circuit_for_task(task_name: str) -> bool:
         cutoff = now - _MAX_FAILED_ATTEMPTS_WINDOW
         if current_ts < cutoff:
             client.hdel(key, "ts")
-            client.hset(key, {"ts": str(now), "count": "0"})
+            client.hset(key, mapping={"ts": str(now), "count": "0"})
             return True
 
         # If we've exceeded the failure threshold, block further retries
@@ -200,7 +200,7 @@ def _record_task_failure(task_name: str) -> None:
     try:
         # Increment counter for this failure
         client.hincrby(key, "count", 1)
-        client.hset(key, {"ts": str(now)})
+        client.hset(key, mapping={"ts": str(now)})
 
         # TTL expires the window automatically (3600s)
         client.expire(key, 3600)
