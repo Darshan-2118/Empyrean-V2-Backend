@@ -12,6 +12,7 @@ Task modules under ``tasks/`` are imported eagerly via ``include`` so their
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import threading
 from datetime import datetime, timezone
 
@@ -24,6 +25,11 @@ from config import get_config
 cfg = get_config()
 
 logger = logging.getLogger(__name__)
+
+# ── Celery storage directory (keeps root folder clean of schedule files) ────
+_CELERY_DIR = Path(__file__).resolve().parent / ".celery"
+_CELERY_DIR.mkdir(exist_ok=True)
+_BEAT_SCHEDULE_FILENAME = str(_CELERY_DIR / "celerybeat-schedule")
 
 # ── Celery application instance ─────────────────────────────────────────────
 # Must be defined before anything below that references it (decorators,
@@ -45,6 +51,7 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
     timezone="UTC",
+    beat_schedule_filename=_BEAT_SCHEDULE_FILENAME,
     # At-least-once delivery (M-6): ack only after the task finishes
     task_acks_late=True,
     task_reject_on_worker_lost=True,

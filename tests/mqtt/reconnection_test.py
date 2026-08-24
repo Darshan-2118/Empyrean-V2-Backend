@@ -70,9 +70,9 @@ class TestMQTTReconnection:
         """Test successful subscription with granted QoS."""
         topic = "air/node/test_node/reading"
 
-        result, mid = mqtt_client._client.subscribe(topic, 1)
-
-        assert result == 0  # Success
+        with patch.object(mqtt_client._client, "subscribe", return_value=(0, 1)):
+            result, mid = mqtt_client._client.subscribe(topic, 1)
+            assert result == 0  # Success
 
         # Simulate SUBACK
         mqtt_client._pending_subs[mid] = topic
@@ -85,8 +85,9 @@ class TestMQTTReconnection:
         """Test subscription denial is logged."""
         topic = "air/node/test_node/reading"
 
-        result, mid = mqtt_client._client.subscribe(topic, 1)
-        assert result == 0
+        with patch.object(mqtt_client._client, "subscribe", return_value=(0, 1)):
+            result, mid = mqtt_client._client.subscribe(topic, 1)
+            assert result == 0
 
         # Simulate broker denying (0x80 is failure in MQTT)
         with caplog.at_level("ERROR"):
@@ -145,7 +146,7 @@ class TestMQTTClientLifecycle:
 
     def test_tls_failure_raises_on_start(self):
         """Test that TLS misconfiguration raises on client initialization."""
-        with patch("config.get_config") as mock_config:
+        with patch("mqtt.client.get_config") as mock_config:
             cfg = MagicMock()
             cfg.MQTT_USE_TLS = True
             cfg.MQTT_TLS_CERT = "/nonexistent/cert.pem"

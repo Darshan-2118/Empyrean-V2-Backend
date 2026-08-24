@@ -45,7 +45,7 @@ def main():
     jwt_secret = generate_secure_secret(48)
 
     print("=" * 60)
-    print("  Empyrean V2 — Production Secrets Generator")
+    print("  Empyrean V2 - Production Secrets Generator")
     print("=" * 60)
     print(f"SECRET_KEY={secret_key}")
     print(f"JWT_SECRET={jwt_secret}")
