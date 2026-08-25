@@ -64,15 +64,7 @@ Validates DB connection, required tables, TimescaleDB hypertable status, Redis p
 python scripts/check_health.py
 ```
 
-### B. Pure-Logic Smoke Phases
-Verifies module imports, app factory, route registration, JWT round-trips, fuzzy engine bounds, MQTT dispatch, and CSV export logic. **No services required.**
-
-Phases 2–12 run concurrently — the full 12-phase check typically completes in under 30 seconds. Each phase reports its individual wall-clock time so regressions are immediately visible.
-```powershell
-python scripts/smoke_phases.py
-```
-
-### C. Full Stack Verification (recommended before committing)
+### B. Full Stack Verification (recommended before committing)
 Runs infrastructure checks (Postgres, Alembic migration, Redis) plus the health probe. By default pytest is **not** included so this stays fast:
 ```powershell
 # Quick infra + health checks only (default, no pytest)
@@ -83,7 +75,7 @@ python scripts/verify.py --full
 ```
 > Windows shortcut: `scripts\check` or `scripts\check --full`
 
-### D. Full Unit & Integration Test Suite
+### C. Full Unit & Integration Test Suite
 Covers phase-level behaviour, API contract enforcement, fuzzy inference edge cases, MQTT dispatch rules, and more:
 ```powershell
 # Run all tests

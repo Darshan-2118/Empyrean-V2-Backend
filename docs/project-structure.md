@@ -79,7 +79,6 @@ Empyrean-V2-Backend/
 │   ├── check.bat           # Verify wrapper for cmd/PowerShell
 │   ├── check_health.py     # Environment health check
 │   ├── seed.py             # Dev seed script
-│   ├── smoke_phases.py     # TEMPORARY phase 1–11 health/working smoke (replaced in Phase 13)
 │   ├── db.sh               # Database helper (bash/Git Bash)
 │   └── bench.py            # Performance load generator (Phase 14)
 ├── tasks/                  # Celery worker + beat task definitions
@@ -116,7 +115,7 @@ Key top-level directories:
 - `migrations/` — Alembic environment (`env.py`) and versioned migration files.
 - `models/` — SQLAlchemy ORM models (users, nodes, sensor readings, aggregates, alerts, settings) plus engine/session setup and shared helpers.
 - `mqtt/` — MQTT ingestion: paho client (`client.py`) subscribing to `air/node/+/reading` and `air/node/+/status`, dispatching validated readings to the Celery `process_reading` task and updating `Node.last_seen` on heartbeats, and bridging `air/alerts` broadcasts to WebSocket clients; Pydantic payload validation (`validator.py`); device config publisher (`config.py`); fire-and-forget `air/alerts` publisher (`publisher.py`) used by the Celery alert task.
-- `scripts/` — dev tooling: full-stack verification, health check, seeding, DB helpers, and a temporary phase-1–11 smoke (`smoke_phases.py`).
+- `scripts/` — dev tooling: full-stack verification, health check, seeding, DB helpers, and a performance load generator (`bench.py`).
 - `tasks/` — Celery worker + beat task definitions: per-reading enrichment (`process_reading.py`, `aqi.py`), hourly aggregation + data retention (`aggregation.py`), alert threshold checks (`alerts.py`), and linear-regression AQI forecasting (`forecast.py`).
 - `tests/` — pytest suite.
 - `certs/` — MQTT TLS certificates (gitignored).
