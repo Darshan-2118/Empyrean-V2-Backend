@@ -184,19 +184,9 @@ hypercorn "app:create_app()" --bind 0.0.0.0:8000 --reload
 
 ## 🧪 Testing & Verification
 
-Empyrean ships with three levels of testing, each serving a distinct purpose. You should run them before pushing code, after changing configuration, and after setting up a new environment to catch regressions early and confirm the entire stack is wired correctly.
+Empyrean ships with two levels of testing, each serving a distinct purpose. You should run them before pushing code, after changing configuration, and after setting up a new environment to catch regressions early and confirm the entire stack is wired correctly.
 
-### Layer 1 — Phase Smoke Test (fastest, no services required)
-
-Verifies that every module imports correctly, the app factory builds, all routes are registered, JWT round-trips work, the fuzzy engine returns bounded scores, and Celery task modules are discoverable. **Does not require Postgres or Redis to be running.**
-
-```bash
-python scripts/smoke_phases.py
-```
-
-Phases 2–12 run concurrently, so the full 12-phase check typically completes in **under 30 seconds**. Per-phase timings are printed so regressions are immediately visible.
-
-### Layer 2 — Full Stack Verification (recommended before committing)
+### Layer 1 — Full Stack Verification (recommended before committing)
 
 Runs infrastructure checks (Postgres reachability, Alembic migration currency, TimescaleDB hypertable, Redis PING, seed data) followed by the app factory smoke check. **Requires the stack to be running.**
 
@@ -210,7 +200,7 @@ python scripts/verify.py --full
 
 > 💡 `check.bat` is a convenience wrapper around `verify.py` for Windows users: `scripts\check --full`
 
-### Layer 3 — pytest Unit & Integration Tests
+### Layer 2 — pytest Unit & Integration Tests
 
 The full test suite covers phase-level behaviour, API contract enforcement, fuzzy inference edge cases, MQTT dispatch rules, and more.
 
