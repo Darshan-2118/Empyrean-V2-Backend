@@ -5,7 +5,7 @@ Decorator ``@validate_body(Schema)`` applied to JSON-body endpoints. It awaits
 ``request.get_json(silent=True)``, runs ``Schema.model_validate(...)``
 (pydantic v2), and stores the validated model on the request where the route
 reads it back via :func:`validated_body`. On validation failure it returns an
-RFC 7807 ``422 Unprocessable Entity`` (``_problem_json`` with the pydantic
+RFC 7807 ``422 Unprocessable Entity`` (``problem_json`` with the pydantic
 error text) — never a 500, and never a pydantic ``ValidationError`` escaping
 the handler.
 
@@ -33,7 +33,40 @@ from typing import Any, Callable
 from pydantic import BaseModel
 from quart import request
 
-from api.jwt import _problem_json
+from api.jwt import problem_json
+
+# H14: cap the 422 detail so a future validator raising an exception with
+# internal data can never dump an unbounded string into the response body.
+_MAX_ERROR_DETAIL = 500
+
+
+def _format_validation_error(exc: Exception) -> str:
+    """Build a compact, client-safe message from a pydantic ``ValidationError``.
+
+    Uses ``exc.errors()`` and keeps only ``loc`` / ``msg`` / a repr of the
+    offending *input value* — never tracebacks, never internal context dicts.
+    Falls back to a capped ``str(exc)`` for non-pydantic exceptions.
+    """
+    errors_fn = getattr(exc, "errors", None)
+    if callable(errors_fn):
+        try:
+            raw = list(errors_fn())
+            parts: list[str] = []
+            for err in raw[:5]:
+                loc = ".".join(str(p) for p in err.get("loc", ()) ) or "body"
+                msg = str(err.get("msg", "invalid value"))
+                inp = err.get("input")
+                if isinstance(inp, (dict, list)):
+                    parts.append(f"{loc}: {msg}")
+                else:
+                    parts.append(f"{loc}: {msg} (input={inp!r})")
+            detail = "; ".join(parts)
+            if len(raw) > 5:
+                detail += f"; (+{len(raw) - 5} more error(s))"
+            return detail[:_MAX_ERROR_DETAIL]
+        except Exception:  # noqa: BLE001 — formatting must never 500
+            pass
+    return str(exc)[:_MAX_ERROR_DETAIL]
 
 
 def validate_body(
@@ -55,15 +88,17 @@ def validate_body(
         async def decorated(*args: Any, **kwargs: Any) -> Any:
             body = await request.get_json(silent=True)
             if body is None:
-                return _problem_json(400, "Bad Request", "Request body is required")
+                return problem_json(400, "Bad Request", "Request body is required")
             if require_object and not isinstance(body, dict):
-                return _problem_json(
+                return problem_json(
                     422, "Unprocessable Entity", "Request body must be a JSON object"
                 )
             try:
                 data = schema.model_validate(body)
             except Exception as exc:  # noqa: BLE001 - any schema error is a 422
-                return _problem_json(422, "Unprocessable Entity", str(exc))
+                return problem_json(
+                    422, "Unprocessable Entity", _format_validation_error(exc)
+                )
             request._validated = data
             return await f(*args, **kwargs)
 
@@ -77,5 +112,15 @@ def validated_body() -> Any:
 
     Call inside the wrapped route function: the validated model lives on the
     request object of the current request context.
+
+    L14: raises ``RuntimeError`` when the route has no ``@validate_body``
+    decorator (or it did not run) — silently returning ``None`` used to let a
+    handler proceed on unvalidated data after a decorator-ordering mistake.
     """
-    return getattr(request, "_validated", None)
+    body = getattr(request, "_validated", None)
+    if body is None:
+        raise RuntimeError(
+            "validated_body() called on a request with no validated body — "
+            "the route is missing the @validate_body(...) decorator"
+        )
+    return body

@@ -21,13 +21,18 @@ from tasks.process_reading import _build_reading, _parse_time, detect_anomaly
 from tasks import process_reading
 
 
+def _recent(hours_ago: float = 0.0) -> datetime:
+    """A timestamp within the ±24h acceptance window (H25), relative to now."""
+    return datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+
+
 def test_parse_time_accepts_datetime():
-    dt = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    dt = _recent(1)
     assert _parse_time(dt) == dt
 
 
 def test_parse_time_accepts_naive_datetime():
-    dt = datetime(2026, 8, 5, 12, 0)  # no tzinfo
+    dt = _recent(1).replace(tzinfo=None)  # no tzinfo
     result = _parse_time(dt)
     assert result.tzinfo is not None
     # Contract: naive timestamps are treated as UTC (not interpreted in the
@@ -36,8 +41,24 @@ def test_parse_time_accepts_naive_datetime():
 
 
 def test_parse_time_accepts_iso_string_with_z():
-    result = _parse_time("2026-08-05T12:00:00Z")
-    assert result == datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    result = _parse_time(_recent(1).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    assert abs((result - _recent(1)).total_seconds()) < 5
+
+
+# ── H25: device timestamps outside the ±24h window are clamped ────────────────
+
+def test_parse_time_clamps_far_future_timestamp():
+    """H25: a malicious far-future timestamp is clamped to server time."""
+    far_future = datetime.now(timezone.utc) + timedelta(days=365 * 2)
+    result = _parse_time(far_future)
+    assert abs((result - datetime.now(timezone.utc)).total_seconds()) < 5
+
+
+def test_parse_time_clamps_far_past_timestamp():
+    """H25: an ancient timestamp (e.g. 1970 epoch replay) is clamped too."""
+    ancient = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    result = _parse_time(ancient)
+    assert abs((result - datetime.now(timezone.utc)).total_seconds()) < 5
 
 
 # ── H-1: fuzzy score must not collapse to 20 when temperature is missing/0 ─────
@@ -129,7 +150,21 @@ class _FakeRedis:
 # ── L-10: corrupted model blob must never 500 the forecast route ──────────────
 
 def test_valid_model_accepts_finite_numeric_slope_and_intercept():
-    assert _valid_model({"slope": 0.5, "intercept": 10, "trained_at": "x"}) is True
+    """H23: finite slope/intercept are accepted. ``trained_at`` is optional
+    (legacy blobs), but must parse when present."""
+    assert _valid_model({"slope": 0.5, "intercept": 10}) is True
+    fresh = datetime.now(timezone.utc).isoformat()
+    assert _valid_model({"slope": 0.5, "intercept": 10, "trained_at": fresh}) is True
+
+
+def test_valid_model_rejects_garbage_or_stale_trained_at():
+    """H23: an unparseable ``trained_at`` is exactly the shape of a poisoned
+    Redis blob — reject it; likewise a model older than the freshness window."""
+    assert _valid_model({"slope": 0.5, "intercept": 10, "trained_at": "x"}) is False
+    stale = (
+        datetime.now(timezone.utc) - timedelta(hours=72)
+    ).isoformat()
+    assert _valid_model({"slope": 0.5, "intercept": 10, "trained_at": stale}) is False
 
 
 def test_valid_model_rejects_string_slope_or_intercept():
@@ -198,7 +233,8 @@ def test_retrain_model_deletes_served_forecast_key(monkeypatch):
 
     monkeypatch.setattr("tasks.forecast.get_sync_db", _Ctx)
     monkeypatch.setattr(
-        "tasks.forecast._training_points", lambda node_id: [(1000.0, 5.0)] * 30
+        "tasks.forecast._training_points_bulk",
+        lambda node_ids: {"N1": [(1000.0, 5.0)] * 30},
     )
     monkeypatch.setattr(
         "tasks.forecast._fit_model",
@@ -269,3 +305,46 @@ def test_detect_anomaly_keeps_2880_most_recent_samples(db_session, sample_node):
     # Most-recent 2880 → mean 20.5, std 0.5 → z(22.2) = 3.4 → True. If the 100.0
     # leaked past the LIMIT, std ≈ 1.56 → z(22.2) ≈ 1.1 → False.
     assert detect_anomaly(db_session, nid, 22.2) is True
+
+
+# ── M45: COUNT may arrive as Decimal depending on the driver ──────────────────
+
+
+def _decimal_count_execute(monkeypatch, session):
+    """Wrap ``session.execute`` so the aggregate row's COUNT is a Decimal.
+
+    ``detect_anomaly`` runs one aggregate query returning
+    ``(count, mean, variance)``; this forces the count through the same
+    guard/comparisons as a driver that yields Decimal instead of int.
+    """
+    from decimal import Decimal
+
+    real_execute = session.execute
+
+    def _execute(stmt, *args, **kwargs):
+        result = real_execute(stmt, *args, **kwargs)
+        count, mean, variance = result.one()
+
+        class _DecimalRow:
+            def one(self):
+                return (Decimal(count), mean, variance)
+
+        return _DecimalRow()
+
+    monkeypatch.setattr(session, "execute", _execute)
+
+
+def test_detect_anomaly_tolerates_decimal_count(db_session, sample_node, monkeypatch):
+    """M45: a Decimal COUNT above the minimum still runs the z-score path."""
+    _seed_pm25_history(db_session, sample_node.node_id, [20.0, 21.0] * 5)
+    _decimal_count_execute(monkeypatch, db_session)
+    # Decimal(10) >= 5 → guard passes; outlier still detected.
+    assert detect_anomaly(db_session, sample_node.node_id, 50.0) is True
+
+
+def test_detect_anomaly_decimal_count_below_minimum(db_session, sample_node, monkeypatch):
+    """M45: a Decimal COUNT below the minimum is rejected by the same guard."""
+    _seed_pm25_history(db_session, sample_node.node_id, [20.0, 21.0])
+    _decimal_count_execute(monkeypatch, db_session)
+    # Decimal(2) < 5 → insufficient history → False (no TypeError).
+    assert detect_anomaly(db_session, sample_node.node_id, 50.0) is False

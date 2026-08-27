@@ -9,7 +9,11 @@ User=empyrean
 Group=empyrean
 WorkingDirectory=/opt/empyrean
 EnvironmentFile=/opt/empyrean/.env
-ExecStart=/opt/empyrean/venv/bin/celery -A celery_app.celery_app beat --loglevel=info
+# M71: flock guard — two beat processes corrupt the shared
+# celerybeat-schedule file. The lock is held for the lifetime of the beat
+# process; a second unit start exits immediately instead of double-scheduling.
+ExecStart=/usr/bin/flock --nonblock /run/empyrean/celery-beat.lock /opt/empyrean/venv/bin/celery -A celery_app.celery_app beat --loglevel=info
+ExecStartPre=/usr/bin/install -d -o empyrean -g empyrean /run/empyrean
 Restart=always
 RestartSec=5
 

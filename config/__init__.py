@@ -10,7 +10,7 @@ instance.
 """
 
 import logging
-import logging
+import os
 from pathlib import Path
 
 from pydantic import field_validator, model_validator
@@ -36,10 +36,17 @@ _MIN_SECRET_BYTES = 32
 _MIN_SECRET_DISTINCT_CHARS = 5
 
 
-def _is_weak_secret(value: str) -> bool:
-    """True when *value* is a known placeholder or too weak for production."""
+def _is_weak_secret(value: str, *, check_strength: bool = True) -> bool:
+    """True when *value* is a known placeholder or too weak for production.
+
+    With ``check_strength=False`` (M67, ``APP_ENV=test`` only) the known
+    placeholder blocklist is still enforced but the length/entropy tests are
+    skipped.
+    """
     if value in _DEV_SECRETS:
         return True
+    if not check_strength:
+        return False
     if len(value.encode("utf-8")) < _MIN_SECRET_BYTES:
         return True
     return len(set(value)) < _MIN_SECRET_DISTINCT_CHARS
@@ -63,6 +70,11 @@ class Config(BaseSettings):
     SECRET_KEY: str = "dev-secret-key"
     LOG_LEVEL: str = "INFO"
 
+    # Request-body cap in bytes (M5): Quart rejects larger bodies with 413.
+    # 64 KB comfortably fits CSV node-config uploads and JSON payloads; bulk
+    # sensor ingest goes over MQTT, not HTTP, so it is not bounded by this.
+    MAX_CONTENT_LENGTH: int = 64 * 1024
+
     # Database
     DATABASE_URL: str = "postgresql://user:pass@localhost:5432/airquality"
 
@@ -77,12 +89,53 @@ class Config(BaseSettings):
     MQTT_TLS_CERT: str = ""
     MQTT_TLS_KEY: str = ""
     MQTT_CA_CERTS: str = ""
+    # H36: broker client id. Empty derives a stable per-host id
+    # (``empyrean-backend-<hostname>``) so two API *hosts* (or a dev instance
+    # against the prod broker) never share one MQTT session — a shared id makes
+    # the broker treat every CONNECT as a takeover and drops in-flight QoS 1
+    # messages. Keep it stable across restarts so the clean_session=False
+    # offline queue keeps working; run only one ingestion client per host.
+    MQTT_CLIENT_ID: str = ""
 
     # JWT
     JWT_SECRET: str = "dev-jwt-secret"
+    # H4/M66: the algorithm is pinned to HS256 — this knob is validated below
+    # and may never be set to anything else (e.g. "none").
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRY_MINUTES: int = 15
     JWT_REFRESH_TOKEN_EXPIRY_DAYS: int = 7
+
+    # L12: maximum accepted password size in UTF-8 bytes, matched to the
+    # hashing algorithm's real limit (bcrypt: 72). Enforced per call by
+    # api/schemas._validate_password_bytes; raise it only together with a
+    # hasher switch (scrypt/argon2), never on bcrypt.
+    PASSWORD_MAX_BYTES: int = 72
+
+    # Bootstrap admin (H5/H6/H28): credentials come from the environment, never
+    # from source. When both username and password are set, the API provisions
+    # this account at startup with a *bcrypt-hashed* password (the plaintext is
+    # never accepted on the login path — login always goes through bcrypt).
+    BOOTSTRAP_ADMIN_USERNAME: str = ""
+    BOOTSTRAP_ADMIN_PASSWORD: str = ""
+    BOOTSTRAP_ADMIN_EMAIL: str = ""
+
+    # Reverse proxy (H12/H31): when the API sits behind a trusted proxy (nginx)
+    # that sets ``X-Real-IP``, enable this so per-IP rate limiting buckets real
+    # clients instead of collapsing everything into the proxy's address.
+    TRUST_PROXY_HEADERS: bool = False
+
+    # Export throttle (H18): minimum seconds between full exports per user.
+    EXPORT_COOLDOWN_SECONDS: int = 300
+
+    # M31: whole-stream export timeout in seconds (was the hardcoded
+    # MAX_EXPORT_TIMEOUT magic constant). Guards against slow-client DoS;
+    # a stream exceeding it is cut with a truncation sentinel row (M83).
+    EXPORT_TIMEOUT_SECONDS: int = 300
+
+    # Metrics endpoint (H19): when set, /metrics requires a matching
+    # ``X-Metrics-Secret`` header. Empty keeps the legacy behaviour (network-
+    # level gating only, e.g. the nginx allowlist).
+    METRICS_SECRET: str = ""
 
     # SMTP (fail-soft alert email, see tasks/alerts.py). All empty by default so
     # email alerts are a no-op unless explicitly configured — never raises.
@@ -92,6 +145,10 @@ class Config(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = ""
     SMTP_USE_TLS: bool = True
+
+    # L9: fallback recipient for critical alert emails when no DB setting
+    # exists (mirrors the other settings' config fallbacks in api/admin.py).
+    ALERT_EMAIL: str = ""
 
     # AQI Thresholds
     AQI_WARNING_THRESHOLD: int = 100
@@ -129,6 +186,50 @@ class Config(BaseSettings):
 
     # ── Validators ────────────────────────────────────────────────────────
 
+    # L33: raw APP_ENV stashed by ``_capture_app_env`` below so field
+    # validators can make production decisions without depending on field
+    # declaration order — replaces the old hand-rolled ``.env`` parser.
+    _app_env_raw: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_app_env(cls, values):
+        """Stash the raw APP_ENV before any field validation runs (L33).
+
+        pydantic-settings has already merged ``os.environ`` and the ``.env``
+        file into *values* by the time this runs, so no manual parsing is
+        needed (the os.environ fallback only covers non-dict init paths).
+        """
+        app_env = None
+        if isinstance(values, dict):
+            app_env = values.get("APP_ENV") or values.get("app_env")
+        if app_env is None:
+            app_env = os.environ.get("APP_ENV")
+        cls._app_env_raw = app_env
+        return values
+
+    @classmethod
+    def _resolved_app_env(cls) -> str:
+        """Effective APP_ENV for cross-field validation (defaults to development)."""
+        return (cls._app_env_raw or "development").strip().lower()
+
+    @field_validator("JWT_ALGORITHM")
+    @classmethod
+    def _validate_jwt_algorithm(cls, v: str) -> str:
+        """Pin the JWT algorithm to HS256 (H4/M66).
+
+        The decode side hardcodes ``["HS256"]`` regardless of this value; this
+        validator exists so a misconfigured ``JWT_ALGORITHM=none`` (or any
+        other algorithm) fails loudly at startup instead of silently changing
+        the token contract.
+        """
+        if v != "HS256":
+            raise ValueError(
+                "JWT_ALGORITHM must be 'HS256' — the codebase pins both encode "
+                f"and decode to HS256 (got {v!r})"
+            )
+        return v
+
     @field_validator("LOG_LEVEL")
     @classmethod
     def _validate_log_level(cls, v: str) -> str:
@@ -137,6 +238,14 @@ class Config(BaseSettings):
         if upper not in allowed:
             raise ValueError(f"LOG_LEVEL must be one of {allowed}, got {v!r}")
         return upper
+
+    @field_validator("MAX_CONTENT_LENGTH")
+    @classmethod
+    def _validate_max_content_length(cls, v: int) -> int:
+        """Reject non-positive body caps (M5) — 0 would block every request."""
+        if v <= 0:
+            raise ValueError(f"MAX_CONTENT_LENGTH must be a positive byte count, got {v}")
+        return v
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -158,9 +267,16 @@ class Config(BaseSettings):
             )
         if not parsed.hostname:
             raise ValueError(f"DATABASE_URL must include a host, got {v!r}")
-        # Password check is gated on APP_ENV, read from the raw env value so we
-        # don't depend on field ordering within the model.
-        app_env = (cls._raw_app_env() or "development").strip().lower()
+        # M73: ``postgresql://@localhost/db`` parses with an empty username —
+        # reject it instead of letting the engine fail on first connect.
+        if not parsed.username:
+            raise ValueError(
+                f"DATABASE_URL must include a username, got {v!r} "
+                "(an empty user like postgresql://@host/db is rejected)"
+            )
+        # Password check is gated on APP_ENV, stashed by the mode="before"
+        # validator so we don't depend on field ordering within the model (L33).
+        app_env = cls._resolved_app_env()
         if app_env == "production" and not parsed.password:
             raise ValueError(
                 "DATABASE_URL has no password in production — refusing to start "
@@ -177,9 +293,18 @@ class Config(BaseSettings):
         API to any website). In production any wildcard is a hard error; in
         other environments it logs a warning so the operator is still told the
         setting is dangerous without blocking local development.
+
+        H1/H11: every non-wildcard entry must be a strict ``scheme://host[:port]``
+        origin. This rejects ``null``, ``file://`` URLs, paths, and bare hosts —
+        the cross-origin values browsers can actually send — instead of letting
+        quart-cors reflect them verbatim. An empty allowlist in production is a
+        hard error too (an empty list may degrade to a wildcard reflection in
+        some quart-cors versions).
         """
+        import re
+
         origins = [o.strip() for o in v.split(",") if o.strip()]
-        app_env = (cls._raw_app_env() or "development").strip().lower()
+        app_env = cls._resolved_app_env()
         if "*" in origins:
             if app_env == "production":
                 raise ValueError(
@@ -190,29 +315,22 @@ class Config(BaseSettings):
                 "CORS_ORIGINS contains '*' which allows any website to call "
                 "the API — restrict it before deploying to production"
             )
+        else:
+            origin_re = re.compile(r"^https?://[A-Za-z0-9._-]+(:\d{1,5})?$")
+            bad = [o for o in origins if not origin_re.fullmatch(o)]
+            if bad:
+                raise ValueError(
+                    "CORS_ORIGINS entries must be origins of the form "
+                    f"scheme://host[:port] — rejected: {bad!r} "
+                    "(no 'null', file://, paths, or bare hostnames)"
+                )
+            if app_env == "production" and not origins:
+                raise ValueError(
+                    "CORS_ORIGINS is empty in production — refusing to start "
+                    "with a possibly-wildcard CORS allowlist. Set explicit "
+                    "origins (e.g. https://app.example.com)."
+                )
         return v
-
-    @classmethod
-    def _raw_app_env(cls) -> str | None:
-        """Best-effort read of APP_ENV from env/.env for cross-field validation.
-
-        ``urlparse`` has already run, so ``_validate_database_url`` needs the
-        *production* decision without relying on field declaration order.
-        """
-        import os
-
-        from pathlib import Path
-
-        env_val = os.environ.get("APP_ENV")
-        if env_val is not None:
-            return env_val
-        dotenv = Path(__file__).resolve().parents[1] / ".env"
-        if dotenv.exists():
-            for line in dotenv.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("APP_ENV") and "=" in line:
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        return None
 
     @model_validator(mode="after")
     def _validate_aqi_thresholds(self) -> "Config":
@@ -235,7 +353,15 @@ class Config(BaseSettings):
         development. This prevents production deployments from accidentally
         running with insecure defaults (e.g. when APP_ENV is unset or misspelled).
         The blocklist is kept in sync with .env.example.
+
+        M67: the full length/entropy strength check is relaxed behind the
+        explicit ``APP_ENV=test`` flag — test fixtures that rebuild Config
+        after ``reset_config_cache()`` only pay for the cheap placeholder
+        blocklist. ``test`` must be set deliberately (it is not a value any
+        deployment uses), so a misspelled production APP_ENV still gets the
+        full check.
         """
+        check_strength = (self.APP_ENV or "").strip().lower() != "test"
         # Always reject known weak secrets, regardless of APP_ENV
         # This prevents silent security failures when APP_ENV is misspelled or unset
         bad = [
@@ -244,7 +370,7 @@ class Config(BaseSettings):
                 ("SECRET_KEY", self.SECRET_KEY),
                 ("JWT_SECRET", self.JWT_SECRET),
             )
-            if _is_weak_secret(value)
+            if _is_weak_secret(value, check_strength=check_strength)
         ]
         if bad:
             raise ValueError(
@@ -272,11 +398,17 @@ class Config(BaseSettings):
     def _validate_mqtt_tls_settings(self) -> "Config":
         """Validate MQTT TLS settings consistency (#43).
 
-        If TLS is enabled, certificate and key files should be provided.
+        If TLS is enabled, certificate, key, AND CA bundle must be provided —
+        the runtime ``tls_set()`` calls require all three (M68: the validator
+        used to check only cert/key, so a missing ``MQTT_CA_CERTS`` passed
+        startup and only failed later inside the client/publisher).
         """
-        if self.MQTT_ENABLED and self.MQTT_USE_TLS and not (self.MQTT_TLS_CERT and self.MQTT_TLS_KEY):
+        if self.MQTT_ENABLED and self.MQTT_USE_TLS and not (
+            self.MQTT_TLS_CERT and self.MQTT_TLS_KEY and self.MQTT_CA_CERTS
+        ):
             raise ValueError(
-                "MQTT_TLS_CERT and MQTT_TLS_KEY must be set when MQTT_USE_TLS is True"
+                "MQTT_TLS_CERT, MQTT_TLS_KEY and MQTT_CA_CERTS must all be set "
+                "when MQTT_USE_TLS is True"
             )
         return self
 
@@ -284,11 +416,13 @@ class Config(BaseSettings):
     def _validate_redis_url(self) -> "Config":
         """Validate Redis URL format (#43).
 
-        Ensures Redis URL uses the redis:// scheme.
+        Accepts ``redis://`` (plaintext), ``rediss://`` (TLS — L46, the old
+        check forced plaintext Redis even for managed TLS brokers) and
+        ``unix://`` (local socket) URLs.
         """
-        if not self.REDIS_URL.startswith("redis://"):
+        if not self.REDIS_URL.startswith(("redis://", "rediss://", "unix://")):
             raise ValueError(
-                "REDIS_URL must be a redis:// URL"
+                "REDIS_URL must be a redis://, rediss:// or unix:// URL"
             )
         return self
 
@@ -308,6 +442,16 @@ def get_config() -> Config:
 
 
 def reset_config_cache() -> None:
-    """Drop the cached Config so the next ``get_config()`` re-reads env/.env."""
+    """Drop the cached Config so the next ``get_config()`` re-reads env/.env.
+
+    M57: also drops the DB engines — they are built from ``DATABASE_URL``, so
+    a reset that repoints the URL must not leave stale engines behind. The
+    import is lazy to avoid a config ↔ models import cycle at startup.
+    """
     global _config_cache
     _config_cache = None
+    try:
+        from models.base import reset_engines
+    except ImportError:
+        return
+    reset_engines()

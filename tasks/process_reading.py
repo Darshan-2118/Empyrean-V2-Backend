@@ -29,13 +29,16 @@ from tasks.aqi import compute_aqi
 logger = logging.getLogger("empyrean.tasks.process_reading")
 
 # Number of prior pm25 samples to load when computing the anomaly Z-score.
-_ANOMALY_WINDOW_HOURS = 24
 # 2880 = 24h at the standard 30s reporting cadence, so the loaded window matches
 # the documented 24h (the old .limit(1000) capped it at ~8.3h — L-6).
 _ANOMALY_WINDOW_SAMPLES = 2880
 _ANOMALY_WINDOW_MINUTES = 1440  # 24 hours in minutes (time-based, not sample-count based)
 _ANOMALY_MIN_SAMPLES = 5
 _ANOMALY_Z_THRESHOLD = 3.0
+
+# H25: maximum accepted clock skew between a device-supplied timestamp and the
+# server, in hours. Timestamps outside ±24h are clamped to server time.
+_TIME_SKEW_LIMIT_HOURS = 24
 
 # Cache key contract (docs/database.md).
 _LATEST_CACHE_TTL = 60
@@ -121,7 +124,24 @@ def _parse_time(value: str | datetime | None) -> datetime:
             return datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+
+    # H25: bound the accepted window. The docstring always claimed a ±24h
+    # envelope; enforce it so a malicious/buggy device cannot commit far-future
+    # (or ancient) timestamps into the hypertable and poison aggregates,
+    # retention windows, and the anomaly history.
+    now = datetime.now(timezone.utc)
+    skew = abs(dt - now)
+    if skew > timedelta(hours=_TIME_SKEW_LIMIT_HOURS):
+        logger.warning(
+            "Reading time %s is outside the ±%sh window (skew %.1fh) — "
+            "clamping to server time",
+            dt.isoformat(),
+            _TIME_SKEW_LIMIT_HOURS,
+            skew.total_seconds() / 3600,
+        )
+        return now
+    return dt
 
 
 def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
@@ -140,7 +160,9 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
         return False
 
     since = datetime.now(timezone.utc) - timedelta(minutes=_ANOMALY_WINDOW_MINUTES)
-    # Aggregate mean/variance in SQL - use time-based window (not fixed sample count)
+    # Aggregate mean/variance in SQL - use time-based window (not fixed sample count).
+    # M43: alias the subquery explicitly so selecting extra columns later can
+    # never silently aggregate from an anonymous/ambiguous relation.
     inner = (
         select(SensorReading.pm25)
         .where(
@@ -151,8 +173,10 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
         .order_by(SensorReading.time.desc())
         .limit(_ANOMALY_WINDOW_SAMPLES)
         .subquery()
+        .alias("recent")
     )
-    count, mean, variance = session.execute(
+    # M44: names avoid shadowing the ``count``/``mean``/``variance`` builtins.
+    sample_count, sample_mean, sample_variance = session.execute(
         select(
             func.count(inner.c.pm25),
             func.avg(inner.c.pm25),
@@ -160,33 +184,33 @@ def detect_anomaly(session, node_id: str, pm25: float | None) -> bool:
         )
     ).one()
 
-    if not count or count < _ANOMALY_MIN_SAMPLES:
+    if not sample_count or sample_count < _ANOMALY_MIN_SAMPLES:
         logger.warning(
             "detect_anomaly: skipped — insufficient history for node %s (count=%s, min=%s)",
             node_id,
-            count,
+            sample_count,
             _ANOMALY_MIN_SAMPLES,
-            extra={"node_id": node_id, "history_count": count, "required_min": _ANOMALY_MIN_SAMPLES}
+            extra={"node_id": node_id, "history_count": sample_count, "required_min": _ANOMALY_MIN_SAMPLES}
         )
         return False
 
-    mean = float(mean)
-    variance = float(variance)
-    if variance == 0:
+    sample_mean = float(sample_mean)
+    sample_variance = float(sample_variance)
+    if sample_variance == 0:
         logger.warning(
             "detect_anomaly: skipped — zero variance in history for node %s",
             node_id,
-            extra={"node_id": node_id, "variance": variance}
+            extra={"node_id": node_id, "variance": sample_variance}
         )
         return False
 
-    z = abs(pm25 - mean) / (variance ** 0.5)
+    z = abs(pm25 - sample_mean) / (sample_variance ** 0.5)
     is_anomaly = z > _ANOMALY_Z_THRESHOLD
     if is_anomaly:
         logger.info(
             "detect_anomaly: anomaly detected for node %s (pm25=%.2f, mean=%.2f, std=%.2f, z=%.2f > %.2f)",
-            node_id, pm25, mean, variance ** 0.5, z, _ANOMALY_Z_THRESHOLD,
-            extra={"node_id": node_id, "pm25": pm25, "mean": mean, "std": variance ** 0.5, "z": z, "threshold": _ANOMALY_Z_THRESHOLD}
+            node_id, pm25, sample_mean, sample_variance ** 0.5, z, _ANOMALY_Z_THRESHOLD,
+            extra={"node_id": node_id, "pm25": pm25, "mean": sample_mean, "std": sample_variance ** 0.5, "z": z, "threshold": _ANOMALY_Z_THRESHOLD}
         )
     return is_anomaly
 

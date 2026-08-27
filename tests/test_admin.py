@@ -158,7 +158,10 @@ def test_data_retention_cleanup_honors_setting_override():
         )
         session.commit()
     try:
-        assert data_retention_cleanup() == {"deleted": 1}
+        # H15: cleanup now also reports anonymised deactivated users.
+        result = data_retention_cleanup()
+        assert result["deleted"] == 1
+        assert "users_anonymised" in result
         with get_sync_db() as session:
             remaining = session.scalar(
                 select(func.count())

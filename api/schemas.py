@@ -17,15 +17,24 @@ from pydantic import (
     Field,
     field_serializer,
     field_validator,
+    HttpUrl,
+    model_validator,
 )
 
 # bcrypt ignores everything past 72 bytes — cap passwords so the schema does
 # not advertise strength the hash cannot provide. The ``max_length=72`` Field
 # bounds count *characters*; bcrypt truncates at 72 *bytes*, so a multi-byte
 # password must also be validated byte-length in a validator (M-14).
+# L12: the *byte* limit itself is a config field (PASSWORD_MAX_BYTES) so a
+# future hasher switch (scrypt/argon2) changes one knob instead of silently
+# outgrowing this constant; the character cap below stays matched to it.
 MAX_PASSWORD_LEN = 72
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+# H21/M20: one canonical node-id pattern lives in mqtt.config (it guards MQTT
+# topic construction); the API schema imports it so the two can never drift.
+from mqtt.config import _NODE_ID_RE as _MQTT_NODE_ID_RE  # noqa: E402
 
 
 def _normalise_username(v: object) -> object:
@@ -53,19 +62,25 @@ def _normalise_username(v: object) -> object:
 
 
 def _validate_password_bytes(v: str) -> str:
-    """Reject a password whose UTF-8 encoding exceeds bcrypt's 72-byte limit.
+    """Reject a password whose UTF-8 encoding exceeds the configured byte limit.
 
     ``max_length=72`` on the ``Field`` counts *characters*; bcrypt hashes and
     compares at most 72 *bytes*, so e.g. a 72-char password of multi-byte
     characters silently prefix-collides with a shorter one. Validate the byte
     length explicitly to enforce the real limit (M-14, Issue #27).
+
+    L12: the limit is read from config (``PASSWORD_MAX_BYTES``) per call so a
+    hasher switch is a config change, not a silent constant drift.
     """
+    from config import get_config
+
+    limit = get_config().PASSWORD_MAX_BYTES
     byte_len = len(v.encode("utf-8"))
-    if byte_len > MAX_PASSWORD_LEN:
+    if byte_len > limit:
         char_len = len(v)
         raise ValueError(
-            f"password exceeds bcrypt's 72-byte limit: {char_len} characters = "
-            f"{byte_len} bytes in UTF-8 (max 72 bytes). "
+            f"password exceeds the {limit}-byte limit: {char_len} characters = "
+            f"{byte_len} bytes in UTF-8 (max {limit} bytes). "
             f"Please use a shorter password or fewer multi-byte characters."
         )
     return v
@@ -152,7 +167,7 @@ class ProfileResponse(BaseModel):
 class UpdateProfileRequest(BaseModel):
     username: str | None = Field(None, min_length=3, max_length=50)
     email: EmailStr | None = Field(None, max_length=255)
-    notification_prefs: dict | None = None
+    notification_prefs: "NotificationPrefs | None" = None
 
     @field_validator("username", mode="before")
     @classmethod
@@ -167,6 +182,34 @@ class UpdateProfileRequest(BaseModel):
     @classmethod
     def _lower_email(cls, v: str | None) -> str | None:
         return str(v).lower() if v is not None else None
+
+
+class WebhookConfig(BaseModel):
+    """One user-registered webhook target (H13/H26).
+
+    Pydantic's ``HttpUrl`` accepts **only** ``http://`` / ``https://`` URLs, so
+    ``javascript:``, ``data:``, and other XSS-capable schemes are rejected at
+    the schema boundary instead of being stored for the frontend to render.
+    """
+
+    url: HttpUrl
+    label: str | None = Field(None, max_length=100)
+
+
+class NotificationPrefs(BaseModel):
+    """User notification preferences (H13/H26).
+
+    ``extra="allow"`` keeps the stored shape forward-compatible: unknown keys
+    round-trip untouched, while every *known* key is validated here. Each
+    webhook entry must carry a real http(s) URL (see :class:`WebhookConfig`)
+    and the list is capped so one account cannot store an unbounded number.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    msgs_per_hr: int | None = Field(None, ge=0, le=96)
+    alert_email_threshold: int | None = Field(None, ge=0, le=96)
+    webhooks: list[WebhookConfig] | None = Field(None, max_length=50)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -275,18 +318,18 @@ class RegisterNodeRequest(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=50)
     name: str | None = Field(None, max_length=100)
     location_name: str | None = Field(None, max_length=200)
-    lat: float | None = None
-    lon: float | None = None
+    # L13: catch coordinate typos before they reach the DB.
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
     firmware_version: str | None = Field(None, max_length=50)
     reading_interval: int = Field(30, ge=1, le=86400)
 
     @field_validator("node_id")
     @classmethod
     def _node_id_safe(cls, v: str) -> str:
-        import re
-        # Mirror of mqtt/config._NODE_ID_RE: a crafted id must not be able to
-        # inject MQTT path segments or wildcards.
-        if not re.fullmatch(r"^[A-Za-z0-9_-]{1,50}$", v):
+        # Canonical pattern from mqtt/config (H21): a crafted id must not be
+        # able to inject MQTT path segments or wildcards.
+        if not _MQTT_NODE_ID_RE.fullmatch(v):
             raise ValueError(
                 "node_id may contain only letters, digits, '_', '-' (1-50 chars)"
             )
@@ -298,8 +341,9 @@ class UpdateNodeRequest(BaseModel):
 
     name: str | None = Field(None, max_length=100)
     location_name: str | None = Field(None, max_length=200)
-    lat: float | None = None
-    lon: float | None = None
+    # L13: catch coordinate typos before they reach the DB.
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
     firmware_version: str | None = Field(None, max_length=50)
     reading_interval: int | None = Field(None, ge=1, le=86400)
     is_active: bool | None = None
@@ -339,4 +383,24 @@ class AdminSettingsUpdate(BaseModel):
     aqi_critical_threshold: int | None = Field(None, ge=0, le=500)
     data_retention_days: int | None = Field(None, ge=1, le=3650)
     alerts_enabled: bool | None = None
-    alert_email: EmailStr | None = None
+    # M62: SystemSetting.value is unbounded Text — cap the email here so a
+    # multi-KB value can never be persisted through this route.
+    alert_email: EmailStr | None = Field(None, max_length=255)
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> "AdminSettingsUpdate":
+        """M21: reject an inverted pair *within one patch* at request time.
+
+        A schema cannot see the DB, so this only covers the both-supplied
+        case; the merged-state check (a lone ``critical`` patched against the
+        stored ``warning`` and vice versa) lives in the route (M14).
+        """
+        if (
+            self.aqi_warning_threshold is not None
+            and self.aqi_critical_threshold is not None
+            and self.aqi_warning_threshold >= self.aqi_critical_threshold
+        ):
+            raise ValueError(
+                "aqi_warning_threshold must stay < aqi_critical_threshold"
+            )
+        return self

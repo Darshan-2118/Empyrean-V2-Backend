@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from quart import Blueprint, jsonify
 
 from api.cache import cache_delete, cache_get_json, cache_set_json
-from api.jwt import _problem_json, admin_required, jwt_required
+from api.jwt import problem_json, admin_required, jwt_required
 from api.rate_limit import rate_limit
 from api.schemas import NodeResponse, RegisterNodeRequest, UpdateNodeRequest
 from api.validation import validate_body, validated_body
@@ -52,12 +52,15 @@ def _serialise(node: Node) -> dict:
     ).model_dump()
 
 
-def _push_config(node_id: str, interval_s: int) -> bool:
+def _push_config(node_id: str, interval_s: int, *, enabled: bool = True) -> bool:
     """Best-effort push of a reading interval to a device (fail-open).
 
     Returns ``True`` only if a client is registered and the publish did not
     raise. Never raises to the caller. When no client is available (broker
     disabled / not started) it logs and returns ``False``.
+
+    M26: ``enabled=False`` pushes a *disabled* config so a deactivated node
+    stops publishing instead of keeping its last cadence until reboot.
     """
     client = get_client()
     if client is None:
@@ -65,7 +68,7 @@ def _push_config(node_id: str, interval_s: int) -> bool:
         return False
     try:
         from mqtt.config import publish_config  # import here to keep route import light
-        publish_config(client, node_id, interval_s=interval_s)
+        publish_config(client, node_id, interval_s=interval_s, enabled=enabled)
     except Exception:
         logger.exception("Config push failed for node %s", node_id)
         return False
@@ -92,7 +95,12 @@ async def list_nodes():
 @jwt_required
 @validate_body(RegisterNodeRequest)
 async def register_node():
-    """Register a new sensor node (self-service; any authenticated user)."""
+    """Register a new sensor node (self-service; any authenticated user).
+
+    M25: re-registering a *deactivated* node id undeletes it (upsert) — a
+    reflashed device gets its identity back instead of a permanent 409. An
+    ACTIVE duplicate still 409s.
+    """
     data = validated_body()
 
     node = Node(
@@ -112,9 +120,23 @@ async def register_node():
             await session.refresh(node)
         except IntegrityError:
             await session.rollback()
-            return _problem_json(409, "Conflict", "A node with this id is already registered")
+            existing = await session.get(Node, data.node_id)
+            if existing is not None and not existing.is_active:
+                existing.name = data.name
+                existing.location_name = data.location_name
+                existing.lat = data.lat
+                existing.lon = data.lon
+                existing.firmware_version = data.firmware_version
+                existing.reading_interval = data.reading_interval
+                existing.is_active = True
+                await session.commit()
+                await session.refresh(existing)
+                node = existing
+            else:
+                return problem_json(409, "Conflict", "A node with this id is already registered")
 
     await cache_delete(_NODES_CACHE_KEY)
+    await cache_delete(_READINGS_LATEST_KEY)
     return jsonify(_serialise(node)), 201
 
 
@@ -129,7 +151,7 @@ async def update_node(node_id: str):
     async with AsyncSessionLocal() as session:
         node = await session.get(Node, node_id)
         if node is None:
-            return _problem_json(404, "Not Found", "Node not found")
+            return problem_json(404, "Not Found", "Node not found")
 
         if data.name is not None:
             node.name = data.name
@@ -149,10 +171,16 @@ async def update_node(node_id: str):
         await session.commit()
         await session.refresh(node)
         serialised = _serialise(node)
+        interval_after = node.reading_interval
 
-    # Push the reading interval to the device (fail-open).
+    # Push config to the device (fail-open). M26: activation changes are
+    # pushed too — a deactivated node must be told to stop publishing (it
+    # otherwise keeps its last cadence until reboot), and a reactivated one
+    # told to resume. An interval-only change pushes the normal config.
     pushed = False
-    if data.reading_interval is not None:
+    if data.is_active is not None:
+        pushed = _push_config(node_id, interval_after, enabled=data.is_active)
+    elif data.reading_interval is not None:
         pushed = _push_config(node_id, data.reading_interval)
 
     await cache_delete(_NODES_CACHE_KEY)

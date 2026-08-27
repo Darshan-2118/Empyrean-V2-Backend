@@ -19,7 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.cache import get_client as get_redis_client
-from api.jwt import _problem_json, admin_required
+from api.jwt import problem_json, admin_required
 from api.schemas import AdminSettingsUpdate
 from api.validation import validate_body, validated_body
 from config import get_config
@@ -53,7 +53,8 @@ _SETTING_DEFS: dict[str, dict[str, Any]] = {
     },
     "alert_email": {
         "description": "Email address that receives critical alerts",
-        "fallback": lambda: "",
+        # L9: cfg fallback like the sibling settings (was the only one without).
+        "fallback": lambda: get_config().ALERT_EMAIL,
     },
 }
 
@@ -77,47 +78,42 @@ def _normalise(key: str, value: Any) -> str:
 
 
 async def _load_settings() -> list[dict[str, Any]]:
-    """Load all settings from DB, falling back to config for missing registry keys."""
+    """Load all settings from DB, falling back to config for missing registry keys.
+
+    L8: single pass over one merged key list (registry keys first, then any
+    extra DB-only rows) instead of walking both collections separately.
+    """
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(SystemSetting))
         db_settings = {s.key: s for s in result.scalars().all()}
 
-    output: list[dict[str, Any]] = []
+    def _db_entry(key: str, s: SystemSetting, description: str | None) -> dict[str, Any]:
+        return {
+            "key": key,
+            "value": s.value,
+            "description": s.description or description,
+            "updated_at": s.updated_at.isoformat().replace("+00:00", "Z") if s.updated_at else None,
+            "updated_by": s.updated_by,
+            "source": "db",
+        }
 
-    # First add all known registry keys
-    for key, defn in _SETTING_DEFS.items():
-        if key in db_settings:
-            s = db_settings[key]
-            output.append({
-                "key": key,
-                "value": s.value,
-                "description": s.description or defn["description"],
-                "updated_at": s.updated_at.isoformat().replace("+00:00", "Z") if s.updated_at else None,
-                "updated_by": s.updated_by,
-                "source": "db",
-            })
+    keys = list(_SETTING_DEFS.keys()) + [k for k in db_settings if k not in _SETTING_DEFS]
+
+    output: list[dict[str, Any]] = []
+    for key in keys:
+        defn = _SETTING_DEFS.get(key, {})
+        s = db_settings.get(key)
+        if s is not None:
+            output.append(_db_entry(key, s, defn.get("description")))
         else:
             output.append({
                 "key": key,
                 "value": _config_fallback(key),
-                "description": defn["description"],
+                "description": defn.get("description"),
                 "updated_at": None,
                 "updated_by": None,
                 "source": "config",
             })
-
-    # Add any extra DB rows that are not in _SETTING_DEFS
-    for key, s in db_settings.items():
-        if key not in _SETTING_DEFS:
-            output.append({
-                "key": key,
-                "value": s.value,
-                "description": s.description,
-                "updated_at": s.updated_at.isoformat().replace("+00:00", "Z") if s.updated_at else None,
-                "updated_by": s.updated_by,
-                "source": "db",
-            })
-
     return output
 
 
@@ -240,6 +236,37 @@ async def _db_info() -> tuple[dict[str, str], int | None, bool]:
         return {"status": "error", "detail": f"PostgreSQL error: {exc}"}, None, False
 
 
+def _observability_counters() -> dict[str, Any]:
+    """Collect operational counters that used to be wired to nothing.
+
+    M38: MQTT dropped-reading / queue-overflow counters; L24: alert-publisher
+    stats; L42: rate-limit availability + bypass count. Each block is
+    fail-soft — a broken component must never break the health endpoint.
+    """
+    counters: dict[str, Any] = {}
+    try:
+        from mqtt.client import get_dropped_readings_count, get_queue_overflow_count
+
+        counters["mqtt_dropped_readings"] = get_dropped_readings_count()
+        counters["mqtt_queue_overflows"] = get_queue_overflow_count()
+    except Exception:  # noqa: BLE001 - health must stay fail-soft
+        pass
+    try:
+        from mqtt.publisher import get_publisher_stats
+
+        counters["alert_publisher"] = get_publisher_stats()
+    except Exception:  # noqa: BLE001 - health must stay fail-soft
+        pass
+    try:
+        from api.rate_limit import get_rate_limit_bypass_count, is_rate_limit_available
+
+        counters["rate_limit_available"] = is_rate_limit_available()
+        counters["rate_limit_bypass_total"] = get_rate_limit_bypass_count()
+    except Exception:  # noqa: BLE001 - health must stay fail-soft
+        pass
+    return counters
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 
@@ -262,20 +289,42 @@ async def update_settings():
     if not updates:
         return jsonify({"settings": await _load_settings()}), 200
 
-    # Cross-field validation: aqi_warning_threshold must be < aqi_critical_threshold
+    # M84: an explicit JSON null used to normalise to "" and get persisted —
+    # e.g. ``"alerts_enabled": null`` silently disabled alerting. Reject
+    # nulls outright; omitting the key leaves the setting unchanged.
+    null_keys = sorted(k for k, v in updates.items() if v is None)
+    if null_keys:
+        return problem_json(
+            422,
+            "Unprocessable Entity",
+            "explicit null is not accepted for: "
+            + ", ".join(null_keys)
+            + " (omit the key to leave a setting unchanged)",
+        )
+
+    # Cross-field validation: aqi_warning_threshold must be < aqi_critical_threshold.
+    # M14: validate against the *merged* state (existing DB/config value merged
+    # with the proposed patch), so a lone patch to one side is checked against
+    # the other side's effective value — a lone `critical=80` against DB
+    # `warning=90` is rejected.
     current_settings = {s["key"]: s["value"] for s in await _load_settings()}
 
-    warning = updates.get(
-        "aqi_warning_threshold",
-        int(current_settings.get("aqi_warning_threshold", cfg.AQI_WARNING_THRESHOLD)),
-    )
-    critical = updates.get(
-        "aqi_critical_threshold",
-        int(current_settings.get("aqi_critical_threshold", cfg.AQI_CRITICAL_THRESHOLD)),
-    )
+    def _merged_int(key: str, fallback_cfg: int) -> int | None:
+        """Effective int for ``key`` after the patch, or ``None`` if not numeric."""
+        if key in updates and updates[key] is not None:
+            return updates[key]
+        # M84: stored values may be non-numeric; never let an eager int() 500.
+        raw = current_settings.get(key)
+        try:
+            return int(raw) if raw is not None and str(raw).strip() != "" else fallback_cfg
+        except (TypeError, ValueError):
+            return fallback_cfg
 
-    if warning is not None and critical is not None and int(warning) >= int(critical):
-        return _problem_json(
+    warning = _merged_int("aqi_warning_threshold", cfg.AQI_WARNING_THRESHOLD)
+    critical = _merged_int("aqi_critical_threshold", cfg.AQI_CRITICAL_THRESHOLD)
+
+    if warning is not None and critical is not None and warning >= critical:
+        return problem_json(
             422,
             "Unprocessable Entity",
             "aqi_warning_threshold must stay < aqi_critical_threshold",
@@ -284,6 +333,19 @@ async def update_settings():
     admin_id = g.current_user.id
 
     async with AsyncSessionLocal() as session:
+        # M13: read the current DB value for every key we're about to touch so
+        # an audit trail can record the change (old → new).
+        old_vals = {
+            s.key: s.value
+            for s in (
+                await session.execute(
+                    select(SystemSetting).where(SystemSetting.key.in_(updates.keys()))
+                )
+            ).scalars()
+        }
+
+        from models.setting import AuditLog
+
         for key, value in updates.items():
             text_value = _normalise(key, value)
             description = _SETTING_DEFS.get(key, {}).get("description")
@@ -305,6 +367,17 @@ async def update_settings():
                 )
             )
             await session.execute(stmt)
+            # M13: record every settings change in the audit trail.
+            session.add(
+                AuditLog(
+                    entity_type="system_settings",
+                    entity_id=key,
+                    action="update",
+                    old_value=old_vals.get(key),
+                    new_value=text_value,
+                    changed_by=admin_id,
+                )
+            )
         await session.commit()
 
     return jsonify({"settings": await _load_settings()}), 200
@@ -343,4 +416,6 @@ async def health():
         "status": overall_status,
         "checks": checks,
         "sizes": sizes,
+        # M38/L24/L42: counters previously computed but never exposed.
+        "counters": _observability_counters(),
     }), 200

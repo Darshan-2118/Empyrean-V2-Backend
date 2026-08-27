@@ -90,6 +90,13 @@ def main():
             new_lines.append(f"JWT_SECRET={jwt_secret}")
 
         env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        # H29: the file now holds live credentials — restrict it to the owner
+        # immediately so other users on the box cannot read it. Best-effort:
+        # POSIX enforces 0600; Windows maps this to a read-only owner file.
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError as exc:
+            print(f"WARNING: could not chmod {env_path.name} to 0600: {exc}")
         print(f"Successfully updated {env_path.name} with new production secrets.")
     else:
         print("Tip: Run with --write-env to automatically write these into your .env file.")

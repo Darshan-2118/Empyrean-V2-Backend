@@ -17,7 +17,7 @@ from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 
 from api.jwt import (
-    _problem_json,
+    problem_json,
     create_access_token,
     generate_refresh_token,
     hash_refresh_token,
@@ -35,23 +35,49 @@ logger = logging.getLogger("empyrean.auth")
 
 auth_bp = Blueprint("auth", __name__)
 
-HARDCODED_ADMIN_USERNAME = "Darshan"
-HARDCODED_ADMIN_PASSWORD = "Darsh1812"
-HARDCODED_ADMIN_EMAIL = "darshanr181204@gmail.com"
+
+def _bootstrap_admin_credentials() -> tuple[str, str, str] | None:
+    """Return ``(username, password, email)`` from env config, or ``None``.
+
+    H5/H6: credentials are never hardcoded in source. The operator opts in by
+    setting ``BOOTSTRAP_ADMIN_USERNAME`` + ``BOOTSTRAP_ADMIN_PASSWORD`` in the
+    environment; when either is missing there is no provisioned admin path at
+    all (use ``scripts/seed.py`` with ``SEED_ADMIN_PASSWORD`` instead).
+    """
+    cfg = get_config()
+    username = cfg.BOOTSTRAP_ADMIN_USERNAME.strip()
+    password = cfg.BOOTSTRAP_ADMIN_PASSWORD
+    if not username or not password:
+        return None
+    email = cfg.BOOTSTRAP_ADMIN_EMAIL.strip() or f"{username.lower()}@empyrean.local"
+    return username, password, email
 
 
-async def ensure_hardcoded_admin() -> User:
-    """Ensure the hardcoded admin user exists in the database with role='admin'."""
+async def ensure_hardcoded_admin() -> User | None:
+    """Ensure the env-configured bootstrap admin exists with role='admin'.
+
+    Returns ``None`` (and logs once) when no bootstrap credentials are
+    configured — that is a valid production posture.
+    """
+    creds = _bootstrap_admin_credentials()
+    if creds is None:
+        logger.info(
+            "No BOOTSTRAP_ADMIN_USERNAME/PASSWORD configured — skipping admin "
+            "auto-provisioning (seed via scripts/seed.py if needed)"
+        )
+        return None
+    username, password, email = creds
+
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(User).where(func.lower(User.username) == HARDCODED_ADMIN_USERNAME.lower())
+            select(User).where(func.lower(User.username) == username.lower())
         )
         user = result.scalar_one_or_none()
         if user is None:
-            pwd_hash = await asyncio.to_thread(hash_password, HARDCODED_ADMIN_PASSWORD)
+            pwd_hash = await asyncio.to_thread(hash_password, password)
             user = User(
-                username=HARDCODED_ADMIN_USERNAME,
-                email=HARDCODED_ADMIN_EMAIL,
+                username=username,
+                email=email,
                 password_hash=pwd_hash,
                 role="admin",
                 is_active=True,
@@ -60,7 +86,7 @@ async def ensure_hardcoded_admin() -> User:
             session.add(user)
             await session.commit()
             await session.refresh(user)
-            logger.info("Created hardcoded admin user '%s'", HARDCODED_ADMIN_USERNAME)
+            logger.info("Created bootstrap admin user '%s'", username)
         else:
             changed = False
             if user.role != "admin":
@@ -72,6 +98,10 @@ async def ensure_hardcoded_admin() -> User:
             if changed:
                 await session.commit()
                 await session.refresh(user)
+                # M12: role/is_active changed on a cached row — evict it.
+                from api.jwt import invalidate_user_cache
+
+                await invalidate_user_cache(user.id)
         return user
 
 # bcrypt hash of a dummy password, compared against when a login username does
@@ -105,10 +135,36 @@ def _dummy_compare(pwd_bytes: bytes) -> None:
 
 
 def _refresh_expiry(now: datetime, cfg: Any) -> datetime:
-    """Refresh-token expiry time for ``now``, truncated to the second."""
-    return now.replace(second=0, microsecond=0) + timedelta(
+    """Refresh-token expiry time for ``now``, truncated to the second.
+
+    L44: truncation drops only the sub-second fraction — the old
+    ``second=0`` form truncated to the *minute*, silently shortening token
+    validity by up to 59 s relative to the documented contract.
+    """
+    return now.replace(microsecond=0) + timedelta(
         days=cfg.JWT_REFRESH_TOKEN_EXPIRY_DAYS
     )
+
+
+# M9: internal-only counter for refresh-token reuse (theft) events. Kept out
+# of the client response so an attacker never learns they were detected, but
+# incrementable via Redis so ops can alert when credentials are compromised.
+_TOKEN_REUSE_KEY = "auth:refresh_token_reuse_total"
+_TOKEN_REUSE_TTL_S = 86400  # daily window, refreshed on every hit
+
+
+async def _record_token_reuse() -> None:
+    """Increment the internal refresh-token-reuse counter (best-effort)."""
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is None:
+            return
+        await client.incr(_TOKEN_REUSE_KEY)
+        await client.expire(_TOKEN_REUSE_KEY, _TOKEN_REUSE_TTL_S)
+    except Exception:
+        logger.exception("Failed to record refresh-token reuse counter")
 
 
 def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
@@ -128,22 +184,31 @@ def _auth_payload(user: User, access_token: str, refresh_token: str) -> dict:
     ).model_dump()
 
 
-async def _issue_auth_tokens(user: User) -> tuple:
-    """Create a JWT pair, persist the refresh token, return a 201 response."""
+async def _issue_auth_tokens(user: User, session=None) -> tuple:
+    """Create a JWT pair, persist the refresh token, return a 201 response.
+
+    M8: ``session`` is the caller's already-open ``AsyncSession``. Reusing it
+    (instead of opening a second one) collapses the token issuance into the
+    caller's single transaction, saving a round-trip and a second connection
+    per login/register. When ``session`` is ``None`` a fresh one is opened for
+    callers that don't have one handy.
+    """
+    if session is None:
+        async with AsyncSessionLocal() as session:
+            return await _issue_auth_tokens(user, session)
+
     access = create_access_token(user.id, user.role)
     raw_refresh, token_hash = generate_refresh_token()
+    now = datetime.now(timezone.utc)
+    expires_at = _refresh_expiry(now, get_config())
 
-    async with AsyncSessionLocal() as session:
-        now = datetime.now(timezone.utc)
-        expires_at = _refresh_expiry(now, get_config())
-
-        rt = RefreshToken(
-            user_id=user.id,
-            token_hash=token_hash,
-            expires_at=expires_at,
-        )
-        session.add(rt)
-        await session.commit()
+    rt = RefreshToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    session.add(rt)
+    await session.commit()
 
     return jsonify(_auth_payload(user, access, raw_refresh)), 201
 
@@ -173,13 +238,15 @@ async def register():
             await session.refresh(user)
         except IntegrityError:
             await session.rollback()
-            return _problem_json(
+            return problem_json(
                 409,
                 "Conflict",
                 "Username or email already taken",
             )
 
-    return await _issue_auth_tokens(user)
+        # M8: reuse the caller's open session so token issuance is one
+        # transaction instead of opening a second session/round-trip.
+        return await _issue_auth_tokens(user, session)
 
 
 @auth_bp.route("/login", methods=["POST"])
@@ -189,43 +256,10 @@ async def login():
     """Authenticate with username/password, return JWT tokens."""
     data = validated_body()
 
-    # Hardcoded admin check / auto-provisioning
-    if (
-        data.username.strip().lower() == HARDCODED_ADMIN_USERNAME.lower()
-        and data.password == HARDCODED_ADMIN_PASSWORD
-    ):
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(User).where(func.lower(User.username) == HARDCODED_ADMIN_USERNAME.lower())
-            )
-            user = result.scalar_one_or_none()
-            if user is None:
-                pwd_hash = await asyncio.to_thread(hash_password, HARDCODED_ADMIN_PASSWORD)
-                user = User(
-                    username=HARDCODED_ADMIN_USERNAME,
-                    email=HARDCODED_ADMIN_EMAIL,
-                    password_hash=pwd_hash,
-                    role="admin",
-                    is_active=True,
-                    notification_prefs={"email_on_critical": True},
-                )
-                session.add(user)
-                await session.commit()
-                await session.refresh(user)
-                logger.info("Auto-provisioned hardcoded admin user '%s' on login", HARDCODED_ADMIN_USERNAME)
-            else:
-                changed = False
-                if user.role != "admin":
-                    user.role = "admin"
-                    changed = True
-                if not user.is_active:
-                    user.is_active = True
-                    changed = True
-                user.last_login_at = datetime.now(timezone.utc)
-                await session.commit()
-                await session.refresh(user)
-
-        return await _issue_auth_tokens(user)
+    # H5/H6: the old hardcoded-admin login branch (plaintext credential compare
+    # bypassing bcrypt, active in production) is removed. The bootstrap admin —
+    # when configured via BOOTSTRAP_ADMIN_* env vars — is provisioned at startup
+    # with a bcrypt hash and authenticates through the normal path below.
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -241,22 +275,23 @@ async def login():
             # the event loop (H-6/L-33).
             await asyncio.to_thread(_dummy_compare, pwd_bytes)
             logger.warning("Failed login: unknown username %r", data.username)
-            return _problem_json(401, "Unauthorized", "Invalid username or password")
+            return problem_json(401, "Unauthorized", "Invalid username or password")
 
         if not await asyncio.to_thread(
             bcrypt.checkpw, pwd_bytes, user.password_hash.encode("utf-8")
         ):
             logger.warning("Failed login: wrong password for %r", data.username)
-            return _problem_json(401, "Unauthorized", "Invalid username or password")
+            return problem_json(401, "Unauthorized", "Invalid username or password")
 
         if not user.is_active:
             logger.warning("Failed login: inactive user %r", data.username)
-            return _problem_json(401, "Unauthorized", "Invalid username or password")
+            return problem_json(401, "Unauthorized", "Invalid username or password")
 
         user.last_login_at = datetime.now(timezone.utc)
         await session.commit()
 
-    return await _issue_auth_tokens(user)
+        # M8: reuse the open session for token issuance (single transaction).
+        return await _issue_auth_tokens(user, session)
 
 
 @auth_bp.route("/refresh", methods=["POST"])
@@ -288,11 +323,39 @@ async def refresh():
         )
         row = result.first()
 
-        # Same 401 whether the token was invalid, already revoked, or expired —
-        # don't reveal which.
         if row is None:
+            # H8: refresh-token reuse detection. A token that exists but is
+            # already *revoked* must never be presented again — the only
+            # legitimate holder stopped using it when it was rotated/logged out.
+            # Re-presenting it is a theft signal, so revoke the entire user's
+            # chain (the victim's next refresh fails and they re-authenticate).
+            # An expired-but-never-revoked token stays a plain generic 401 with
+            # no mutation (L-27) — idle expiry is benign, not theft.
+            reused = await session.execute(
+                select(RefreshToken.user_id).where(
+                    RefreshToken.token_hash == token_hash,
+                    RefreshToken.revoked == True,  # noqa: E712
+                )
+            )
+            stolen_user_id = reused.scalar_one_or_none()
+            if stolen_user_id is not None:
+                logger.warning(
+                    "Refresh-token reuse detected (user %s) — revoking all "
+                    "of the user's refresh tokens as a theft response",
+                    stolen_user_id,
+                )
+                await session.execute(
+                    sa_update(RefreshToken)
+                    .where(RefreshToken.user_id == stolen_user_id)
+                    .values(revoked=True)
+                )
+                await session.commit()
+                # M9: surface reuse as an internal-only counter so ops can alert
+                # on credential theft without ever leaking it to the client
+                # (the HTTP response stays a generic 401).
+                await _record_token_reuse()
             logger.warning("Rejected refresh token: invalid, already revoked, or expired")
-            return _problem_json(
+            return problem_json(
                 401, "Unauthorized", "Refresh token is invalid or expired"
             )
         user_id, _ = row
@@ -305,7 +368,7 @@ async def refresh():
         # reveal whether an account is missing or deactivated (L-26).
         if user is None or not user.is_active:
             await session.commit()
-            return _problem_json(
+            return problem_json(
                 401, "Unauthorized", "Refresh token is invalid or expired"
             )
 
@@ -313,13 +376,8 @@ async def refresh():
         raw_new, new_hash = generate_refresh_token()
         new_expires = _refresh_expiry(now, get_config())
 
-        # Revoke the old refresh token as part of rotation (only the specific token)
-        await session.execute(
-            sa_update(RefreshToken)
-            .where(RefreshToken.token_hash == token_hash)
-            .values(revoked=True)
-        )
-
+        # L43: no second UPDATE needed — the claiming UPDATE ... RETURNING at
+        # the top of this handler already set revoked=True on this token.
         new_rt = RefreshToken(
             user_id=user.id,
             token_hash=new_hash,

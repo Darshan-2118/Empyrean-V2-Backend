@@ -35,14 +35,15 @@ from config import get_config
 
 logger = logging.getLogger("empyrean.cache")
 
-cfg = get_config()
-
 _client: Redis | None = None
 
 # Throttle the per-call "cache disabled" warning so a cache that was never
 # built doesn't spam every request (see #16). One warning per this many seconds.
 _CACHE_WARN_INTERVAL_S = 60.0
 _last_cache_warn: float = 0.0
+# M18: separate throttle for construction-failure warnings (mirrors
+# tasks/_redis.py), so a long outage doesn't log on every get_client() call.
+_last_client_warn: float = 0.0
 
 
 def get_client() -> Redis | None:
@@ -51,16 +52,42 @@ def get_client() -> Redis | None:
     Returns ``None`` if the client could not be constructed (e.g. a malformed
     URL) so callers can degrade. Note: ``from_url`` does not connect — actual
     connection errors surface on the first command and are handled per-call.
+
+    Self-healing (M18, mirrors ``tasks/_redis.py``): a failed construction
+    leaves ``_client`` at ``None`` so the next call retries — a worker that
+    boots during a Redis outage recovers without a restart.
     """
-    global _client, _last_cache_warn
-    if _client is None:
-        try:
-            _client = Redis.from_url(cfg.REDIS_URL, decode_responses=True)
-            logger.info("Redis cache client created for %s", cfg.REDIS_URL)
-        except Exception:
-            logger.exception("Failed to create Redis client — cache disabled")
-            _client = None
+    global _client, _last_client_warn
+    if _client is not None:
+        return _client
+    try:
+        # L15: resolve config per call — a module-level ``cfg`` snapshot went
+        # stale after reset_config_cache() in tests.
+        redis_url = get_config().REDIS_URL
+        _client = Redis.from_url(redis_url, decode_responses=True)
+        logger.info("Redis cache client created for %s", redis_url)
+    except Exception:
+        now = time.monotonic()
+        if now - _last_client_warn >= _CACHE_WARN_INTERVAL_S:
+            logger.warning(
+                "Failed to (re)create Redis cache client — cache disabled "
+                "until Redis becomes reachable"
+            )
+            _last_client_warn = now
+        _client = None
     return _client
+
+
+def reset_cache_client() -> None:
+    """Drop the process-global client so the next ``get_client()`` rebuilds it.
+
+    M22: ``reset_config_cache()`` alone left ``_client`` pointing at the old
+    REDIS_URL; tests that mock ``Redis.from_url`` or repoint the URL need this
+    hook (wired into ``tests/conftest.py``).
+    """
+    global _client, _last_client_warn
+    _client = None
+    _last_client_warn = 0.0
 
 
 def _warn_cache_disabled() -> None:

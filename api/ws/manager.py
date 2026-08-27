@@ -80,16 +80,31 @@ class ConnectionManager:
             return (True, len(connections))
         except RuntimeError as e:
             # Loop is not running / already closed — nothing to deliver.
+            # M74: mark the captured loop stale so the next ``connect()``
+            # recaptures the live loop instead of every later broadcast
+            # silently dropping against the dead one (the drop used to be a
+            # debug log and nothing more).
             logger.debug("WS loop not running — dropping broadcast: %s", e)
+            with self._lock:
+                if self._loop is loop:
+                    self._loop = None
             return (False, len(connections))
 
     async def _send_all(self, payload: str, connections: list[Any]) -> None:
-        dead: list[Any] = []
-        for ws in connections:
-            try:
-                await ws.send(payload)
-            except Exception:
-                dead.append(ws)
+        """Deliver ``payload`` to all sockets concurrently (M87).
+
+        The old sequential loop let one slow client stall every other socket's
+        delivery. ``gather(..., return_exceptions=True)`` sends in parallel and
+        reports per-socket failures without cancelling the healthy sends; the
+        futures returned by ``run_coroutine_threadsafe`` are observed here
+        (exception results are inspected, never discarded silently).
+        """
+        results = await asyncio.gather(
+            *(ws.send(payload) for ws in connections), return_exceptions=True
+        )
+        dead = [
+            ws for ws, result in zip(connections, results) if isinstance(result, BaseException)
+        ]
         if dead:
             with self._lock:
                 for ws in dead:

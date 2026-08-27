@@ -7,8 +7,10 @@ Usage::
 """
 
 # Re-export the base so callers can do ``from models import Base``
+# (L29: dispose_engines re-exported for symmetry with get_sync_db).
 from models.base import (
     Base,
+    dispose_engines,
     get_sync_db,
 )
 
@@ -32,5 +34,6 @@ __all__ = [
     "Alert",
     "SystemSetting",
     "AuditLog",
+    "dispose_engines",
     "get_sync_db",
 ]

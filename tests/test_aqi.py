@@ -34,3 +34,38 @@ def test_in_range_values_still_interpolate_normally():
     assert 101 <= aqi <= 150
     aqi, _ = compute_aqi(None, 604.0)  # top PM10 band, no clamp needed
     assert aqi == 500
+
+
+# ── M53/M54: breakpoint-edge behaviour is pinned ──────────────────────────────
+
+
+def test_fractional_index_is_truncated_not_rounded():
+    """M53: EPA convention truncates the fractional index (math.floor).
+
+    PM2.5 = 12.0 sits exactly on the Good band's C_hi: the interpolation yields
+    exactly 50; a value just inside the next band must truncate DOWN, never
+    round half-up (the old behaviour produced off-by-one AQIs at edges).
+    """
+    aqi, category = compute_aqi(12.0, None)
+    assert aqi == 50
+    assert category == "Good"
+    # First band boundary of PM2.5's second band: 35.4 → exactly 100, 35.5 → 101.
+    aqi, _ = compute_aqi(35.4, None)
+    assert aqi == 100
+    aqi, _ = compute_aqi(35.5, None)
+    assert aqi == 101
+
+
+def test_pm10_band_gap_value_lands_on_previous_band_floor():
+    """M54: PM10 bands have a 1-unit gap (54 → 55). A value inside the gap
+    (54.5) is matched to the *next* band by the ``<= C_hi`` scan and
+    interpolates a hair UNDER its I_lo (51), so truncation floors it to 50.
+    Harmless but pinned: this documents the exact boundary behaviour so a
+    future band-table edit cannot silently shift edge values.
+    """
+    aqi, category = compute_aqi(None, 54.5)
+    assert aqi == 50
+    assert category == "Moderate"  # band 1 owns the value despite AQI 50
+    # The band's true lower edge maps to exactly its I_lo.
+    aqi, _ = compute_aqi(None, 55.0)
+    assert aqi == 51

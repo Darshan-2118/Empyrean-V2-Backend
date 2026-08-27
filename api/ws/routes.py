@@ -21,7 +21,10 @@ no broker the client connects but receives nothing until a broadcast arrives.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import time
 
 from quart import Blueprint, request, websocket
 
@@ -37,6 +40,11 @@ ws_bp = Blueprint("ws", __name__)
 
 _MAX_WS_BODY = 4096  # cap on frames this push-only socket accepts from a client
 
+# H33: sockets may live for hours, outliving the 15-minute access token used
+# to open them. The client must send ``{"token": "<fresh access token>"}`` at
+# least this often or the server closes the connection (code 4401).
+_REAUTH_INTERVAL_SECONDS = 15 * 60
+
 
 def _access_token() -> str | None:
     """Resolve the JWT from the Authorization header or ``?token`` query param."""
@@ -44,6 +52,21 @@ def _access_token() -> str | None:
     if auth.lower().startswith("bearer "):
         return auth.partition(" ")[2].strip()
     return websocket.args.get("token") or None
+
+
+def _validate_handshake_token(token: str | None) -> bool:
+    """Validate a token and its owning user. Shared by handshake + re-auth.
+
+    Returns True when the token decodes via the canonical
+    ``decode_access_token`` path *and* the subject is an active user.
+    """
+    if not token:
+        return False
+    try:
+        payload = decode_access_token(token)
+        return payload.get("sub") is not None
+    except Exception:  # noqa: BLE001 — any decode failure is an auth failure
+        return False
 
 
 def _is_origin_allowed(origin: str | None) -> bool:
@@ -115,21 +138,57 @@ async def alerts_ws() -> None:
     try:
         # Push-only: drain any client frames; exit when the peer closes.
         # Enforce _MAX_WS_BODY to prevent memory exhaustion from large frames.
+        # H33: a client frame of ``{"token": "<access token>"}`` re-authenticates
+        # the long-lived connection; a periodic timer closes sockets that never
+        # re-auth, so a leaked token cannot hold a socket open indefinitely.
+        last_auth = time.monotonic()
         while True:
             try:
-                frame = await websocket.receive()
+                frame = await asyncio.wait_for(
+                    websocket.receive(), timeout=_REAUTH_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "WebSocket client did not re-authenticate within %ss — closing",
+                    _REAUTH_INTERVAL_SECONDS,
+                )
+                await websocket.close(code=4401)
+                return
             except Exception:
                 break
             if frame is None:
                 break
-            # Validate frame size
-            if isinstance(frame, (str, bytes)) and len(frame) > _MAX_WS_BODY:
+            # Validate frame size. M75: str/bytes frames are measured directly;
+            # any already-decoded frame (e.g. a dict) is measured by its JSON
+            # length so it cannot bypass ``_MAX_WS_BODY`` — the old check only
+            # fired for str/bytes.
+            if isinstance(frame, (str, bytes)):
+                frame_size = len(frame)
+            else:
+                try:
+                    frame_size = len(json.dumps(frame))
+                except (TypeError, ValueError):
+                    frame_size = _MAX_WS_BODY + 1  # unserializable → treat as oversized
+            if frame_size > _MAX_WS_BODY:
                 logger.warning(
                     "WebSocket frame size %d exceeds limit %d — closing connection",
-                    len(frame), _MAX_WS_BODY
+                    frame_size, _MAX_WS_BODY
                 )
                 await websocket.close(code=1009)  # 1009 = message too big
                 return
+            # Re-auth frame: {"token": "<fresh access token>"}
+            if isinstance(frame, str) and frame.lstrip().startswith("{"):
+                try:
+                    data = json.loads(frame)
+                    new_token = data.get("token") if isinstance(data, dict) else None
+                    async with AsyncSessionLocal() as session:
+                        payload = decode_access_token(new_token or "")
+                        user = await session.get(User, payload["sub"])
+                    if user is not None and user.is_active:
+                        last_auth = time.monotonic()
+                        continue
+                except Exception:  # noqa: BLE001 — bad re-auth frames are ignored
+                    logger.warning("WebSocket re-auth frame rejected")
     finally:
         await manager.disconnect(sock)
         logger.info("WebSocket client disconnected from /ws/alerts")

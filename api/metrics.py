@@ -1,5 +1,4 @@
 import time
-import re
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -7,17 +6,6 @@ from prometheus_client import (
     generate_latest,
 )
 from quart import request
-
-# Sanitize label values to be valid Prometheus label characters and within length limits.
-# Keeps cardinality under control by collapsing dynamic parts (e.g., variables) into a safe token.
-def _sanitize(label: str) -> str:
-    # Replace anything that isn't alphanumeric or underscore with an underscore
-    label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
-    # Collapse repeated underscores
-    label = re.sub(r'_+', '_', label)
-    # Trim to a reasonable length (Prometheus max 63 chars per label value)
-    return label[:63].strip('_')
-
 
 REQ_COUNT = Counter(
     "empyrean_http_requests_total",
@@ -44,6 +32,12 @@ def register_metrics(app):
 
     @app.after_request
     async def _observe(response):
+        # L20: the route label is the URL *rule* (e.g. "/api/v1/nodes/<node_id>"),
+        # never the request path, so client input can't mint new series —
+        # unmatched routes collapse to the bounded "unknown" sentinel (pinned
+        # by tests/test_metrics.py, M33). Cardinality caveat: a future route
+        # template embedding a regex converter would widen the label set;
+        # keep route rules literal.
         route = str(request.url_rule or "unknown")
 
         labels = (
@@ -60,5 +54,15 @@ def register_metrics(app):
 
     @app.route("/metrics")
     async def metrics():
+        # H19: when METRICS_SECRET is configured, require a matching
+        # X-Metrics-Secret header so the endpoint is safe even if the API is
+        # ever exposed without the nginx 127.0.0.1 allowlist in front of it.
+        from config import get_config
+
+        secret = get_config().METRICS_SECRET
+        if secret:
+            provided = request.headers.get("X-Metrics-Secret", "")
+            if provided != secret:
+                return "Forbidden", 403
         # A 2-tuple (body, content_type) would be parsed as a status code.
         return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}

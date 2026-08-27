@@ -8,6 +8,7 @@ Provides:
 - ``get_sync_db()`` — sync context manager for Celery tasks
 """
 
+import asyncio
 import logging
 from contextlib import contextmanager
 from typing import Generator
@@ -65,6 +66,23 @@ _state = {
 }
 
 
+def _dispose_stale_async_engine() -> None:
+    """Best-effort dispose of a leftover async engine before replacing it.
+
+    M89: reinit used to dispose only the sync engine, leaking the async
+    pool. ``AsyncEngine.dispose()`` is a coroutine and reinit is sync, so
+    run it in a fresh loop when possible; inside a running loop (or if the
+    pool was bound to a dead one) fall back to dropping the reference.
+    """
+    stale = _state["async_engine"]
+    if stale is None:
+        return
+    try:
+        asyncio.run(stale.dispose())
+    except Exception:
+        logger.debug("Could not dispose stale async engine pool", exc_info=True)
+
+
 def _init_engines():
     """Initialize or reinitialize database engines and session factories.
     
@@ -75,7 +93,8 @@ def _init_engines():
     if _state["sync_engine"] is not None:
         logger.debug("Disposing stale database engines (config reset detected)")
         _state["sync_engine"].dispose()
-    
+    _dispose_stale_async_engine()
+
     cfg = get_config()
     sync_db_url = cfg.DATABASE_URL
     
@@ -98,6 +117,11 @@ def _init_engines():
         pool_recycle=1800,
         pool_pre_ping=True,
         echo=False,
+        # L30: prepared_statement_cache_size=0 disables asyncpg's prepared-
+        # statement cache on purpose — with pgbouncer in transaction-pooling
+        # mode a statement prepared on one connection can be executed on
+        # another that never prepared it ("prepared statement does not
+        # exist"). Keep 0 while pgbouncer sits in front of Postgres.
         connect_args={"prepared_statement_cache_size": 0},
     )
 
@@ -143,29 +167,64 @@ def get_sync_session_local():
     return _state["sync_session_local"]
 
 
-# Initialize engines on first import for backward compatibility
-_init_engines()
+# M58: ``sync_engine`` / ``async_engine`` / ``AsyncSessionLocal`` /
+# ``SyncSessionLocal`` are resolved lazily via PEP 562 ``__getattr__`` instead
+# of being bound once at import time. A reinit or reset_engines() can then
+# never leave ``models.base.<alias>`` lookups pointing at disposed engines —
+# each access returns whatever the current state holds (initializing on first
+# access). Note: a ``from models.base import …`` still captures the object at
+# import time; after a reset, re-import or use the getters for a fresh one.
 
-# Export module-level variables that delegate to the getters
-sync_engine = _state["sync_engine"]
-async_engine = _state["async_engine"]
-AsyncSessionLocal = _state["async_session_local"]
-SyncSessionLocal = _state["sync_session_local"]
+
+def __getattr__(name: str):
+    if name == "sync_engine":
+        return get_sync_engine()
+    if name == "async_engine":
+        return get_async_engine()
+    if name == "AsyncSessionLocal":
+        return get_async_session_local()
+    if name == "SyncSessionLocal":
+        return get_sync_session_local()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Engine lifecycle ──────────────────────────────────────────────────────────
+
+
+def reset_engines() -> None:
+    """Dispose and drop all engines/session factories (M57).
+
+    Wired into ``config.reset_config_cache()``: engines are built from
+    ``DATABASE_URL``, so after a config reset the next engine access must
+    rebuild from the fresh URL instead of reusing engines built from the old
+    one. Safe to call when nothing was built yet.
+    """
+    if _state["sync_engine"] is not None:
+        _state["sync_engine"].dispose()
+    _dispose_stale_async_engine()
+    _state["sync_engine"] = None
+    _state["async_engine"] = None
+    _state["async_session_local"] = None
+    _state["sync_session_local"] = None
 
 
 async def dispose_engines() -> None:
     """Dispose both engines, releasing all pooled connections.
 
     Call this on application shutdown to avoid leaking connections.
+
+    M89: also clears the module state — otherwise post-shutdown getters would
+    hand back the disposed engines instead of re-initializing fresh ones.
     """
     logger.info("Disposing database engines …")
     if _state["sync_engine"] is not None:
         _state["sync_engine"].dispose()
     if _state["async_engine"] is not None:
         await _state["async_engine"].dispose()
+    _state["sync_engine"] = None
+    _state["async_engine"] = None
+    _state["async_session_local"] = None
+    _state["sync_session_local"] = None
     logger.info("Database engines disposed.")
 
 

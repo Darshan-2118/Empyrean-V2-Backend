@@ -20,12 +20,17 @@ class User(Base):
         Integer, primary_key=True, autoincrement=True,
     )
     username: Mapped[str] = mapped_column(
+        # H27: VARCHAR(n) in Postgres counts *characters*, not bytes, so the
+        # audit's multibyte-overflow concern cannot trigger here — the API
+        # schema caps usernames at 50 chars long before any write.
         String(50), unique=True, nullable=False, index=True,
     )
     email: Mapped[str] = mapped_column(
         String(255), unique=True, nullable=False, index=True,
     )
     password_hash: Mapped[str] = mapped_column(
+        # H27: bcrypt digests are always 60 ASCII bytes; 255 chars leaves
+        # generous headroom for future hash formats (argon2 ~97 chars).
         String(255), nullable=False,
     )
     role: Mapped[str] = mapped_column(

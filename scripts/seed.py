@@ -30,6 +30,8 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 from config import get_config
 
+from sqlalchemy import select
+
 from models import (
     Node,
     SystemSetting,
@@ -77,7 +79,11 @@ def seed(force: bool = False) -> None:
 
     with get_sync_db() as session:
         # ── 1. Admin user ─────────────────────────────────────────────────
-        existing_admin = session.query(User).filter_by(username="admin").first()
+        # L34: 2.x-style select() queries, matching the rest of the codebase
+        # (the legacy 1.x query()/filter_by() chain is deprecated).
+        existing_admin = session.scalar(
+            select(User).where(User.username == "admin")
+        )
         if existing_admin:
             logger.info("Admin user already exists — skipping.")
         else:
@@ -93,25 +99,42 @@ def seed(force: bool = False) -> None:
             # Log the username only — never the plaintext password.
             logger.info("Created admin user: '%s' (password from SEED_ADMIN_PASSWORD)", admin.username)
 
-        # ── 1b. Hardcoded Admin user: Darshan ─────────────────────────────
-        existing_darshan = session.query(User).filter(User.username.ilike("Darshan")).first()
-        if existing_darshan:
-            if existing_darshan.role != "admin" or not existing_darshan.is_active:
-                existing_darshan.role = "admin"
-                existing_darshan.is_active = True
-                session.commit()
-            logger.info("Admin user 'Darshan' already exists — ensured admin role.")
-        else:
-            darshan = User(
-                username="Darshan",
-                email="darshan@empyrean.local",
-                password_hash=hash_password("Darsh1812"),
-                role="admin",
-                is_active=True,
-                notification_prefs={"email_on_critical": True},
+        # ── 1b. Bootstrap admin from env (H28) ────────────────────────────
+        # The hardcoded "Darshan"/"Darsh1812" row is removed. Operators who
+        # want a second named admin set BOOTSTRAP_ADMIN_USERNAME/PASSWORD and
+        # the API provisions it at startup — never with a source-committed
+        # password.
+        cfg_creds = (
+            os.environ.get("BOOTSTRAP_ADMIN_USERNAME", "").strip(),
+            os.environ.get("BOOTSTRAP_ADMIN_PASSWORD", ""),
+            os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip(),
+        )
+        if cfg_creds[0] and cfg_creds[1]:
+            existing_bootstrap = session.scalar(
+                select(User).where(User.username.ilike(cfg_creds[0]))
             )
-            session.add(darshan)
-            logger.info("Created admin user: 'Darshan'")
+            if existing_bootstrap:
+                if existing_bootstrap.role != "admin" or not existing_bootstrap.is_active:
+                    existing_bootstrap.role = "admin"
+                    existing_bootstrap.is_active = True
+                    session.commit()
+                logger.info("Bootstrap admin user '%s' already exists — ensured admin role.", cfg_creds[0])
+            else:
+                bootstrap = User(
+                    username=cfg_creds[0],
+                    email=cfg_creds[2] or f"{cfg_creds[0].lower()}@empyrean.local",
+                    password_hash=hash_password(cfg_creds[1]),
+                    role="admin",
+                    is_active=True,
+                    notification_prefs={"email_on_critical": True},
+                )
+                session.add(bootstrap)
+                logger.info("Created bootstrap admin user: '%s' (password from BOOTSTRAP_ADMIN_PASSWORD)", cfg_creds[0])
+        else:
+            logger.info(
+                "BOOTSTRAP_ADMIN_USERNAME/PASSWORD not both set — skipping "
+                "bootstrap admin seed."
+            )
 
         # ── 2. Default system settings ────────────────────────────────────
         defaults = [
@@ -137,7 +160,9 @@ def seed(force: bool = False) -> None:
             ),
         ]
         for setting in defaults:
-            existing = session.query(SystemSetting).filter_by(key=setting.key).first()
+            existing = session.scalar(
+                select(SystemSetting).where(SystemSetting.key == setting.key)
+            )
             if existing:
                 logger.info("Setting '%s' already exists — skipping.", setting.key)
             else:
@@ -145,7 +170,9 @@ def seed(force: bool = False) -> None:
                 logger.info("Created setting: %s = %s", setting.key, setting.value)
 
         # ── 3. Sample node ────────────────────────────────────────────────
-        existing_node = session.query(Node).filter_by(node_id="ESP32-01").first()
+        existing_node = session.scalar(
+            select(Node).where(Node.node_id == "ESP32-01")
+        )
         if existing_node:
             logger.info("Node 'ESP32-01' already exists — skipping.")
         else:

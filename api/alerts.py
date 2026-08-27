@@ -2,12 +2,10 @@
 Alerts blueprint — list and acknowledge threshold-breach alerts.
 
 ``GET`` returns **unacknowledged** alerts (``acknowledged_at IS NULL``) with
-``limit``/``offset``/``severity`` params. The full unacknowledged list is cached
-under ``alerts:unacked`` (TTL 30s); filters and pagination are applied in-memory
-after the cache read so the cache key never varies with query params. A 30s TTL
-bounds staleness for newly-created alerts (the WebSocket channel covers the
-real-time path). ``PATCH`` marks an alert acknowledged (idempotent) and
-invalidates the cache.
+``limit``/``offset``/``severity`` params. Filtering and pagination run in SQL
+(M27) — the old design cached the FULL unacked list under ``alerts:unacked``
+and sliced pages in Python, loading thousands of rows per request behind a
+noisy node. ``PATCH`` marks an alert acknowledged (idempotent).
 
 Alert *creation* lives in ``tasks.alerts.check_thresholds`` (Celery beat) — not
 here.
@@ -19,10 +17,9 @@ import logging
 from datetime import datetime, timezone
 
 from quart import Blueprint, g, jsonify, request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from api.cache import cache_delete, cache_get_json, cache_set_json
-from api.jwt import _problem_json, jwt_required
+from api.jwt import problem_json, jwt_required
 from api.rate_limit import rate_limit
 from api.schemas import AlertResponse
 from models import Alert
@@ -32,8 +29,6 @@ logger = logging.getLogger("empyrean.alerts")
 
 alerts_bp = Blueprint("alerts", __name__)
 
-_ALERTS_CACHE_KEY = "alerts:unacked"
-_ALERTS_CACHE_TTL = 30  # docs/database.md contract
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 200
 _SEVERITIES = {"warning", "critical"}
@@ -42,15 +37,16 @@ _SEVERITIES = {"warning", "critical"}
 def _serialise(alert: Alert) -> dict:
     """Convert an ``Alert`` ORM row into an ``AlertResponse`` dict.
 
-    ``value``/``threshold`` are Postgres REAL (may surface as ``float`` or
-    ``Decimal``) — coerce to ``float``.
+    L16: no manual ``float()`` casts — Postgres REAL columns already return
+    Python floats via asyncpg, and ``AlertResponse`` coerces its numeric
+    fields anyway.
     """
     return AlertResponse(
         alert_id=alert.alert_id,
         node_id=alert.node_id,
         parameter=alert.parameter,
-        value=float(alert.value),
-        threshold=float(alert.threshold),
+        value=alert.value,
+        threshold=alert.threshold,
         severity=alert.severity,
         message=alert.message,
         triggered_at=alert.triggered_at,
@@ -82,51 +78,59 @@ def _validate_pagination() -> tuple[int, int] | None:
 @rate_limit()
 @jwt_required
 async def list_alerts():
-    """Unacknowledged alerts, newest first, with optional filters."""
+    """Unacknowledged alerts, newest first, with optional filters.
+
+    M27: the severity filter and LIMIT/OFFSET pagination run in SQL. The old
+    cache-the-full-list design loaded every unacked alert (10 000+ behind a
+    noisy node) into Python on each call just to slice one page out.
+    """
     severity = request.args.get("severity")
     if severity is not None and severity not in _SEVERITIES:
-        return _problem_json(
+        return problem_json(
             422, "Unprocessable Entity", "severity must be 'warning' or 'critical'"
         )
 
     pagination = _validate_pagination()
     if pagination is None:
-        return _problem_json(
+        return problem_json(
             422,
             "Unprocessable Entity",
             f"limit must be 1..{_MAX_LIMIT} and offset must be >= 0",
         )
     limit, offset = pagination
 
-    cached = await cache_get_json(_ALERTS_CACHE_KEY)
-    if cached is None:
-        stmt = (
-            select(Alert)
-            .where(Alert.acknowledged_at.is_(None))
-            .order_by(Alert.triggered_at.desc(), Alert.alert_id.desc())
-        )
-        async with AsyncSessionLocal() as session:
-            rows = list((await session.execute(stmt)).scalars().all())
-        cached = [_serialise(a) for a in rows]
-        await cache_set_json(_ALERTS_CACHE_KEY, cached, _ALERTS_CACHE_TTL)
-
+    stmt = (
+        select(Alert)
+        .where(Alert.acknowledged_at.is_(None))
+        .order_by(Alert.triggered_at.desc(), Alert.alert_id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    count_stmt = (
+        select(func.count())
+        .select_from(Alert)
+        .where(Alert.acknowledged_at.is_(None))
+    )
     if severity is not None:
-        cached = [a for a in cached if a["severity"] == severity]
+        stmt = stmt.where(Alert.severity == severity)
+        count_stmt = count_stmt.where(Alert.severity == severity)
 
-    total = len(cached)
-    page = cached[offset : offset + limit]
-    return jsonify({"alerts": page, "total": total}), 200
+    async with AsyncSessionLocal() as session:
+        rows = list((await session.execute(stmt)).scalars().all())
+        total = int((await session.execute(count_stmt)).scalar_one())
+
+    return jsonify({"alerts": [_serialise(a) for a in rows], "total": total}), 200
 
 
 @alerts_bp.route("/<int:alert_id>/acknowledge", methods=["PATCH"])
 @rate_limit()
 @jwt_required
 async def acknowledge_alert(alert_id: int):
-    """Mark an alert acknowledged (idempotent); invalidate the alerts cache."""
+    """Mark an alert acknowledged (idempotent)."""
     async with AsyncSessionLocal() as session:
         alert = await session.get(Alert, alert_id)
         if alert is None:
-            return _problem_json(404, "Not Found", "Alert not found")
+            return problem_json(404, "Not Found", "Alert not found")
 
         if alert.acknowledged_at is None:
             alert.acknowledged_at = datetime.now(timezone.utc)
@@ -136,5 +140,4 @@ async def acknowledge_alert(alert_id: int):
 
         serialised = _serialise(alert)
 
-    await cache_delete(_ALERTS_CACHE_KEY)
     return jsonify(serialised), 200

@@ -11,6 +11,7 @@ Two decorators are exposed:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -26,12 +27,144 @@ logger = logging.getLogger("empyrean.auth")
 
 cfg = get_config()
 JWT_SECRET = cfg.JWT_SECRET
-JWT_ALGORITHM = cfg.JWT_ALGORITHM
+# H4/M66: the algorithm is pinned literally, never read from config. Even
+# though Config now validates JWT_ALGORITHM == "HS256", defense in depth says
+# the security-critical decode path must not depend on a mutable knob at all.
+JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
 
+# M12: short-TTL Redis cache for the authenticated User row, so most requests
+# avoid a DB round-trip. ~30s TTL bounds deactivation/role-change staleness;
+# callers invalidate the key on any is_active/role mutation.
+_USER_CACHE_KEY = "cache:user:{user_id}"
+_USER_CACHE_TTL_S = 30
 
-def _problem_json(status: int, title: str, detail: str | None = None):
-    """Return an RFC 7807 ``application/problem+json`` response."""
+
+def _user_cache_key(user_id: int) -> str:
+    return _USER_CACHE_KEY.format(user_id=user_id)
+
+
+def _serialise_user_for_cache(user) -> dict:
+    """Return the JSON-safe dict of a User row, or ``None`` if it can't be built."""
+    prefs = user.notification_prefs or {}
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "password_hash": user.password_hash,
+        "role": user.role,
+        "is_active": bool(user.is_active),
+        "notification_prefs": prefs,
+        "last_login_at": _iso(user.last_login_at),
+        "created_at": _iso(user.created_at),
+        "updated_at": _iso(user.updated_at),
+    }
+
+
+def _iso(dt) -> str | None:
+    """Render a datetime as ISO8601 (or None) for the cache."""
+    if dt is None:
+        return None
+    return dt.isoformat()
+
+
+def _cache_hit_to_user(payload: dict):
+    """Reconstruct a detached User instance from a cached payload.
+
+    Datetime fields are strings in the cache and must be re-parsed so the
+    ORM model receives proper ``datetime`` values.
+    """
+    from models.user import User
+
+    def _parse(v):
+        if v is None:
+            return None
+        try:
+            return datetime.fromisoformat(v)
+        except (TypeError, ValueError):
+            return None
+
+    return User(
+        id=payload["id"],
+        username=payload["username"],
+        email=payload["email"],
+        password_hash=payload["password_hash"],
+        role=payload["role"],
+        is_active=payload["is_active"],
+        notification_prefs=payload.get("notification_prefs") or {},
+        last_login_at=_parse(payload.get("last_login_at")),
+        created_at=_parse(payload.get("created_at")),
+        updated_at=_parse(payload.get("updated_at")),
+    )
+
+
+async def invalidate_user_cache(user_id: int) -> None:
+    """Evict the cached User row for ``user_id`` (M12).
+
+    Call after any ``is_active``/role mutation so the 30s TTL can't serve a
+    stale record. Best-effort — never raises.
+    """
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is None:
+            return
+        await client.delete(_user_cache_key(user_id))
+    except Exception:
+        logger.exception("Failed to invalidate user cache for id %d", user_id)
+
+
+async def _get_user_cached(user_id: int):
+    """Return the User for ``user_id``, via the Redis cache when possible.
+
+    On a hit, returns a detached :class:`User` reconstructed from the cache
+    (M12). On a miss it loads from the DB and populates the cache. Fails open
+    to the DB if Redis is unavailable.
+    """
+    from models.user import User
+
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is not None:
+            raw = await client.get(_user_cache_key(user_id))
+            if raw:
+                payload = json.loads(raw)
+                if payload.get("id") == user_id:
+                    return _cache_hit_to_user(payload)
+    except Exception:
+        logger.exception("User-cache read failed for id %d — falling back to DB", user_id)
+
+    from models.base import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return None
+
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is not None:
+            await client.setex(
+                _user_cache_key(user_id),
+                _USER_CACHE_TTL_S,
+                json.dumps(_serialise_user_for_cache(user)),
+            )
+    except Exception:
+        logger.exception("User-cache write failed for id %d", user_id)
+    return user
+
+
+def problem_json(status: int, title: str, detail: str | None = None):
+    """Return an RFC 7807 ``application/problem+json`` response.
+
+    L3: public (no leading underscore) — it is imported across the API
+    package, so it is part of the module's public surface.
+    """
     return jsonify(
         {
             "type": "about:blank",
@@ -43,16 +176,74 @@ def _problem_json(status: int, title: str, detail: str | None = None):
 
 
 def create_access_token(user_id: int, role: str) -> str:
-    """Create a short-lived JWT access token (HS256)."""
+    """Create a short-lived JWT access token (HS256).
+
+    The token carries a unique ``jti`` claim so it can be individually
+    revoked via the Redis blocklist (H7) — e.g. on logout or password change.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "role": role,
         "type": "access",
+        "jti": secrets.token_urlsafe(16),
         "iat": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRY_MINUTES),
     }
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+# ── Access-token revocation (H7/H16) ──────────────────────────────────────────
+# A Redis SET of revoked ``jti`` values. Each entry's TTL equals the token's
+# remaining lifetime, so the blocklist self-cleans and never grows unboundedly.
+# When Redis is unavailable the check fails *open* (matching the rate limiter's
+# documented posture): a 15-minute access token is still bounded by its expiry,
+# and revocation is best-effort rather than a hard dependency.
+
+_BLOCKLIST_KEY = "jwt:blocklist"
+
+
+async def revoke_access_token(payload: dict[str, Any]) -> None:
+    """Add a decoded access-token payload's ``jti`` to the revocation blocklist.
+
+    Safe to call with any payload shape; tokens without a ``jti`` (legacy) are
+    silently skipped. Failures are logged, never raised — revocation must not
+    break logout.
+    """
+    jti = payload.get("jti")
+    if not jti:
+        return
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is None:
+            logger.warning("Redis unavailable — access-token jti %r not blocklisted", jti)
+            return
+        exp = payload.get("exp")
+        ttl = max(int(exp - datetime.now(timezone.utc).timestamp()), 1) if exp else 3600
+        await client.sadd(_BLOCKLIST_KEY, jti)
+        # Keep the whole set alive at least as long as this entry needs to be;
+        # individual entries are pruned by _is_token_revoked's lazy cleanup.
+        await client.expire(_BLOCKLIST_KEY, max(ttl, 3600))
+    except Exception:
+        logger.exception("Failed to blocklist access-token jti %r", jti)
+
+
+async def _is_token_revoked(jti: str | None) -> bool:
+    """True when the token's ``jti`` is on the revocation blocklist."""
+    if not jti:
+        return False
+    try:
+        from api.cache import get_client
+
+        client = get_client()
+        if client is None:
+            return False
+        return bool(await client.sismember(_BLOCKLIST_KEY, jti))
+    except Exception:
+        logger.exception("Blocklist lookup failed for jti %r — failing open", jti)
+        return False
 
 
 def decode_access_token(token: str) -> dict[str, Any]:
@@ -64,7 +255,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
     payload = pyjwt.decode(
         token,
         JWT_SECRET,
-        algorithms=[JWT_ALGORITHM],
+        algorithms=[JWT_ALGORITHM],  # pinned to ["HS256"] — see H4
         options={"require": ["sub", "exp"]},
     )
     # Validate token type is explicitly "access" to prevent refresh token reuse
@@ -101,12 +292,19 @@ async def _authenticate_user() -> tuple[Any | None, Any | None]:
     is a ready-to-return RFC 7807 ``(body, status, headers)`` tuple. Shared by
     ``jwt_required`` and ``admin_required`` so both decorators are
     order-independent (M-11).
+
+    Supported scheme (M15): only ``Bearer`` (RFC 6750) is supported — a
+    request MUST send ``Authorization: Bearer <jwt>``. ``Token``/``JWT``
+    prefixes are not accepted and yield a 401. Do not add other schemes here
+    without documenting them; if a proxy ever prepends a different scheme
+    (M15), it must strip it before this handler runs. The scheme match is
+    case-insensitive (RFC 7235 / L-30).
     """
     auth = request.headers.get("Authorization", "")
     # RFC 7235 auth-scheme names are case-insensitive, so accept "bearer " too
     # (L-30).
     if not auth.lower().startswith("bearer "):
-        return None, _problem_json(
+        return None, problem_json(
             401, "Unauthorized", "Missing or malformed Authorization header"
         )
 
@@ -115,25 +313,28 @@ async def _authenticate_user() -> tuple[Any | None, Any | None]:
         payload = decode_access_token(token)
     except pyjwt.ExpiredSignatureError:
         logger.warning("Rejected expired access token")
-        return None, _problem_json(401, "Token expired", "Access token has expired")
+        return None, problem_json(401, "Token expired", "Access token has expired")
     except pyjwt.InvalidTokenError:
         logger.warning("Rejected invalid access token")
-        return None, _problem_json(401, "Invalid token", "Access token is not valid")
+        return None, problem_json(401, "Invalid token", "Access token is not valid")
+
+    # H7: reject tokens revoked via the jti blocklist (logout / password change).
+    if await _is_token_revoked(payload.get("jti")):
+        logger.warning("Rejected revoked access token (jti=%s)", payload.get("jti"))
+        return None, problem_json(401, "Invalid token", "Access token is not valid")
 
     user_id: int = payload.get("sub")
 
-    from models.base import AsyncSessionLocal
-    from models.user import User
-
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, user_id)
-        if user is None or not user.is_active:
-            # Return the same generic detail as an invalid token so a caller
-            # cannot learn whether the account was deactivated (N-11; L-26 class).
-            return None, _problem_json(
-                401, "Unauthorized", "Access token is not valid"
-            )
-        return user, None
+    # M12: hit the short-TTL Redis cache for the common case, falling back to
+    # the DB on a miss or Redis outage.
+    user = await _get_user_cached(user_id)
+    if user is None or not user.is_active:
+        # Return the same generic detail as an invalid token so a caller
+        # cannot learn whether the account was deactivated (N-11; L-26 class).
+        return None, problem_json(
+            401, "Unauthorized", "Access token is not valid"
+        )
+    return user, None
 
 
 def jwt_required(f: Callable) -> Callable:
@@ -173,7 +374,7 @@ def admin_required(f: Callable) -> Callable:
                 return error
             g.current_user = user
         if user.role != "admin":
-            return _problem_json(403, "Forbidden", "Admin privileges are required")
+            return problem_json(403, "Forbidden", "Admin privileges are required")
         return await f(*args, **kwargs)
 
     return decorated

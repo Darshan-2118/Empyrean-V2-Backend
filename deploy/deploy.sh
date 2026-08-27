@@ -46,7 +46,6 @@ DOMAIN="$2"
 
 sudo install -m 0644 "$APP_DIR"/deploy/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now quart-api celery-worker celery-beat
 
 # Configure Nginx if DOMAIN is provided
 if [ -n "$DOMAIN" ] && [ -f "$APP_DIR/deploy/nginx.conf" ]; then
@@ -74,12 +73,24 @@ else
 fi
 REMOTE
 
-# --- Migrations ---
+# --- Stop services → migrate → start (M72 + L50) ---
+# The old order enabled/started the units BEFORE migrating, so a failed
+# migration left new code serving on a half-applied schema — and already-
+# running services were never restarted, so "deployed" code was not loaded.
+# Now: stop whatever is running, apply the schema, then (re)start everything
+# on the new code. A migration failure leaves the old state stopped, not
+# half-migrated-and-serving.
 ssh "$SERVER_USER@$SERVER_HOST" bash -s -- "$APP_DIR" <<'REMOTE'
 set -e
 APP_DIR="$1"
+
+sudo systemctl enable quart-api celery-worker celery-beat
+sudo systemctl stop quart-api celery-worker celery-beat || true
+
 cd "$APP_DIR"
 "$APP_DIR/venv/bin/alembic" upgrade head
+
+sudo systemctl restart quart-api celery-worker celery-beat
 REMOTE
 
-echo "[deploy] SUCCESS — code, deps, systemd units, and migrations are live"
+echo "[deploy] SUCCESS — code, deps, migrations, and systemd services are live"

@@ -20,7 +20,7 @@ from sqlalchemy.exc import ProgrammingError
 
 from api._time import parse_iso_datetime
 from api.cache import cache_get_json, cache_set_json
-from api.jwt import _problem_json, jwt_required
+from api.jwt import problem_json, jwt_required
 from api.rate_limit import rate_limit
 from api.schemas import HistoryBucket, LatestReading
 from models import Node, SensorReading
@@ -146,7 +146,7 @@ async def history():
     """
     bucket = request.args.get("bucket", "1h")
     if bucket not in _BUCKET_INTERVALS:
-        return _problem_json(
+        return problem_json(
             422,
             "Unprocessable Entity",
             f"bucket must be one of: {', '.join(_BUCKET_INTERVALS)}",
@@ -159,10 +159,10 @@ async def history():
         )
         to_dt = parse_iso_datetime(request.args.get("to"), default=now)
     except ValueError as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+        return problem_json(422, "Unprocessable Entity", str(exc))
 
     if from_dt >= to_dt:
-        return _problem_json(
+        return problem_json(
             422, "Unprocessable Entity", "'from' must be earlier than 'to'"
         )
 
@@ -170,15 +170,27 @@ async def history():
     # exploding into millions of buckets. Keep the *most recent* segment of the
     # requested range (rolling ``from`` forward) so the response still reflects
     # the latest history the client asked about.
+    clamped = False
     max_span = _BUCKET_MAX_SPAN[bucket]
     if to_dt - from_dt > max_span:
         from_dt = to_dt - max_span
+        clamped = True
         logger.warning(
             "history range exceeds %s for bucket=%s — clamped from to %s",
             max_span, bucket, from_dt.isoformat(),
         )
 
-    node_id = request.args.get("node_id") or None
+    node_id = request.args.get("node_id")
+    # M35: an explicit ``?node_id=`` (empty) used to coerce to None = "all
+    # nodes" — a silent footgun. Reject it; omitting the parameter entirely
+    # still means all nodes.
+    if node_id is not None and not node_id.strip():
+        return problem_json(
+            422,
+            "Unprocessable Entity",
+            "node_id must not be empty when provided (omit the parameter for all nodes)",
+        )
+    node_id = node_id or None
 
     where = "time >= :from_ts AND time <= :to_ts"
     params: dict = {"from_ts": from_dt, "to_ts": to_dt}
@@ -220,7 +232,7 @@ async def history():
                     "/readings/history failed: TimescaleDB extension missing — %s",
                     exc,
                 )
-                return _problem_json(
+                return problem_json(
                     503,
                     "Service Unavailable",
                     "History requires the TimescaleDB extension (time_bucket). "
@@ -230,4 +242,12 @@ async def history():
             raise
 
     buckets = [_history_from_row(row) for row in rows]
-    return jsonify({"buckets": buckets}), 200
+    response = jsonify({"buckets": buckets})
+    if clamped:
+        # M24: the range was silently clipped forward before — the client
+        # got different data than requested with no signal. The header names
+        # the effective (clamped) lower bound actually served.
+        response.headers["X-Range-Clamped"] = (
+            f"from={from_dt.isoformat().replace('+00:00', 'Z')}"
+        )
+    return response, 200

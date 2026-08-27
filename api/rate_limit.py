@@ -12,7 +12,9 @@ wrapped endpoint carries
 ``X-RateLimit-Limit`` / ``X-RateLimit-Remaining`` / ``X-RateLimit-Reset``.
 
 If Redis is unreachable the decorator **fails open** — the request is allowed
-(and still gets headers) rather than blocking the API. When failing open, a
+rather than blocking the API, and the response carries the usual
+``X-RateLimit-*`` headers **plus** ``X-RateLimit-Bypass: true`` (M19) so the
+numbers are never mistaken for an active limit. When failing open, a
 WARNING is logged and a counter is incremented so `/admin/health` can report
 rate-limit bypass state (#03).
 """
@@ -24,22 +26,23 @@ import time
 from datetime import datetime, timezone
 from functools import wraps
 from threading import Lock
-from typing import Any, Callable, Dict, Tuple, Optional
+from typing import Any, Callable
 
 from quart import request
 
 from api.cache import get_client
-from api.jwt import _problem_json
+from api.jwt import problem_json
 
 logger = logging.getLogger("empyrean.ratelimit")
 
 DEFAULT_LIMIT = 200
 DEFAULT_WINDOW_SECONDS = 60
 
-# In-memory fallback for when Redis is unavailable
-# Structure: {key: (count, window_start_time)}
-_in_memory_cache: Dict[str, Tuple[int, float]] = {}
-_in_memory_lock = Lock()
+# M17: there is deliberately NO in-memory fallback limiter. The old
+# ``_in_memory_cache`` dict was never populated, so a Redis outage silently
+# meant no rate limit while the docstrings claimed a working per-process
+# fallback. The dead dict is removed; the limiter now fails open honestly and
+# reports the degraded state via the bypass counter / /admin/health.
 
 # Track rate-limit bypass events (#03 — observability)
 # Incremented when Redis unavailable or errors; checked by /admin/health
@@ -50,19 +53,19 @@ _bypass_events_lock = Lock()
 def is_rate_limit_available() -> bool:
     """True when the distributed (Redis-backed) limiter is usable.
 
-    False means the decorator is failing open to the per-process in-memory
-    fallback (#03) — still protective per-instance, but not a shared limit. Used
-    by ``GET /admin/health`` to surface rate-limit state.
+    False means the decorator is failing open with **no** rate limiting
+    (M17 — the old in-memory fallback was dead and is removed), so requests
+    are unthrottled. Used by ``GET /admin/health`` to surface rate-limit state.
     """
     return get_client() is not None
 
 
 def get_rate_limit_bypass_count() -> int:
     """Return the count of rate-limit bypass events since app startup.
-    
+
     Used by /admin/health (#03) to surface when Redis has been unavailable,
-    triggering the fail-open fallback path. A non-zero count indicates the
-    rate-limiter was not working as designed (single shared limit).
+    putting the limiter into its fail-open state (M17). A non-zero count
+    indicates rate limiting was off for a period.
     """
     with _bypass_events_lock:
         return _bypass_events
@@ -70,9 +73,10 @@ def get_rate_limit_bypass_count() -> int:
 
 def _increment_bypass_counter() -> None:
     """Increment the rate-limit bypass counter (#03).
-    
-    Called when Redis is unavailable or errored, triggering the in-memory
-    fallback. Provides observability into when rate-limiting has degraded.
+
+    Called when Redis is unavailable or errored. Since M17 removed the dead
+    in-memory fallback, a bypass means rate limiting is genuinely off for this
+    process — the counter gives /admin/health observability into that.
     """
     global _bypass_events
     with _bypass_events_lock:
@@ -80,15 +84,31 @@ def _increment_bypass_counter() -> None:
 
 
 def _client_ip() -> str:
-    """Client IP for rate limiting — ``request.remote_addr`` only (H-5).
+    """Client IP for rate limiting (H12/H31).
 
-    A client-supplied ``X-Forwarded-For`` header is never trusted: honoring its
-    first entry lets an attacker mint a fresh bucket per request (bypassing the
-    limit) and poison a victim's bucket (DoS). If the API sits behind a trusted
-    proxy, terminate the client IP at that trusted layer (e.g. PROXY protocol)
-    and configure the proxy, not this code, to set a trusted header.
+    By default only ``request.remote_addr`` is used: a client-supplied
+    ``X-Forwarded-For`` header is never trusted, since honoring its first entry
+    lets an attacker mint a fresh bucket per request and poison a victim's
+    bucket.
+
+    When ``TRUST_PROXY_HEADERS`` is enabled in config, the ``X-Real-IP`` header
+    set by the *trusted* reverse proxy (deploy/nginx.conf) is honored instead —
+    otherwise every proxied request shares the proxy's address (e.g.
+    ``127.0.0.1``) and one user can exhaust the single shared bucket for
+    everyone. Only enable this when the API is not directly reachable.
     """
+    if _trust_proxy():
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
     return request.remote_addr or "unknown"
+
+
+def _trust_proxy() -> bool:
+    """Read the TRUST_PROXY_HEADERS flag lazily so tests can repoint config."""
+    from config import get_config
+
+    return get_config().TRUST_PROXY_HEADERS
 
 
 def _rate_limit_key(ip: str, now: datetime) -> str:
@@ -100,6 +120,13 @@ def _rate_limit_key(ip: str, now: datetime) -> str:
     whole budget and deny all other endpoints on that IP. ``request.endpoint``
     is populated for any request that matched a route; a literal ``default``
     scope keeps the key stable if it is ever missing.
+
+    Granularity (M16): the bucket is keyed on the **view-function name**, NOT
+    the URL path. A single handler that serves many sub-paths (e.g. a
+    ``/<node_id>`` route) therefore shares one bucket across all of those
+    paths for a given IP. This is intentional — a per-path bucket would let a
+    client mint unbounded buckets. If per-path isolation is ever needed, add a
+    separate, bounded path key rather than widening this one.
     """
     endpoint = request.endpoint or "default"
     minute = now.strftime("%Y%m%d%H%M")
@@ -111,18 +138,30 @@ def _reset_epoch(now: datetime) -> int:
     return int(now.timestamp()) + (60 - now.second)
 
 
-def _rate_headers(limit: int, remaining: int, reset_ts: int) -> dict[str, str]:
-    """Build the ``X-RateLimit-*`` response headers."""
-    return {
+def _rate_headers(
+    limit: int, remaining: int, reset_ts: int, bypass: bool = False
+) -> dict[str, str]:
+    """Build the ``X-RateLimit-*`` response headers.
+
+    M19: fail-open responses carry ``X-RateLimit-Bypass: true`` so the
+    limit/remaining values are never mistaken for an active limit — without
+    the label, a bypassed response looked identical to an unconsumed bucket.
+    """
+    headers = {
         "X-RateLimit-Limit": str(limit),
         "X-RateLimit-Remaining": str(max(remaining, 0)),
         "X-RateLimit-Reset": str(reset_ts),
     }
+    if bypass:
+        headers["X-RateLimit-Bypass"] = "true"
+    return headers
 
 
-def _with_headers(result: Any, limit: int, remaining: int, reset_ts: int) -> Any:
+def _with_headers(
+    result: Any, limit: int, remaining: int, reset_ts: int, bypass: bool = False
+) -> Any:
     """Attach rate-limit headers to a Quart response or ``(body, status[, headers])`` tuple."""
-    headers = _rate_headers(limit, remaining, reset_ts)
+    headers = _rate_headers(limit, remaining, reset_ts, bypass)
     if isinstance(result, tuple):
         if len(result) == 3:
             body, status, existing = result
@@ -167,9 +206,12 @@ async def _incr(client, key: str, window_seconds: int) -> int | None:
 def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> Callable:
     """Enforce a per-IP fixed-window request limit.
 
-    On breach returns an RFC 7807 ``429 Too Many Requests``. When Redis is unavailable,
-    falls back to an in-memory counter to avoid failing open. Attaches
-    ``X-RateLimit-*`` headers to every response.
+    On breach returns an RFC 7807 ``429 Too Many Requests``. When Redis is
+    unavailable the limiter **fails open** (M17): there is deliberately no
+    in-memory fallback dict (the old one was dead, never populated), so a
+    Redis outage means no shared rate limit rather than a silently ineffective
+    one. ``/admin/health`` reports this degraded state via the bypass counter.
+    Attaches ``X-RateLimit-*`` headers to every response.
     """
 
     def decorator(f: Callable) -> Callable:
@@ -188,7 +230,7 @@ def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_
                     if count > limit:
                         logger.warning("Rate limit exceeded for IP %s (%s/%s)", ip, count, limit)
                         return _with_headers(
-                            _problem_json(
+                            problem_json(
                                 429, "Too Many Requests", "Rate limit exceeded. Please slow down."
                             ),
                             limit,
@@ -196,15 +238,16 @@ def rate_limit(limit: int = DEFAULT_LIMIT, window_seconds: int = DEFAULT_WINDOW_
                             reset_ts,
                         )
                     return _with_headers(await f(*args, **kwargs), limit, limit - count, reset_ts)
-                # Redis error -> fail open
+                # Redis INCR errored -> fail open (M17): no unreliable fallback.
                 logger.warning("Redis rate-limit INCR failed for %r — failing open", key)
                 _increment_bypass_counter()
             else:
-                # Redis client unavailable -> fail open
+                # Redis client unavailable -> fail open (M17).
                 _increment_bypass_counter()
 
-            # Fail open: allow request through with headers
-            return _with_headers(await f(*args, **kwargs), limit, limit, reset_ts)
+            # Fail open: allow request through with headers, labelled as a
+            # bypass (M19) so clients can tell no limit was enforced.
+            return _with_headers(await f(*args, **kwargs), limit, limit, reset_ts, bypass=True)
 
         return decorated
 

@@ -38,3 +38,27 @@ async def test_health_then_metrics():
         assert "empyrean_http_requests_total" in body
         assert 'status="200"' in body
         assert 'route="/health"' in body
+
+
+@pytest.mark.asyncio
+async def test_unmatched_route_uses_bounded_unknown_sentinel():
+    """M33: a request that matches no route is labelled ``route="unknown"``.
+
+    The sentinel keeps the label set bounded — pinning it here means a refactor
+    that starts labelling 404s with the raw request path (a client-controlled
+    cardinality blowup) cannot sneak back in.
+    """
+    from api.metrics import register_metrics
+
+    app = create_app()
+    register_metrics(app)
+
+    async with app.test_client() as client:
+        miss = await client.get("/definitely-not-a-route-m33")
+        assert miss.status_code == 404
+
+        metrics = await client.get("/metrics")
+        body = (await metrics.get_data()).decode()
+        assert 'route="unknown"' in body
+        # The raw path must never become a series label.
+        assert "/definitely-not-a-route-m33" not in body

@@ -23,6 +23,7 @@ This document covers the environment variables the Empyrean backend reads at sta
 | `APP_ENV` | `development` | Environment: `development` or `production` |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG/INFO/WARNING/ERROR/CRITICAL) |
 | `SECRET_KEY` | `<256-bit random>` | Application secret key |
+| `OTLP_ENDPOINT` | _(unset)_ | Optional OTLP gRPC endpoint (e.g. `http://localhost:4317`). When unset, OpenTelemetry span export is disabled and no per-request span JSON is written to stdout. |
 
 ## Services (single-system deployment)
 
