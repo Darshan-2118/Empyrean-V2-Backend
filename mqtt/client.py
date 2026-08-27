@@ -28,6 +28,7 @@ import json
 import logging
 import queue
 import re
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -54,6 +55,9 @@ _QOS = 1
 # Fixed client id + persistent session (clean_session=False, L-20): offline
 # delivery of queued QoS1 device messages is honored, consistent with the
 # at-least-once contract and the M-8 bounded-queue/retry durability path.
+# H36: this legacy constant is only a *prefix* now — the runtime id appends
+# the hostname (or uses MQTT_CLIENT_ID) so two API hosts / a dev instance
+# against the prod broker never fight over one broker session.
 _CLIENT_ID = "empyrean-backend"
 
 # Worker-queue backpressure bounds (I-35): configurable via config/__init__.py
@@ -118,6 +122,27 @@ def _increment_queue_overflow() -> None:
     global _queue_overflow_count
     with _queue_overflow_lock:
         _queue_overflow_count += 1
+
+
+# M39: per-node inbound rate bound. A flooding (or broken) node used to fill
+# the worker queue with payloads that each cost json.loads + pydantic
+# validation with no bound. Devices report on a ~30 s cadence, so anything
+# above this per-node frequency is excess and is dropped before it reaches
+# the worker queue. Keyed by topic-validated node ids (bounded fleet).
+_NODE_MSG_MIN_INTERVAL_S = 0.5
+_node_last_seen: dict[str, float] = {}
+_node_last_seen_lock = threading.Lock()
+
+
+def _node_rate_limited(node_id: str) -> bool:
+    """True when *node_id* sent a message less than the min interval ago (M39)."""
+    now = time.monotonic()
+    with _node_last_seen_lock:
+        last = _node_last_seen.get(node_id)
+        if last is not None and now - last < _NODE_MSG_MIN_INTERVAL_S:
+            return True
+        _node_last_seen[node_id] = now
+        return False
 
 
 def _resolve_payload(data: bytes | str) -> str | None:
@@ -266,17 +291,33 @@ class MQTTClient:
         self._worker_thread: threading.Thread | None = None
         self._pending_subs: dict[int, str] = {}  # mid -> topic (L-23)
         self._ready = False  # True once both reading and status subscriptions are granted
-        self._subscriptions_complete = 0  # Track progress toward both subscriptions
+        # M36: readiness is tracked by *which* required topics have been
+        # granted, not by a SUBACK counter — a counter let an unusual grant
+        # order (e.g. reading + alerts first) mark the client ready without
+        # the status topic ever being subscribed.
+        self._granted_topics: set[str] = set()
         self._tls_configured = False  # True only after tls_set() succeeds (H-4)
 
+        # H36: unique-per-host session id. An explicit MQTT_CLIENT_ID wins;
+        # otherwise derive from the hostname so a second backend host (or a
+        # dev instance pointed at the same broker) gets its own session rather
+        # than triggering an endless CONNECT-takeover loop with this one.
+        # getattr (not attribute access) so test stubs and minimal cfg objects
+        # without this newer field keep working.
+        resolved_client_id = (
+            getattr(self._cfg, "MQTT_CLIENT_ID", "")
+            or f"{_CLIENT_ID}-{socket.gethostname().lower()}"
+        )
+
         self._client = mqtt.Client(
-            client_id=_CLIENT_ID,
+            client_id=resolved_client_id,
             clean_session=False,
             protocol=mqtt.MQTTv311,
         )
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._client.on_subscribe = self._on_subscribe
+        self._client.on_disconnect = self._on_disconnect
         self._client.reconnect_delay_set(min_delay=1, max_delay=60)
 
         if self._cfg.MQTT_USE_TLS:
@@ -350,7 +391,8 @@ class MQTTClient:
         the authoritative check.
 
         Only sets `_ready=True` after BOTH required subscriptions
-        (reading + status) are successfully granted.
+        (reading + status) are successfully granted — tracked by topic name,
+        never by SUBACK arrival order (M36).
         """
         topic = self._pending_subs.pop(mid, None)
         granted = granted_qos[0] if granted_qos else None
@@ -363,29 +405,40 @@ class MQTTClient:
             )
             return
 
-        # Track successful subscriptions
-        self._subscriptions_complete += 1
+        self._granted_topics.add(topic)
 
-        # Only mark ready after both required subscriptions succeed
-        # (reading and status — alerts is optional from a readiness perspective)
-        if topic in (_READING_TOPIC, _STATUS_TOPIC):
-            if self._subscriptions_complete == 2:
+        if {_READING_TOPIC, _STATUS_TOPIC} <= self._granted_topics:
+            if not self._ready:
                 self._ready = True
                 logger.info(
                     "MQTT client ready — both required topics subscribed: "
                     "%s, %s @ granted QoS %s", _READING_TOPIC, _STATUS_TOPIC, granted
                 )
-            else:
-                logger.info(
-                    "Subscribed to %s @ granted QoS %s (%d/2 required)",
-                    topic, granted, self._subscriptions_complete
-                )
+        elif topic in (_READING_TOPIC, _STATUS_TOPIC):
+            logger.info(
+                "Subscribed to %s @ granted QoS %s (%d/2 required)",
+                topic, granted, len(self._granted_topics & {_READING_TOPIC, _STATUS_TOPIC}),
+            )
         else:
-            # Alerts subscription completes the count but doesn't trigger ready state
+            # Alerts subscription is optional from a readiness perspective.
             logger.info(
                 "Alerts subscription granted @ QoS %s (ready check uses reading/status)",
                 granted
             )
+
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        """Reset subscription/readiness state when the broker connection drops.
+
+        M88: ``_ready`` used to survive disconnects, so one good session made
+        readiness permanent across broker loss. L23: ``_pending_subs`` is
+        cleared too — mids from the lost session can never match SUBACKs after
+        a reconnect (``_on_connect`` re-subscribes and re-registers them).
+        """
+        if rc != 0:
+            logger.warning("Unexpected MQTT disconnect (rc=%s) — readiness reset", rc)
+        self._ready = False
+        self._granted_topics.clear()
+        self._pending_subs.clear()
 
     def _on_message(self, client, userdata, msg) -> None:
         """Decode + route on the paho loop; heavier work goes to the worker."""
@@ -412,7 +465,15 @@ class MQTTClient:
                     msg.topic
                 )
                 return
-            
+
+            # M39: bound per-node inbound cadence before the worker queue so
+            # a flooding node can't force unbounded parse/validate cost.
+            if _node_rate_limited(node_id):
+                logger.debug(
+                    "Rate-limiting inbound %s for node %r (M39)", match.group("kind"), node_id
+                )
+                return
+
             self._enqueue(node_id, match.group("kind"), raw)
         except Exception:
             logger.exception("Unhandled error in on_message for %r", msg.topic)
@@ -423,6 +484,10 @@ class MQTTClient:
         A transiently-full queue is retried so a slow worker doesn't force drops,
         but a persistently-full queue (worker can't keep up) drops with a
         warning rather than blocking the paho loop (M-9).
+
+        M37: a drop here also increments the queue-overflow counter — it used
+        to be logged-only, so ``get_queue_overflow_count()`` stayed 0 forever
+        and /admin/health could never surface backpressure data loss.
         """
         for attempt in range(_ENQUEUE_MAX_ATTEMPTS):
             try:
@@ -435,6 +500,7 @@ class MQTTClient:
             kind,
             node_id,
         )
+        _increment_queue_overflow()
 
     def _run_worker(self) -> None:
         """Consume the dispatch queue on a dedicated thread (M-9)."""
@@ -568,6 +634,17 @@ class MQTTClient:
         connection status rather than "has ever connected".
         """
         return bool(self._client.is_connected())
+
+    def publish(self, topic: str, payload=None, qos: int = 0, retain: bool = False):
+        """Delegate a publish to the underlying paho client (H34).
+
+        ``mqtt.registry`` hands **this wrapper** to API code; without this
+        delegation, ``mqtt.config.publish_config(client, …)`` raised
+        ``AttributeError`` on every call and each PATCH ``/nodes/:node_id``
+        config push silently failed (``config_pushed: false`` forever).
+        Thread-safe: paho's ``Client.publish`` may be called from any thread.
+        """
+        return self._client.publish(topic, payload=payload, qos=qos, retain=retain)
 
 
 def main() -> None:

@@ -31,6 +31,7 @@ import asyncio
 import csv
 import io
 import logging
+import time
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime, timedelta, timezone
 
@@ -38,7 +39,7 @@ from quart import Blueprint, Response, request
 from sqlalchemy import select
 
 from api._time import parse_iso_datetime
-from api.jwt import _problem_json, jwt_required
+from api.jwt import problem_json, jwt_required
 from api.rate_limit import rate_limit
 from models import SensorReading
 from models.base import AsyncSessionLocal
@@ -66,10 +67,53 @@ _CHUNK_BYTES = 64 * 1024
 MAX_CONCURRENT_EXPORTS = 4
 _exports_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXPORTS)
 
-# Per-export timeout in seconds. Prevents slow-client DoS attack where a
-# client opens an export and holds the connection indefinitely. This timeout
-# applies to the entire export stream, not individual chunks (#5).
-MAX_EXPORT_TIMEOUT = 300  # 5 minutes
+# M31: per-export timeout now lives in config (EXPORT_TIMEOUT_SECONDS,
+# default 300 s / 5 minutes). Prevents slow-client DoS where a client opens
+# an export and holds the connection indefinitely. The timeout applies to
+# the entire export stream, not individual chunks (#5).
+
+
+def _export_timeout_s() -> int:
+    """Resolve the whole-stream export timeout from config (M31)."""
+    from config import get_config
+
+    return get_config().EXPORT_TIMEOUT_SECONDS
+
+# H18: per-user cooldown between exports (seconds). A full-year export can
+# return hundreds of MB; without this an authenticated account could pull the
+# entire dataset every minute (the IP rate limit alone allows 200/min).
+# Keyed by user id in Redis with a TTL, so it is shared across workers.
+_EXPORT_COOLDOWN_KEY = "export:cooldown:{user_id}"
+
+
+async def _check_export_cooldown(user_id: int) -> int | None:
+    """Claim the per-user export slot, returning remaining seconds on breach.
+
+    Uses a Redis SET NX + EXPIRE so only one export may start per cooldown
+    window per user. Returns ``None`` when the export may proceed, or the
+    number of seconds until the user may export again. Fails open when Redis
+    is unavailable (consistent with the rate limiter's documented posture).
+    """
+    from api.cache import get_client
+    from config import get_config
+
+    cooldown = get_config().EXPORT_COOLDOWN_SECONDS
+    if cooldown <= 0:
+        return None
+    client = get_client()
+    if client is None:
+        return None
+    try:
+        key = _EXPORT_COOLDOWN_KEY.format(user_id=user_id)
+        # SET with NX: succeeds only if no unexpired claim exists.
+        claimed = await client.set(key, "1", ex=cooldown, nx=True)
+        if claimed:
+            return None
+        ttl = await client.ttl(key)
+        return max(int(ttl), 1)
+    except Exception:
+        logger.warning("Export cooldown check failed — failing open", exc_info=True)
+        return None
 
 # The 15 SensorReading columns in model order; the header row uses these names.
 _CSV_COLUMNS = [
@@ -126,31 +170,53 @@ def _format_row(r: SensorReading) -> list[str]:
     ]
 
 
+def _render_csv_header() -> str:
+    """Render the CSV header row exactly once (L18)."""
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\r\n").writerow(_CSV_COLUMNS)
+    return out.getvalue()
+
+
+_CSV_HEADER = _render_csv_header()
+
+# M83: trailer emitted when a stream is cut by the export timeout, so a
+# truncated CSV is never indistinguishable from a complete one. The leading
+# ``#`` makes it an obvious sentinel for humans and a loudly malformed row
+# for strict parsers (1 cell vs 15).
+_TRUNCATED_SENTINEL = "# TRUNCATED: export exceeded the server timeout — data is INCOMPLETE"
+
+
 async def _csv_chunks(rows: AsyncIterable[SensorReading]) -> AsyncIterator[str]:
     """Yield the CSV body in ~64KB chunks, header first.
 
     DB-free and directly unit-testable: ``rows`` is any async iterable of
     objects exposing the 15 SensorReading attributes.
-    
-    Enforces MAX_EXPORT_TIMEOUT to prevent slow-client DoS (#5).
+
+    Enforces the configured export timeout to prevent slow-client DoS (#5).
+    On timeout the partial buffer is flushed **plus** a sentinel trailer row
+    (M83) so clients can tell the file was cut.
     """
-    import time
     start_time = time.time()
-    
+    timeout_s = _export_timeout_s()
+
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\r\n")
-    writer.writerow(_CSV_COLUMNS)
+    out.write(_CSV_HEADER)
     async for row in rows:
         # Check timeout on each row iteration
         elapsed = time.time() - start_time
-        if elapsed > MAX_EXPORT_TIMEOUT:
+        if elapsed > timeout_s:
             logger.warning(
                 "Export timeout exceeded after %.1f seconds, terminating stream",
                 elapsed
             )
             yield out.getvalue()
+            out.seek(0)
+            out.truncate(0)
+            writer.writerow([_TRUNCATED_SENTINEL])
+            yield out.getvalue()
             return
-        
+
         writer.writerow(_format_row(row))
         if out.tell() >= _CHUNK_BYTES:
             yield out.getvalue()
@@ -209,21 +275,34 @@ async def export():
         )
         to_dt = parse_iso_datetime(request.args.get("to"), default=now)
     except ValueError as exc:
-        return _problem_json(422, "Unprocessable Entity", str(exc))
+        return problem_json(422, "Unprocessable Entity", str(exc))
 
     if from_dt >= to_dt:
-        return _problem_json(
+        return problem_json(
             422, "Unprocessable Entity", "'from' must be earlier than 'to'"
         )
 
     if to_dt - from_dt > MAX_EXPORT_SPAN:
-        return _problem_json(
+        return problem_json(
             422,
             "Unprocessable Entity",
             f"range exceeds the maximum export span of {MAX_EXPORT_SPAN.days} days",
         )
 
     node_id = request.args.get("node_id") or None
+
+    # H18: per-user throttle — one export per EXPORT_COOLDOWN_SECONDS.
+    from quart import g
+
+    user = getattr(g, "current_user", None)
+    if user is not None:
+        retry_after = await _check_export_cooldown(user.id)
+        if retry_after is not None:
+            return problem_json(
+                429,
+                "Too Many Requests",
+                f"Export already requested — retry in {retry_after} seconds",
+            )
 
     csv_chunks = _csv_chunks(_stream_rows(from_dt, to_dt, node_id))
     filename = (

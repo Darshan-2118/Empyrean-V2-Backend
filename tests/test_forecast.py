@@ -114,7 +114,7 @@ def test_retrain_model_invalidates_served_forecast(monkeypatch):
         "_fit_model",
         lambda points: {"slope": 2.0, "intercept": -5.0, "trained_at": "2026-08-05T00:00:00Z"},
     )
-    monkeypatch.setattr(fc, "_training_points", lambda node_id: [(float(i), float(i)) for i in range(40)])
+    monkeypatch.setattr(fc, "_training_points_bulk", lambda node_ids: {"N": [(float(i), float(i)) for i in range(40)]})
     monkeypatch.setattr(fc, "get_sync_db", lambda: _FakeDB())
 
     result = fc.retrain_model()

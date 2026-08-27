@@ -24,8 +24,11 @@ class RefreshToken(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
+    # M63: the value is always a 64-char SHA-256 hex digest (see
+    # api.jwt.generate_refresh_token) — the old String(255) over-allocated
+    # the index by ~4x for no benefit.
     token_hash: Mapped[str] = mapped_column(
-        String(255), nullable=False, index=True,
+        String(64), nullable=False, index=True,
     )
     expires_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, index=True,

@@ -172,7 +172,12 @@ def test_readings_latest_read_through_and_write_back(monkeypatch):
 
 
 def test_forecast_serves_from_cache(monkeypatch):
-    """Forecast honors ``celery:forecast:{node_id}`` and skips computation on a hit."""
+    """Forecast honors the versioned cache key and skips computation on a hit.
+
+    M50 contract: the served key is ``celery:forecast:{node_id}:{version}``
+    where ``version`` is the current model's ``trained_at`` stamp, so the
+    test seeds both the model blob and the matching versioned forecast.
+    """
     fake = FakeRedis()
     monkeypatch.setattr("api.cache.get_client", lambda: fake)
     node_id = _unique("CACHEFC")
@@ -185,7 +190,12 @@ def test_forecast_serves_from_cache(monkeypatch):
         headers = _auth_headers(create_access_token(user.id, user.role))
         # A distinctive aqi the on-the-fly generator could not produce from an
         # empty node — presence proves the cached points were served verbatim.
-        fake.data[f"celery:forecast:{node_id}"] = json.dumps(
+        trained_at = "2026-08-11T00:00:00Z"
+        fake.data[f"forecast:model:{node_id}"] = json.dumps(
+            {"slope": 0.0, "intercept": 123.0, "trained_at": trained_at}
+        )
+        versioned_key = f"celery:forecast:{node_id}:{trained_at}"
+        fake.data[versioned_key] = json.dumps(
             [{"time": "2026-08-11T00:00:00Z", "aqi": 123}]
         )
 
@@ -198,7 +208,7 @@ def test_forecast_serves_from_cache(monkeypatch):
             assert len(body["points"]) == 1
             assert body["points"][0]["aqi"] == 123
             # The cached key was NOT rewritten (a hit is read-only).
-            assert json.loads(fake.data[f"celery:forecast:{node_id}"])[0]["aqi"] == 123
+            assert json.loads(fake.data[versioned_key])[0]["aqi"] == 123
 
     try:
         _run(scenario())

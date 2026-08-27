@@ -64,6 +64,10 @@ def _stamp_beat_heartbeat() -> None:
     with a 1h TTL; ``GET /admin/health`` reports ``celery_beat`` healthy while
     the stamp is fresh (≤ 3× the schedule interval). Fail-soft: no client or a
     write error ⇒ warn and continue — a dead Redis must not fail the task.
+
+    L27: stamped at the END of the task, not at the start — a slow Redis (or a
+    task that dies mid-run) must not advertise a heartbeat for work that has
+    not actually completed.
     """
     client = get_sync_redis()
     if client is None:
@@ -145,9 +149,12 @@ def _upsert_alert(
     new_severity_rank = severity_rank_map.get(severity, 0)
     
     # Build the ON CONFLICT DO UPDATE with severity comparison in the WHERE clause
-    # This ensures only higher-severity alerts replace existing ones
+    # This ensures only higher-severity alerts replace existing ones.
+    # H24: the new rank comes from the fixed Python map above and is int()-cast
+    # before interpolation, so the SQL fragment can only ever embed a numeric
+    # literal — even if a future caller passes user-controlled severity text.
     existing_rank = _SEVERITY_RANK_SQL.format(table="alerts")
-    new_rank = _SEVERITY_RANK_SQL.format(table="EXCLUDED")
+    new_rank_value = int(severity_rank_map.get(severity, 0))
     stmt = (
         pg_insert(Alert)
         .values(
@@ -168,7 +175,7 @@ def _upsert_alert(
                 "message": message,
                 "triggered_at": datetime.now(timezone.utc),
             },
-            where=text(f"{existing_rank} < {new_rank}"),
+            where=text(f"{existing_rank} < {new_rank_value}"),
         )
     )
     result = session.execute(stmt)
@@ -197,14 +204,21 @@ def _alert_email(session) -> str | None:
     return None
 
 
-def _send_alert_email(recipient: str, node_id: str, aqi: float, severity: str, message: str) -> None:
-    """Send a critical-breached alert email, fail-soft (#11).
+def _send_alert_emails(
+    recipient: str, alerts: list[tuple[str, float, str, str]]
+) -> None:
+    """Send all critical-breach alert emails over ONE SMTP connection (M52).
 
-    Reads SMTP transport from config. Any failure (unconfigured, auth error,
-    network) is logged and swallowed so a beat task can never fail on email —
-    the alert row and MQTT/WS broadcasts are committed independently.
+    ``alerts`` is a list of ``(node_id, aqi, severity, message)`` tuples. The
+    old per-alert helper opened a fresh SMTP connection for each message —
+    10 connects/min worst case with a noisy fleet; now one connection per beat
+    run carries every message. Fail-soft (#11): any failure (unconfigured,
+    auth error, network) is logged and swallowed so a beat task can never fail
+    on email — the alert rows and MQTT/WS broadcasts are committed
+    independently. A single message that fails mid-session is skipped without
+    aborting the rest.
     """
-    if not recipient:
+    if not recipient or not alerts:
         return
     host, port, user, password, sender, use_tls = (
         cfg.SMTP_HOST,
@@ -215,31 +229,44 @@ def _send_alert_email(recipient: str, node_id: str, aqi: float, severity: str, m
         cfg.SMTP_USE_TLS,
     )
     if not host:
-        logger.debug("SMTP_HOST not configured — skipping email alert for %s", node_id)
+        logger.debug(
+            "SMTP_HOST not configured — skipping %d email alert(s)", len(alerts)
+        )
         return
     try:
-        msg = EmailMessage()
-        msg["Subject"] = f"[Empyrean] {severity.title()} AQI alert — node {node_id}"
-        msg["From"] = sender
-        msg["To"] = recipient
-        msg.set_content(
-            f"AQI threshold breach on node {node_id}.\n\n"
-            f"Severity: {severity}\n"
-            f"AQI: {aqi:.0f}\n"
-            f"{message}\n\n"
-            f"Generated at {datetime.now(timezone.utc).isoformat()}"
-        )
         with smtplib.SMTP(host, port, timeout=10) as smtp:
             if use_tls:
                 smtp.starttls()
             if user:
                 smtp.login(user, password)
-            smtp.send_message(msg)
-        logger.info("Sent %s alert email for node %s to %s", severity, node_id, recipient)
+            sent = 0
+            for node_id, aqi, severity, message in alerts:
+                msg = EmailMessage()
+                msg["Subject"] = f"[Empyrean] {severity.title()} AQI alert — node {node_id}"
+                msg["From"] = sender
+                msg["To"] = recipient
+                msg.set_content(
+                    f"AQI threshold breach on node {node_id}.\n\n"
+                    f"Severity: {severity}\n"
+                    f"AQI: {aqi:.0f}\n"
+                    f"{message}\n\n"
+                    f"Generated at {datetime.now(timezone.utc).isoformat()}"
+                )
+                try:
+                    smtp.send_message(msg)
+                    sent += 1
+                except Exception:
+                    logger.warning(
+                        "Failed to send alert email for node %s to %s — skipped",
+                        node_id, recipient,
+                    )
+        logger.info(
+            "Sent %d/%d alert email(s) to %s", sent, len(alerts), recipient
+        )
     except Exception:
         logger.warning(
-            "Failed to send alert email for node %s to %s — skipped",
-            node_id, recipient,
+            "Failed to send alert email batch (%d message(s)) to %s — skipped",
+            len(alerts), recipient,
         )
 
 
@@ -258,8 +285,6 @@ def check_thresholds() -> dict:
 
     Returns ``{"created": n}``.
     """
-    _stamp_beat_heartbeat()  # liveness for /admin/health (Phase 10)
-
     with get_sync_db() as session:
         settings = _read_settings(session)
 
@@ -267,6 +292,7 @@ def check_thresholds() -> dict:
         # A *missing* row (fresh DB) defaults to "true" so alerts stay ON.
         if settings.get(_ALERTS_ENABLED_SETTING, "true") != "true":
             logger.info("Alerts disabled (alerts_enabled != 'true') — skipping")
+            _stamp_beat_heartbeat()  # L27: beat fired and the run completed
             return {"created": 0}
 
         warning = _threshold(
@@ -353,9 +379,10 @@ def check_thresholds() -> dict:
 
     # Fail-soft email alerts for critical breaches (#11). Never raises; the
     # alert rows + WS/MQTT broadcasts above are already committed independently.
+    # M52: one SMTP connection carries the whole batch instead of one per alert.
     if emails and email_recipient:
-        for node_id, aqi, severity, message in emails:
-            _send_alert_email(email_recipient, node_id, aqi, severity, message)
+        _send_alert_emails(email_recipient, emails)
 
+    _stamp_beat_heartbeat()  # L27: liveness for /admin/health, stamped on completion
     logger.info("check_thresholds created %s alert(s)", created)
     return {"created": created}

@@ -29,6 +29,10 @@ cfg = get_config()
 
 # Keep last N refresh tokens per user even if expired (Issue #28)
 _REFRESH_TOKEN_RETENTION_PER_USER = 10
+# M48: …but only for this long after expiry. The keep-last-N carve-out used
+# to preserve N expired tokens per user *forever*; tokens expired beyond the
+# grace window are deleted regardless of the per-user retention.
+_REFRESH_TOKEN_GRACE_DAYS = 30
 
 
 # ``name`` defaults to the fully-qualified path (tasks.aggregation.hourly_aggregate)
@@ -185,38 +189,87 @@ def data_retention_cleanup() -> dict:
         result = session.execute(sql, {"days": days})
         n = result.rowcount
 
-    logger.info("Data-retention cleanup removed %s readings", n)
-    return {"deleted": n}
+        # L48: hourly_agg roll-ups must obey the same retention window — the
+        # purge used to touch only sensor_readings, so buckets accumulated
+        # forever beyond retention.
+        agg_result = session.execute(
+            text("DELETE FROM hourly_agg WHERE bucket < now() - (:days * interval '1 day')"),
+            {"days": days},
+        )
+        agg_deleted = agg_result.rowcount
+
+        # H15: long-deactivated accounts must not keep PII forever. Once an
+        # inactive user has been gone past the retention window, scrub the
+        # identity fields in place — FK history (alerts/settings/audit rows)
+        # survives via its SET NULL / plain references, but nothing links back
+        # to a person any more.
+        anon_sql = text(
+            """
+            UPDATE users SET
+                username = 'deleted-user-' || id::text,
+                email = 'deleted-user-' || id::text || '@deleted.invalid',
+                password_hash = '!',
+                notification_prefs = '{}'::jsonb,
+                last_login_at = NULL
+            WHERE is_active = false
+              AND updated_at < now() - (:days * interval '1 day')
+              AND email NOT LIKE '%@deleted.invalid'
+            """
+        )
+        anon_result = session.execute(anon_sql, {"days": days})
+        anonymized = anon_result.rowcount
+
+    logger.info(
+        "Data-retention cleanup removed %s readings, %s hourly buckets, "
+        "and anonymised %s deactivated user(s)",
+        n, agg_deleted, anonymized,
+    )
+    return {"deleted": n, "hourly_buckets_deleted": agg_deleted, "users_anonymised": anonymized}
 
 
 @celery_app.task(name="empyrean.tasks.aggregation.refresh_token_cleanup", **_TASK_AUTORETRY)
 def refresh_token_cleanup() -> dict:
     """Delete expired refresh tokens to prevent database bloat (Issue #28).
 
-    Runs daily. Deletes tokens where expires_at < now(). Keeps the last
-    _REFRESH_TOKEN_RETENTION_PER_USER tokens per user even if expired,
-    to support legitimate use cases like revoking all sessions.
+    Runs daily (beat entry added by M79). Deletes tokens where
+    expires_at < now(). Keeps the last _REFRESH_TOKEN_RETENTION_PER_USER
+    tokens per user even if expired, to support legitimate use cases like
+    revoking all sessions — but only for _REFRESH_TOKEN_GRACE_DAYS after
+    expiry (M48); the carve-out used to keep them forever.
 
     Returns ``{"deleted": n}`` where ``n`` is the number of rows removed.
     """
     with get_sync_db() as session:
-        # Subquery to find expired tokens to delete, keeping the latest N per user
-        # Uses a window function to rank tokens by created_at desc per user
+        # Subquery to find expired tokens to delete, keeping the latest N per
+        # user. Uses a window function to rank tokens by created_at desc per
+        # user. M48: tokens expired beyond the grace window are deleted even
+        # when inside the keep-last-N carve-out.
         sql = text("""
             DELETE FROM refresh_tokens
             WHERE id IN (
                 SELECT id FROM (
                     SELECT id,
+                           expires_at,
                            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) as rn
                     FROM refresh_tokens
                     WHERE expires_at < now()
                 ) ranked
                 WHERE rn > :retention
+                   OR expires_at < now() - (:grace_days * interval '1 day')
             )
         """)
-        result = session.execute(sql, {"retention": _REFRESH_TOKEN_RETENTION_PER_USER})
+        result = session.execute(
+            sql,
+            {
+                "retention": _REFRESH_TOKEN_RETENTION_PER_USER,
+                "grace_days": _REFRESH_TOKEN_GRACE_DAYS,
+            },
+        )
         n = result.rowcount
 
-    logger.info("Refresh token cleanup removed %s expired tokens (keeping last %s per user)",
-                n, _REFRESH_TOKEN_RETENTION_PER_USER)
+    logger.info(
+        "Refresh token cleanup removed %s expired tokens (keeping last %s per "
+        "user for up to %s days after expiry)",
+        n, _REFRESH_TOKEN_RETENTION_PER_USER, _REFRESH_TOKEN_GRACE_DAYS,
+    )
     return {"deleted": n}

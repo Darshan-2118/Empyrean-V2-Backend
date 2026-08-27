@@ -53,6 +53,13 @@ class Node(Base):
     # passive_deletes=True: the DB already declares ON DELETE CASCADE on the
     # FKs, so let Postgres delete child rows instead of the ORM loading every
     # reading into memory (an OOM hazard on a hypertable).
+    #
+    # M61 caveat: with passive_deletes the ORM does NOT refresh in-memory
+    # child collections after a delete — code that deletes a node's children
+    # via raw SQL (or another session) leaves already-loaded
+    # ``sensor_readings`` / ``alerts`` collections stale. Always delete
+    # through the ORM relationship, or ``session.expire(node)`` after a
+    # raw-SQL delete before re-reading the collections.
     sensor_readings = relationship(
         "SensorReading", back_populates="node",
         cascade="all, delete-orphan", passive_deletes=True,

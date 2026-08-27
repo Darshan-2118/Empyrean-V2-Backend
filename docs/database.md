@@ -115,7 +115,7 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 | `celery:heartbeat:beat` | 3600s | ISO-8601 UTC timestamp of the last beat tick — written by `tasks.alerts.check_thresholds` (the 60s beat task, so this doubles as beat liveness); read by `GET /admin/health`, which reports `celery_beat` healthy while the stamp is ≤180s old (3× the schedule) |
 | `ratelimit:{endpoint}:{ip}:{minute}` | 60s | Request count (int) — per endpoint, per IP, per UTC minute (e.g. `ratelimit:auth.login:192.0.2.10:202608051530`); each endpoint has its own per-IP budget, so one endpoint cannot exhaust another's |
 | `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) — read/written by the `/forecast` endpoint & `generate_forecast` |
-| `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `tasks.forecast.retrain_model` |
+| `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `empyrean.tasks.forecast.retrain_model` |
 
 TTLs are tuned per data volatility, not a single blanket value: live readings never go stale beyond 60s, while less time-sensitive data (node metadata, forecasts) uses a longer TTL to cut down on recomputation.
 

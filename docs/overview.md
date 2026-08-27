@@ -307,8 +307,7 @@ Empyrean-V2-Backend/
 │   ├── validation.py       # @validate_body middleware
 │   ├── request_log.py      # App-wide HTTP request logging hooks
 │   └── ws/                 # WebSocket connection manager and /ws/alerts endpoint
-├── app/                    # OpenTelemetry tracing setup (ASGI + Celery)
-├── app_factory/            # Quart application factory and lifecycle initializers
+├── app_factory/            # Quart application factory + OpenTelemetry tracing (ASGI/Celery)
 ├── config/                 # Pydantic environment configuration (Dev/Prod settings)
 ├── deploy/                 # Production deployment templates (systemd, nginx, logrotate)
 ├── docs/                   # System documentation & technical specifications
@@ -319,7 +318,7 @@ Empyrean-V2-Backend/
 ├── tasks/                  # Celery tasks (reading enrichment, EPA AQI, alerts, aggregations, ML)
 ├── tests/                  # Test suite (unit, integration, smoke, benchmark)
 ├── celery_app.py           # Celery application configuration, beat schedules & circuit breaker
-├── main.py                 # Application entrypoint
+├── app.py                    # Application entrypoint (Quart factory re-export)
 └── requirements.txt        # Pinned Python package dependencies
 ```
 

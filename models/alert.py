@@ -7,7 +7,7 @@ alert here.  The frontend displays unacknowledged alerts on a map.
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, Integer, REAL, String, Text, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, REAL, String, Text, func, text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -27,6 +27,12 @@ class Alert(Base):
     # double-inserts. ``tasks.check_thresholds`` upserts against this index.
     # Delivered by migration ``0003_add_alerts_partial_unique.py``;
     # this declaration keeps alembic autogenerate + ``create_all`` in sync.
+    #
+    # L25: the message cap used to be enforced only in the task; the CHECK
+    # constraint bounds storage at the DB level too (NULL messages pass).
+    # M64: partial ``(triggered_at DESC)`` index backs the hot unacked-listing
+    # query (``WHERE acknowledged_at IS NULL ORDER BY triggered_at DESC``).
+    # Both delivered by migration ``0006_add_alert_constraints.py``.
     __table_args__ = (
         Index(
             "uq_alerts_unacked_node",
@@ -34,6 +40,15 @@ class Alert(Base):
             "parameter",
             unique=True,
             postgresql_where=text("acknowledged_at IS NULL"),
+        ),
+        Index(
+            "idx_alerts_unacked_triggered",
+            text("triggered_at DESC"),
+            postgresql_where=text("acknowledged_at IS NULL"),
+        ),
+        CheckConstraint(
+            f"message IS NULL OR LENGTH(message) <= {_MAX_ALERT_MESSAGE_LENGTH}",
+            name="ck_alerts_message_length",
         ),
     )
 

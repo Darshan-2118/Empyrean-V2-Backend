@@ -12,12 +12,14 @@ Task modules under ``tasks/`` are imported eagerly via ``include`` so their
 from __future__ import annotations
 
 import logging
+import uuid
 from pathlib import Path
 import threading
 from datetime import datetime, timezone
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.app.task import Task
 from sqlalchemy.exc import OperationalError
 
 from config import get_config
@@ -31,9 +33,231 @@ _CELERY_DIR = Path(__file__).resolve().parent / ".celery"
 _CELERY_DIR.mkdir(exist_ok=True)
 _BEAT_SCHEDULE_FILENAME = str(_CELERY_DIR / "celerybeat-schedule")
 
+# ── Redis-backed circuit breaker (#15, M1/M2) ────────────────────────────────
+# Tracks failed task attempts per task in a *real* rolling window (M1): each
+# failure is one uniquely-membered entry in a per-task sorted set, scored by
+# unix timestamp. Pruning uses ZREMRANGEBYSCORE so individual failures age out
+# naturally — no more wholesale counter reset on a stale timestamp. Every
+# multi-step operation (prune+count, prune+add) runs as a single Lua script so
+# concurrent workers can never interleave reads and writes (M2).
+#
+# M6: the breaker is enforced inside the shared ``Task`` base's
+# ``apply_async``, so *every* dispatch entry point (.delay(), .apply_async(),
+# send_task, and beat) goes through the same gate — not just ``send_task`` as
+# before.
+_FAILED_ATTEMPTS_KEY = "celery:circuit_breaker:failed_attempts"
+_MAX_FAILED_ATTEMPTS = 10  # After 10 failures, circuit opens
+_ROLLING_WINDOW_SIZE = 300  # Count failures within the last 300s (5 minutes)
+
+# Prune expired failures, record this failure (unique member), refresh the
+# key TTL, and return the live window size — atomically.
+_RECORD_FAILURE_LUA = """
+local cutoff = tonumber(ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return redis.call('ZCARD', KEYS[1])
+"""
+
+# Prune expired failures and return how many remain — atomically. Empty sets
+# are deleted so idle tasks leave no keys behind.
+_CHECK_CIRCUIT_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local count = redis.call('ZCARD', KEYS[1])
+if count == 0 then
+    redis.call('DEL', KEYS[1])
+end
+return count
+"""
+
+_lock = threading.Lock()
+_enabled = True
+_redis_client = None  # Lazily-initialised, reused for the process lifetime
+
+
+def _get_redis_client():
+    """Return a module-level Redis client, creating it once on first call."""
+    global _redis_client
+    if _redis_client is None:
+        with _lock:
+            if _redis_client is None:  # double-checked locking
+                from redis import Redis
+                _redis_client = Redis.from_url(
+                    cfg.REDIS_URL,
+                    decode_responses=False,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
+    return _redis_client
+
+
+def _circuit_for_task(task_name: str) -> bool:
+    """Check if retries should be allowed for *task_name*.
+
+    The circuit is open when the task has accumulated >= _MAX_FAILED_ATTEMPTS
+    failures within the last _ROLLING_WINDOW_SIZE seconds. The prune+count
+    check runs as one atomic Lua script (M2), so two workers checking
+    simultaneously always agree on the state.
+    """
+    if not _enabled:
+        return True
+
+    key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - _ROLLING_WINDOW_SIZE
+
+    try:
+        from redis.exceptions import ResponseError
+
+        client = _get_redis_client()
+        try:
+            count = int(client.eval(_CHECK_CIRCUIT_LUA, 1, key, cutoff))
+        except ResponseError as exc:
+            # Deployments upgrading from the old hash-based breaker may still
+            # carry hash-typed keys under this prefix; start those windows clean.
+            if "WRONGTYPE" not in str(exc):
+                raise
+            client.delete(key)
+            count = int(client.eval(_CHECK_CIRCUIT_LUA, 1, key, cutoff))
+
+        if count >= _MAX_FAILED_ATTEMPTS:
+            logger.warning(
+                "Circuit open for task '%s' - %d failures within %ds rolling "
+                "window, skipping dispatch",
+                task_name,
+                count,
+                _ROLLING_WINDOW_SIZE,
+            )
+            return False
+        return True
+
+    except Exception:
+        logger.warning("Redis error checking circuit breaker for task %s (fail-open)", task_name)
+        return True  # Fail open on Redis errors
+
+
+class _OpenCircuitError(RuntimeError):
+    """Raised when a task is dispatched while its circuit is open."""
+
+
+def _raise_open_circuit(task_name: str) -> None:
+    """Log and raise the open-circuit error for *task_name* (M6)."""
+    logger.error(
+        "Task '%s' skipped due to circuit being OPEN (%d failures within %ds "
+        "rolling window). Trigger reset via: python -c "
+        "'from celery_app import reset_circuit_breaker; "
+        "reset_circuit_breaker(\"%s\")'",
+        task_name,
+        _MAX_FAILED_ATTEMPTS,
+        _ROLLING_WINDOW_SIZE,
+        task_name,
+    )
+    raise _OpenCircuitError(f"Circuit breaker open for task {task_name}")
+
+
+class CircuitBreakerTask(Task):
+    """Celery Task base that gates every dispatch entry point on the breaker.
+
+    Overriding ``apply_async`` means ``.delay()``, ``.apply_async()`` and
+    ``send_task`` all funnel through ``_circuit_for_task`` (M6), so direct task
+    calls from worker/beat code are protected exactly like the old
+    ``send_task`` gate.
+
+    M82 dispatch contract: on a CLOSED circuit these behave exactly like
+    Celery's implementations and return an ``AsyncResult``. On an OPEN
+    circuit they **raise** :class:`CircuitBreakerOpenError` (exported below)
+    instead of returning — callers that dispatch synchronously must catch it
+    (the MQTT dispatch path does). The signature mirrors Celery's own
+    ``delay(*args, **kwargs)`` → ``apply_async(args=…, kwargs=…)`` mapping,
+    so both positional and keyword task arguments forward correctly.
+    """
+
+    def apply_async(self, args=None, kwargs=None, task_id=None, producer=None,
+                    link=None, link_error=None, shadow=None, **options):
+        if _circuit_for_task(self.name):
+            return super().apply_async(
+                args=args, kwargs=kwargs, task_id=task_id, producer=producer,
+                link=link, link_error=link_error, shadow=shadow, **options
+            )
+        _raise_open_circuit(self.name)
+
+    def delay(self, *args, **kwargs):
+        return self.apply_async(args=args, kwargs=kwargs)
+
+
+def _record_task_failure(task_name: str) -> None:
+    """Record a failed task execution for circuit breaker tracking (#15).
+
+    Called automatically by all tasks that use autoretry_for. Each failure is
+    one uniquely-membered sorted-set entry scored by unix time; the
+    prune+add+TTL sequence runs atomically via Lua (M2) so concurrent workers
+    recording failures can never lose counts.
+    """
+    if not _enabled:
+        return
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
+    member = f"{now}:{uuid.uuid4().hex}"
+    ttl_ms = (_ROLLING_WINDOW_SIZE + 60) * 1000  # outlive the window slightly
+
+    try:
+        from redis.exceptions import ResponseError
+
+        client = _get_redis_client()
+        args = (now - _ROLLING_WINDOW_SIZE, now, member, ttl_ms)
+        try:
+            client.eval(_RECORD_FAILURE_LUA, 1, key, *args)
+        except ResponseError as exc:
+            # Legacy hash-typed key from the pre-M1 implementation.
+            if "WRONGTYPE" not in str(exc):
+                raise
+            client.delete(key)
+            client.eval(_RECORD_FAILURE_LUA, 1, key, *args)
+    except Exception:
+        logger.warning("Redis error recording task failure for %s (ignored)", task_name)
+
+
+def reset_circuit_breaker(task_name: str | None = None) -> None:
+    """Reset circuit breaker state for one or all tasks (#15).
+
+    Called after successful task execution or external intervention.
+
+    M80: with no argument, SCAN over the per-task key prefix and delete each
+    match — state only ever lives at ``{base}:{task_name}`` keys, so the old
+    ``DELETE`` of the bare base key was a silent no-op and "reset all" never
+    reset anything.
+    """
+    try:
+        client = _get_redis_client()
+        if task_name is None:
+            cursor = 0
+            while True:
+                cursor, keys = client.scan(
+                    cursor=cursor, match=f"{_FAILED_ATTEMPTS_KEY}:*", count=100
+                )
+                if keys:
+                    client.delete(*keys)
+                if cursor == 0:
+                    break
+            logger.info("Reset all circuit breaker state")
+        else:
+            client.delete(f"{_FAILED_ATTEMPTS_KEY}:{task_name}")
+            logger.info("Reset circuit breaker for task %s", task_name)
+    except Exception as e:
+        logger.warning("Redis error resetting circuit breaker: %s", e)
+
+
+def toggle_circuit_breaker(enabled: bool) -> None:
+    """Enable or disable the circuit breaker entirely (#15)."""
+    global _enabled
+    _enabled = enabled
+    logger.info("Circuit breaker %s", "ENABLED" if enabled else "DISABLED")
+
+
 # ── Celery application instance ─────────────────────────────────────────────
-# Must be defined before anything below that references it (decorators,
-# monkeypatches, etc. all execute at import time).
+# Uses the shared ``CircuitBreakerTask`` base so every task enforced by the
+# breaker (M6). Defined after the breaker helpers above; decorators, includes
+# and monkeypatches all run at import time.
 celery_app = Celery(
     "empyrean",
     broker=cfg.REDIS_URL,
@@ -44,6 +268,7 @@ celery_app = Celery(
         "tasks.forecast",
         "tasks.process_reading",
     ],
+    task_cls=CircuitBreakerTask,
 )
 
 celery_app.conf.update(
@@ -88,13 +313,21 @@ celery_app.conf.update(
             "schedule": crontab(minute=7),
         },
         "forecast-model-retraining": {
-            "task": "tasks.forecast.retrain_model",
+            "task": "empyrean.tasks.forecast.retrain_model",
             "schedule": crontab(minute=7),
         },
         # ── Daily at 03:23 ───────────────────────────────
         "data-retention-cleanup": {
             "task": "empyrean.tasks.aggregation.data_retention_cleanup",
             "schedule": crontab(hour=3, minute=23),
+        },
+        # ── Daily at 03:41 ───────────────────────────────
+        # M79: despite its "Runs daily" docstring this task was never
+        # scheduled, so expired refresh tokens accumulated forever. Offset
+        # from the retention cleanup so the two purges don't run at once.
+        "refresh-token-cleanup": {
+            "task": "empyrean.tasks.aggregation.refresh_token_cleanup",
+            "schedule": crontab(hour=3, minute=41),
         },
     },
 )
@@ -113,185 +346,31 @@ _TASK_AUTORETRY = dict(
     retry_jitter=True,
 )
 
-# ── Redis-backed circuit breaker (#15) ─────────────────────────────────────
-# Tracks failed task attempts perRetryKey to implement a circuit breaker that
-# prevents retry storms. When a task fails N times in a rolling window, subsequent
-# attempts skip retries and are logged as "circuit open".
-_FAILED_ATTEMPTS_KEY = "celery:circuit_breaker:failed_attempts"
-_MAX_FAILED_ATTEMPTS_WINDOW = 300  # 5 minutes
-_MAX_FAILED_ATTEMPTS = 10  # After 10 failures, circuit opens
-_ROLLING_WINDOW_SIZE = 60  # Count failures in 60s windows (5 windows)
-
-_lock = threading.Lock()
-_enabled = True
-_redis_client = None  # Lazily-initialised, reused for the process lifetime
-
-
-def _get_redis_client():
-    """Return a module-level Redis client, creating it once on first call."""
-    global _redis_client
-    if _redis_client is None:
-        with _lock:
-            if _redis_client is None:  # double-checked locking
-                from redis import Redis
-                _redis_client = Redis.from_url(
-                    cfg.REDIS_URL,
-                    decode_responses=False,
-                    socket_connect_timeout=2,
-                    socket_timeout=2,
-                )
-    return _redis_client
-
-
-def _circuit_for_task(task_name: str) -> bool:
-    """Check if retries should be allowed for *task_name*.
-
-    Returns False if the task has exceeded its failure tolerance in the last
-    MAX_FAILED_ATTEMPTS_WINDOW, indicating a circuit is open. Returns True
-    otherwise. This is a Redis-backed circuit breaker with rolling fixed
-    windows (#15).
-    """
-    if not _enabled:
-        return True
-
-    now = int(datetime.now(timezone.utc).timestamp())
-    key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
-
-    try:
-        client = _get_redis_client()
-
-        # Get the current timestamp
-        current_ts = client.hget(key, "ts")
-        if not current_ts:
-            # First attempt - initialize counter
-            client.hset(key, mapping={"ts": str(now), "count": "0"})
-            return True
-
-        current_ts = int(current_ts)
-        count_str = client.hget(key, "count")
-        count = int(count_str) if count_str else 0
-
-        # Remove timestamps older than the rolling window
-        cutoff = now - _MAX_FAILED_ATTEMPTS_WINDOW
-        if current_ts < cutoff:
-            client.hdel(key, "ts")
-            client.hset(key, mapping={"ts": str(now), "count": "0"})
-            return True
-
-        # If we've exceeded the failure threshold, block further retries
-        if count >= _MAX_FAILED_ATTEMPTS:
-            logger.warning(
-                "Circuit open for task '%s' - %d failures in %.1f-minute window, "
-                "skipping retries",
-                task_name,
-                count,
-                _MAX_FAILED_ATTEMPTS_WINDOW / 60.0,
-            )
-            return False
-
-        # Increment counter for this attempt
-        client.hincrby(key, "count", 1)
-        return True
-
-    except Exception:
-        logger.warning("Redis error checking circuit breaker for task %s (fail-open)", task_name)
-        return True  # Fail open on Redis errors
-
-
-def _record_task_failure(task_name: str) -> None:
-    """Record a failed task execution for circuit breaker tracking (#15).
-
-    Called automatically by all tasks that use autoretry_for.
-    """
-    if not _enabled:
-        return
-
-    now = int(datetime.now(timezone.utc).timestamp())
-    key = f"{_FAILED_ATTEMPTS_KEY}:{task_name}"
-
-    try:
-        client = _get_redis_client()
-        # Increment counter for this failure
-        client.hincrby(key, "count", 1)
-        client.hset(key, mapping={"ts": str(now)})
-        # TTL expires the window automatically (3600s)
-        client.expire(key, 3600)
-    except Exception:
-        logger.warning("Redis error recording task failure for %s (ignored)", task_name)
-
-
-def reset_circuit_breaker(task_name: str | None = None) -> None:
-    """Reset circuit breaker state for one or all tasks (#15).
-
-    Called after successful task execution or external intervention.
-    """
-    try:
-        client = _get_redis_client()
-        if task_name is None:
-            client.delete(_FAILED_ATTEMPTS_KEY)
-            logger.info("Reset all circuit breaker state")
-        else:
-            client.delete(f"{_FAILED_ATTEMPTS_KEY}:{task_name}")
-            logger.info("Reset circuit breaker for task %s", task_name)
-    except Exception as e:
-        logger.warning("Redis error resetting circuit breaker: %s", e)
-
-
-def toggle_circuit_breaker(enabled: bool) -> None:
-    """Enable or disable the circuit breaker entirely (#15)."""
-    global _enabled
-    _enabled = enabled
-    logger.info("Circuit breaker %s", "ENABLED" if enabled else "DISABLED")
-
 
 # ── Task hooks for automatic failure recording (#15) ─────────────────────────
-# These hooks are registered globally and automatically record task failures
-# to the circuit breaker when autoretry_for is in use.
-
-from celery.signals import task_prerun, task_postrun
-
-
-@task_prerun.connect
-def on_task_prerun(sender, task_id, task, **kwargs):
-    """Called before every task starts. No failure recording here to avoid double-counting."""
-    # Failure recording moved to task_postrun to count only actual failures
-    pass
+# Registered globally; record failed attempts to the breaker.
+from celery.signals import task_postrun
 
 
 @task_postrun.connect
 def on_task_postrun(sender, task_id, task, retval, state, **kwargs):
-    """Called after every task completes. Record failures and reset on success."""
-    if hasattr(task, "autoretry_for") and task.autoretry_for:
-        if state == 'FAILURE':
-            # Record failure for circuit breaker
-            _record_task_failure(task.name)
-        else:
-            # Task succeeded (or retried/reset): clear failure count for this task
-            reset_circuit_breaker(task.name)
+    """Record failed attempts for the circuit breaker (M81).
 
+    FAILURE *and* RETRY outcomes both count as failed attempts: with
+    autoretry everywhere, a failing task surfaces as RETRY on every attempt
+    and only reaches FAILURE once retries are exhausted. The old hook reset
+    the window on any non-FAILURE state, so a failing task wiped its own
+    failure count on every retry and the breaker could never open.
 
-# ── Task middleware to integrate circuit breaker (#15) ───────────────────────
-# Wraps task execution to check circuit breaker state before retrying.
-
-original_task_apply_async = celery_app.send_task
-
-
-def circuit_breaker_aware_send_task(name: str, task_dict=None, *args, **kwargs):
-    """Send task with circuit breaker awareness (#15).
-
-    Logs retry attempts and checks circuit breaker state before execution.
+    Success deliberately does **not** reset the window — the rolling window
+    (ZREMRANGEBYSCORE pruning) ages failures out on its own, and a task that
+    flaps between success and failure should still trip the breaker. The
+    check path (``_circuit_for_task``) only prunes and counts; it never
+    records, so checking a circuit cannot feed it.
     """
-    if _circuit_for_task(name):
-        return original_task_apply_async(name, task_dict, *args, **kwargs)
-    else:
-        logger.error(
-            "Task '%s' skipped due to circuit being OPEN (10 failures in 5 min window). "
-            "Trigger reset via: python -c 'from celery_app import reset_circuit_breaker; "
-            "reset_circuit_breaker(\"%s\")'",
-            name,
-            name,
-        )
-        raise RuntimeError(f"Circuit breaker open for task {name}")
+    if state in ("FAILURE", "RETRY"):
+        _record_task_failure(task.name)
 
 
-celery_app.send_task = circuit_breaker_aware_send_task
+# Re-exported for callers who dispatch synchronously and can catch it.
+CircuitBreakerOpenError = _OpenCircuitError

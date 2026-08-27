@@ -132,3 +132,45 @@ def test_query_string_credentials_never_logged(caplog):
     assert qs_secret not in msg
     assert "path=/health" in msg
     assert "?" not in msg
+
+
+def test_concurrent_requests_never_cross_start_times(caplog):
+    """M23: the start time lives on the *request* context — pin per-request
+    isolation so a refactor (e.g. moving the stamp to a module global) cannot
+    cross-start concurrent requests.
+
+    A slow route (~300 ms) and a fast route run concurrently; each logged
+    duration must reflect its OWN start time. If the starts crossed, the fast
+    request would inherit the slow one's earlier stamp (duration ≥ ~300 ms) or
+    the slow one would inherit the fast one's late stamp (duration < sleep).
+    """
+    caplog.set_level(logging.INFO, logger="empyrean.request")
+
+    async def _scenario():
+        app = create_app()
+
+        @app.route("/_m23_slow")
+        async def _slow():
+            await asyncio.sleep(0.3)
+            return "slow", 200
+
+        client = app.test_client()
+        slow_resp, fast_resp = await asyncio.gather(
+            client.get("/_m23_slow"),
+            client.get("/health"),
+        )
+        assert slow_resp.status_code == 200
+        assert fast_resp.status_code == 200
+
+    _run(_scenario())
+
+    durations: dict[str, float] = {}
+    for record in _request_records(caplog):
+        msg = record.getMessage()
+        assert _LOG_LINE_RE.fullmatch(msg), f"unexpected log line: {msg!r}"
+        path = msg.split("path=")[1].split(" ", 1)[0]
+        durations[path] = float(msg.split("duration_ms=")[1])
+
+    assert "/_m23_slow" in durations and "/health" in durations
+    assert durations["/_m23_slow"] >= 250.0  # at least its own sleep
+    assert durations["/health"] < 250.0  # never inherits the slow start

@@ -55,8 +55,9 @@ def _ensure_test_db_exists(url_str: str) -> None:
 _ensure_test_db_exists(_TEST_DB_URL)
 
 # Point the application's engines at the test DB *before* the models import
-# below (models/base.py builds its engines from DATABASE_URL at import time).
-# Without this, API-level tests would silently hit the real "Empyrean" DB.
+# below. Engines are built lazily from DATABASE_URL on first access (M57),
+# and the reset_config_cache() below also drops any already-built engines —
+# without both, API-level tests would silently hit the real "Empyrean" DB.
 os.environ["DATABASE_URL"] = _TEST_DB_URL
 
 # N-8: get_config() caches its first Config. We built one above (from .env,
@@ -64,6 +65,13 @@ os.environ["DATABASE_URL"] = _TEST_DB_URL
 # drop that cached instance so the models import picks up the env override.
 os.environ["REDIS_URL"] = _TEST_REDIS_URL
 reset_config_cache()
+
+# M22: the API cache module holds a process-global Redis client; drop it too
+# so it is rebuilt against the isolated test REDIS_URL above (a client built
+# against the dev URL would otherwise survive the config reset).
+from api.cache import reset_cache_client
+
+reset_cache_client()
 
 from models import Base, Node, SystemSetting, User
 from models.helpers import hash_password
@@ -102,18 +110,10 @@ def create_test_tables():
     # Flush/stop the OTel BatchSpanProcessor's background exporter thread
     # before pytest closes its captured stdout, otherwise it raises
     # "ValueError: I/O operation on closed file" after the session ends.
-    # NOTE: imported via file path (same trick as app_factory/factory.py) —
-    # a plain `from app.tracing import ...` resolves to the top-level app.py,
-    # which is not a package.
-    import importlib.util
-    import pathlib
-
-    _tracing_path = pathlib.Path(__file__).resolve().parent.parent / "app" / "tracing.py"
-    _spec = importlib.util.spec_from_file_location("app_pkg.tracing", _tracing_path)
-    _tracing = importlib.util.module_from_spec(_spec)
     try:
-        _spec.loader.exec_module(_tracing)
-        _tracing.shutdown_tracing()
+        from app_factory.tracing import shutdown_tracing
+
+        shutdown_tracing()
     except Exception:  # noqa: BLE001 - teardown must never fail the session
         pass
     Base.metadata.drop_all(_engine)

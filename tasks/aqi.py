@@ -38,7 +38,11 @@ _PM10_BANDS = [
     (255.0, 354.0, 151, 200),
     (355.0, 424.0, 201, 300),
     (425.0, 504.0, 301, 400),
-    (505.0, 604.0, 301, 500),
+    # H35: EPA's PM10 Hazardous sub-band is AQI 401–500 (mirroring the PM2.5
+    # table above). The old I_lo=301 under-reported the whole 505–604 range by
+    # up to ~55 index points, masking genuine Hazardous events below the
+    # critical-alert threshold.
+    (505.0, 604.0, 401, 500),
 ]
 
 # Mirrors the band ordering above (index by band position).
@@ -68,7 +72,9 @@ def _aqi_for(concentration: float | None, bands: list[tuple]) -> tuple[int | Non
     The concentration is clamped to ``[0, top C_hi]`` before the band lookup so
     a negative concentration maps to the Good band (AQI 0, not negative - L-13)
     and a value above the last breakpoint cannot extrapolate past 500 (H-2).
-    ``round-half-up`` matches the EPA convention (L-12).
+    The fractional result is truncated (``math.floor``), matching the EPA
+    convention — the old round-half-up produced off-by-one AQI values at
+    breakpoint edges (M53).
     """
     if concentration is None or not math.isfinite(concentration):
         return None, None
@@ -76,7 +82,7 @@ def _aqi_for(concentration: float | None, bands: list[tuple]) -> tuple[int | Non
     c = max(0.0, min(concentration, top_hi))
     i = _subindex(c, bands)
     lo, hi, ilo, ihi = bands[i]
-    aqi = math.floor((ihi - ilo) / (hi - lo) * (c - lo) + ilo + 0.5)
+    aqi = math.floor((ihi - ilo) / (hi - lo) * (c - lo) + ilo)
     return aqi, CATEGORIES[i]
 
 

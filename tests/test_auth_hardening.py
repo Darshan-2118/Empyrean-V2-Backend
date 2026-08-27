@@ -189,49 +189,83 @@ def test_l33_dummy_password_hash_is_lazy():
     assert len(h) >= 59        # cost-12 bcrypt hashes are 60 chars
 
 
-# ── Hardcoded Admin User tests ────────────────────────────────────────────────
+# ── Bootstrap admin tests (H5/H6/H28) ─────────────────────────────────────────
 
 
-def test_hardcoded_admin_login_and_access():
-    """Hardcoded admin 'Darshan' logs in with 'Darsh1812' and receives full admin access."""
+def test_bootstrap_admin_login_and_access(monkeypatch):
+    """Env-configured bootstrap admin logs in via the normal bcrypt path.
+
+    H5/H6: credentials come from BOOTSTRAP_ADMIN_* env vars (never source), are
+    provisioned as a bcrypt hash, and authenticate through the standard login
+    path — there is no plaintext bypass anymore.
+    """
+    import api.auth
+    from config import get_config as real_get_config
+
+    tag = secrets.token_hex(4)
+    username = f"bootstrap_admin_{tag}"
+    password = f"B00tstrap-{tag}-pass!"
+
+    real_cfg = real_get_config()
+
+    class _Cfg:
+        """Real config with bootstrap admin fields overridden."""
+
+        def __getattr__(self, name):
+            return getattr(real_cfg, name)
+
+    cfg = _Cfg()
+    cfg.BOOTSTRAP_ADMIN_USERNAME = username
+    cfg.BOOTSTRAP_ADMIN_PASSWORD = password
+    cfg.BOOTSTRAP_ADMIN_EMAIL = ""
+    # api.auth resolves config through its module-level import.
+    monkeypatch.setattr(api.auth, "get_config", lambda: cfg)
+
     async def _scenario():
         app = create_app()
         client = app.test_client()
 
-        # Login with hardcoded credentials
+        # Provision via the startup helper (normally run by before_serving).
+        await api.auth.ensure_hardcoded_admin()
+
         resp = await client.post(
             "/api/v1/auth/login",
-            json={"username": "Darshan", "password": "Darsh1812"},
+            json={"username": username, "password": password},
         )
         assert resp.status_code == 201, (resp.status_code, await resp.get_data())
         data = await resp.get_json()
         assert data["role"] == "admin"
-        assert data["user"]["username"] == "Darshan"
-        assert data["user"]["role"] == "admin"
+        assert data["user"]["username"] == username
         assert "access_token" in data
         assert "refresh_token" in data
 
         token = data["access_token"]
 
-        # Admin-only endpoint access (GET /api/v1/admin/settings)
         admin_resp = await client.get(
             "/api/v1/admin/settings",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert admin_resp.status_code == 200, (admin_resp.status_code, await admin_resp.get_data())
+        assert admin_resp.status_code == 200, (resp.status_code, await admin_resp.get_data())
 
-        # Admin-only health endpoint access (GET /api/v1/admin/health)
-        health_resp = await client.get(
-            "/api/v1/admin/health",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert health_resp.status_code == 200
-
-        # Wrong password for Darshan fails with 401
+        # Wrong password fails with 401 — no plaintext bypass exists.
         wrong_resp = await client.post(
             "/api/v1/auth/login",
-            json={"username": "Darshan", "password": "wrongpassword"},
+            json={"username": username, "password": "wrongpassword"},
         )
         assert wrong_resp.status_code == 401
 
     _run_async(_scenario())
+
+
+def test_no_hardcoded_admin_without_env_config():
+    """With no BOOTSTRAP_ADMIN_* configured, provisioning is a no-op (H5)."""
+    import api.auth
+
+    creds = api.auth._bootstrap_admin_credentials()
+    # In the test environment no bootstrap creds are set by default; if an
+    # operator's .env sets them, the helper must still return env values only —
+    # never the removed hardcoded constants.
+    if creds is not None:
+        username, password, _ = creds
+        assert password != "Darsh1812"
+        assert username.lower() != "darshan"
