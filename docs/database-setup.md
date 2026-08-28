@@ -234,17 +234,24 @@ Or using the helper script:
 
 ## 🌱 Seeding Initial Data
 
-Populate the database with system settings, default admin credentials, and initial sensor nodes:
+Populate the database with system settings and the sample sensor node:
 
 ```bash
 python scripts/seed.py
 ```
 
+Then create your admin account interactively:
+
+```bash
+python scripts/create_admin.py
+```
+
 ### Seeded Defaults:
-- **Admin Account**: there is no hardcoded admin. Set `BOOTSTRAP_ADMIN_USERNAME` /
-  `BOOTSTRAP_ADMIN_PASSWORD` (optionally `BOOTSTRAP_ADMIN_EMAIL`) in `.env` before
-  seeding; the seeder creates that user with the `admin` role. The password must
-  pass the strength gate (≥ 8 chars, mixed case, digit, symbol).
+- **Admin Account**: there is no hardcoded admin. `scripts/create_admin.py`
+  prompts for a username, email, and password (hidden input, strength-checked);
+  `--reset-password` recovers an existing account. For non-interactive deploys,
+  set `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` (optionally
+  `BOOTSTRAP_ADMIN_EMAIL`) instead.
 - **Default Node**:
   - **Node ID**: `ESP32-01`
   - **Location**: `Lab 1 - Central Monitoring`

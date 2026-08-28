@@ -20,6 +20,8 @@ Empyrean V2 is a real-time air quality ingestion, analysis, alerting, and foreca
   - [2. Install Dependencies](#2-install-dependencies)
   - [3. Generate `.env` & Configure Secrets](#3-generate-env-file--configure-secrets)
   - [4. Database Setup & Migrations](#4-database-setup--migrations)
+    - [`models/` & `migrations/` — what they do](#models-migrations)
+    - [Admin Access — create your account](#admin-access)
   - [5. Pre-flight Stack Health Check](#5-pre-flight-stack-health-check)
   - [6. Running the Stack](#6-running-the-stack)
   - [7. Connecting a Real ESP32 Node](#7-connecting-a-real-esp32-node-optional)
@@ -163,9 +165,11 @@ Ensure PostgreSQL with TimescaleDB is running, then apply database migrations:
 alembic upgrade head
 ```
 
+<a id="models-migrations"></a>
+
 > 📁 **`models/` vs `migrations/` in one line each:** `models/` holds the SQLAlchemy ORM classes — the source of truth for every table. `migrations/` holds versioned Alembic schema changes, and `alembic upgrade head` applies any not yet run so the database stays in sync with the models.
 
-*(Optional)* Seed sample nodes, default admin accounts, and initial configurations:
+*(Optional)* Seed the sample node and initial system settings:
 ```bash
 python scripts/seed.py
 ```
@@ -178,13 +182,14 @@ python scripts/seed.py
 > 📖 **Need help installing or configuring PostgreSQL & TimescaleDB?**  
 > See our step-by-step [PostgreSQL & TimescaleDB Setup Guide](docs/database-setup.md) for Docker, Windows (WSL2 / Native), Linux, macOS, and Cloud setup, or watch this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
 
+<a id="admin-access"></a>
+
 > 💡 **Admin Access:**
-> There are no hardcoded credentials. To provision an admin account, set
-> `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, and (optionally)
-> `BOOTSTRAP_ADMIN_EMAIL` in `.env` **before** running `python scripts/seed.py` —
-> the seeder creates (or promotes) that user with the `admin` role. The password
-> must pass the strength gate (≥ 8 chars, mixed case, digit, symbol) and is never
-> a known-weak value.
+> There are no hardcoded credentials — you create your own admin account:
+> ```bash
+> python scripts/create_admin.py
+> ```
+> It prompts for a username, email, and password (hidden input; must be ≥ 8 chars with upper, lower, digit, and symbol). If the username already exists it is promoted to admin — add `--reset-password` to set a fresh password on an existing or locked-out account. For non-interactive/CI deploys, set `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, and (optionally) `BOOTSTRAP_ADMIN_EMAIL` in `.env` instead.
 
 ### 5. Pre-flight Stack Health Check
 
