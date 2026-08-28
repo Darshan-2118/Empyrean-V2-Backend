@@ -54,14 +54,15 @@ The easiest way to get everything running is to use the provided startup scripts
    alembic upgrade head
    ```
 
-7. **Seed initial data** (admin user, defaults, sample node)
+7. **Seed initial data** (default settings + sample node), then **create your admin user**
    ```bash
    python scripts/seed.py
+   python scripts/create_admin.py
    ```
    > 💡 **Admin User:**
-   > There are no hardcoded credentials. Set `BOOTSTRAP_ADMIN_USERNAME` and
-   > `BOOTSTRAP_ADMIN_PASSWORD` (optionally `BOOTSTRAP_ADMIN_EMAIL`) in `.env`
-   > before seeding — the seeder creates that user with the `admin` role.
+   > There are no hardcoded credentials — `create_admin.py` prompts interactively
+   > for a username, email, and password (hidden input, strength-checked). Use
+   > `--reset-password` to set a fresh password on an existing account.
 
 8. **Pre-flight health check**
    ```bash
@@ -173,15 +174,23 @@ For manual processes, use Ctrl+C in each terminal window.
 
 ## Admin Credentials
 
-There is no built-in default account. Provision the admin via environment variables **before** running `scripts/seed.py`:
+There is no built-in default account. Create your own admin interactively:
+
+```bash
+python scripts/create_admin.py
+```
+
+It prompts for a username, email, and password (hidden input; ≥ 8 chars with upper, lower, digit, and symbol). If the username already exists it is promoted to admin; add `--reset-password` to set a fresh password on an existing or locked-out account. The password is never logged or written to any file.
+
+For non-interactive / CI deploys, provision via environment variables instead:
 
 ```bash
 BOOTSTRAP_ADMIN_USERNAME=youradmin
-BOOTSTRAP_ADMIN_PASSWORD=<strong password>   # ≥ 8 chars, mixed case, digit, symbol
+BOOTSTRAP_ADMIN_PASSWORD=<strong password>
 BOOTSTRAP_ADMIN_EMAIL=ops@example.com        # optional
 ```
 
-The seeder creates (or promotes) that user with the `admin` role. The password must pass the strength gate and is never a known-weak value. **Rotate it via `/api/v1/profile/change-password` after first login.**
+The API provisions (or promotes) that user with the `admin` role at startup. **Rotate it via `/api/v1/profile/change-password` after first login.**
 
 ## Troubleshooting
 

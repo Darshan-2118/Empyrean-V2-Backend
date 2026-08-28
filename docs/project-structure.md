@@ -82,6 +82,7 @@ Empyrean-V2-Backend/
 │   ├── check.bat           # Verify wrapper for cmd/PowerShell
 │   ├── check_health.py     # Environment health check
 │   ├── seed.py             # Dev seed script
+│   ├── create_admin.py     # Interactive admin account creation (no hardcoded creds)
 │   ├── db.sh               # Database helper (bash/Git Bash)
 │   └── bench.py            # Performance load generator (Phase 14)
 ├── tasks/                  # Celery worker + beat task definitions

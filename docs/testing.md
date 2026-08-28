@@ -47,9 +47,10 @@ pip install -r requirements.txt
 # 3. Ensure .env has valid keys and credentials
 python scripts/generate_secrets.py --write-env
 
-# 4. Run database migrations & seed initial admin / sample nodes
+# 4. Run database migrations, seed sample data & create your admin
 alembic upgrade head
 python scripts/seed.py
+python scripts/create_admin.py
 ```
 
 ---

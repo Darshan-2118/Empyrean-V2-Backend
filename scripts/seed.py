@@ -2,8 +2,9 @@
 Seed script — populates the database with initial data for development.
 
 Creates:
-- Admin user: ``admin`` / ``admin@empyrean.local`` (password from env
-  ``SEED_ADMIN_PASSWORD``)
+- Admin user: ``admin`` / ``admin@empyrean.local`` — only when the env
+  ``SEED_ADMIN_PASSWORD`` is set (otherwise skipped; use the interactive
+  ``scripts/create_admin.py`` instead)
 - Default system settings (AQI thresholds, data retention, alerts toggle)
 - A sample node (``ESP32-01``)
 
@@ -14,7 +15,8 @@ Safety:
 
 Usage::
 
-    SEED_ADMIN_PASSWORD=<secret> python scripts/seed.py
+    python scripts/seed.py                                     # settings + sample node
+    SEED_ADMIN_PASSWORD=<secret> python scripts/seed.py        # also creates 'admin'
     SEED_ADMIN_PASSWORD=<secret> python scripts/seed.py --force   # prod override
 """
 
@@ -49,15 +51,20 @@ logger = logging.getLogger("seed")
 _ERR_EXIT = 3
 
 
-def _admin_password() -> str:
-    """Return the admin password from ``SEED_ADMIN_PASSWORD`` or abort."""
+def _admin_password() -> str | None:
+    """Return the admin password from ``SEED_ADMIN_PASSWORD``, or ``None``.
+
+    When unset, admin creation is skipped — interactive setups should use
+    ``python scripts/create_admin.py`` instead of wiring env vars.
+    """
     password = os.environ.get("SEED_ADMIN_PASSWORD")
     if not password:
-        logger.error(
-            "SEED_ADMIN_PASSWORD must be set to seed the admin user. "
-            "Refusing to create an account with a guessed password."
+        logger.info(
+            "SEED_ADMIN_PASSWORD not set — skipping admin user creation. "
+            "Run `python scripts/create_admin.py` to create your admin "
+            "account interactively."
         )
-        sys.exit(_ERR_EXIT)
+        return None
     return password
 
 
@@ -81,23 +88,26 @@ def seed(force: bool = False) -> None:
         # ── 1. Admin user ─────────────────────────────────────────────────
         # L34: 2.x-style select() queries, matching the rest of the codebase
         # (the legacy 1.x query()/filter_by() chain is deprecated).
-        existing_admin = session.scalar(
-            select(User).where(User.username == "admin")
-        )
-        if existing_admin:
-            logger.info("Admin user already exists — skipping.")
+        if admin_password is None:
+            pass  # interactive path — see scripts/create_admin.py
         else:
-            admin = User(
-                username="admin",
-                email="admin@empyrean.local",
-                password_hash=hash_password(admin_password),
-                role="admin",
-                is_active=True,
-                notification_prefs={"email_on_critical": True},
+            existing_admin = session.scalar(
+                select(User).where(User.username == "admin")
             )
-            session.add(admin)
-            # Log the username only — never the plaintext password.
-            logger.info("Created admin user: '%s' (password from SEED_ADMIN_PASSWORD)", admin.username)
+            if existing_admin:
+                logger.info("Admin user already exists — skipping.")
+            else:
+                admin = User(
+                    username="admin",
+                    email="admin@empyrean.local",
+                    password_hash=hash_password(admin_password),
+                    role="admin",
+                    is_active=True,
+                    notification_prefs={"email_on_critical": True},
+                )
+                session.add(admin)
+                # Log the username only — never the plaintext password.
+                logger.info("Created admin user: '%s' (password from SEED_ADMIN_PASSWORD)", admin.username)
 
         # ── 1b. Bootstrap admin from env (H28) ────────────────────────────
         # The hardcoded "Darshan"/"Darsh1812" row is removed. Operators who

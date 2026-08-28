@@ -24,7 +24,7 @@ This document covers the environment variables the Empyrean backend reads at sta
 | `JWT_ACCESS_TOKEN_EXPIRY_MINUTES` | `15` | Access-token lifetime (must be > 0) |
 | `JWT_REFRESH_TOKEN_EXPIRY_DAYS` | `7` | Refresh-token lifetime (must be > 0) |
 | `PASSWORD_MAX_BYTES` | `72` | Max accepted password size in UTF-8 bytes (bcrypt limit) |
-| `BOOTSTRAP_ADMIN_USERNAME` | _(empty)_ | Optional admin auto-provisioned at startup/seed when set together with the password |
+| `BOOTSTRAP_ADMIN_USERNAME` | _(empty)_ | Optional admin auto-provisioned at startup/seed when set together with the password — non-interactive path; interactive setups should use `python scripts/create_admin.py` instead |
 | `BOOTSTRAP_ADMIN_PASSWORD` | _(empty)_ | Bootstrap admin password — must pass the strength gate (≥ 8 chars, mixed case, digit, symbol) |
 | `BOOTSTRAP_ADMIN_EMAIL` | _(empty)_ | Optional email for the bootstrap admin |
 | `TRUST_PROXY_HEADERS` | `false` | Trust `X-Real-IP` from a reverse proxy — enable ONLY behind a trusted proxy (see `deploy/nginx.conf`) |
