@@ -10,6 +10,25 @@ Empyrean V2 is a real-time air quality ingestion, analysis, alerting, and foreca
 
 ---
 
+## 📑 Table of Contents
+
+- [Architecture & Core Components](#️-architecture--core-components)
+- [Prerequisites](#-prerequisites)
+  - [Platform Setup (Windows / Linux)](#platform-setup-do-this-before-starting-the-stack)
+- [Quick Start (Local Development)](#-quick-start-local-development)
+  - [1. Clone & Set Up Python Environment](#1-clone--set-up-python-environment)
+  - [2. Install Dependencies](#2-install-dependencies)
+  - [3. Generate `.env` & Configure Secrets](#3-generate-env-file--configure-secrets)
+  - [4. Database Setup & Migrations](#4-database-setup--migrations)
+  - [5. Pre-flight Stack Health Check](#5-pre-flight-stack-health-check)
+  - [6. Running the Stack](#6-running-the-stack)
+  - [7. Connecting a Real ESP32 Node](#7-connecting-a-real-esp32-node-optional)
+- [Testing & Verification](#-testing--verification)
+- [API Overview](#-api-overview)
+- [Documentation](#-documentation)
+
+---
+
 ## 🏗️ Architecture & Core Components
 
 ```
@@ -66,6 +85,29 @@ Empyrean V2 is a real-time air quality ingestion, analysis, alerting, and foreca
 | **Redis** | `6.0+` | Celery message broker, query caching, rate limiting |
 | **MQTT Broker** | Mosquitto / EMQX / HiveMQ | For IoT sensor telemetry ingestion |
 
+### Platform Setup (do this before starting the stack)
+
+**Windows — WSL2 + Redis.** Redis runs inside WSL2; `scripts\start.bat` starts it automatically once installed.
+
+```powershell
+# 1. Install WSL2 (elevated PowerShell; reboot if prompted, Ubuntu installs by default)
+wsl --install
+
+# 2. Inside WSL, install and start Redis
+wsl
+sudo apt update && sudo apt install -y redis-server
+sudo service redis-server start
+```
+
+**Linux — Redis only.**
+
+```bash
+sudo apt update && sudo apt install -y redis-server    # Debian/Ubuntu
+sudo systemctl enable --now redis-server
+```
+
+Verify: `redis-cli ping` (`wsl redis-cli ping` on Windows) must return `PONG`.
+
 ---
 
 ## 🚀 Quick Start (Local Development)
@@ -121,10 +163,17 @@ Ensure PostgreSQL with TimescaleDB is running, then apply database migrations:
 alembic upgrade head
 ```
 
+> 📁 **`models/` vs `migrations/` in one line each:** `models/` holds the SQLAlchemy ORM classes — the source of truth for every table. `migrations/` holds versioned Alembic schema changes, and `alembic upgrade head` applies any not yet run so the database stays in sync with the models.
+
 *(Optional)* Seed sample nodes, default admin accounts, and initial configurations:
 ```bash
 python scripts/seed.py
 ```
+
+> 🧪 **Simulated node:** the seeder creates a pseudo node `ESP32-01` so you can verify the full ingestion → AQI → alerting pipeline without any hardware. With the stack running, publish a synthetic reading and check `GET /api/v1/readings/latest`:
+> ```bash
+> mosquitto_pub -h localhost -t "air/node/ESP32-01/reading" -m '{"temperature": 27.5, "humidity": 60.0, "pressure": 1013.0, "voc_ohm": 120000.0, "mq135_ppm": 15.0, "pm25": 18.0, "pm10": 35.0}'
+> ```
 
 > 📖 **Need help installing or configuring PostgreSQL & TimescaleDB?**  
 > See our step-by-step [PostgreSQL & TimescaleDB Setup Guide](docs/database-setup.md) for Docker, Windows (WSL2 / Native), Linux, macOS, and Cloud setup, or watch this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
@@ -181,6 +230,22 @@ celery -A celery_app.celery_app beat --loglevel=info
 ```bash
 hypercorn "app:create_app()" --bind 0.0.0.0:8000 --reload
 ```
+
+### 7. Connecting a Real ESP32 Node (Optional)
+
+`ESP32-01` is only a stand-in for testing. To wire in a physical ESP32 (BME680 + MQ135 + PMS5003/SDS011):
+
+1. In `.env`, set `MQTT_ENABLED=true` and point `MQTT_BROKER_HOST` / `MQTT_BROKER_PORT` at your broker (ingestion stays off until `MQTT_ENABLED=true`).
+2. Register the device with `POST /api/v1/nodes` (or reuse the seeded `ESP32-01`).
+3. Flash firmware that speaks the topic contract — the `node_id` in the topic is authoritative and must match the registered node:
+
+| Direction | Topic | JSON payload |
+|-----------|-------|--------------|
+| Device → Backend | `air/node/{node_id}/reading` | `temperature, humidity, pressure, voc_ohm, mq135_ppm, pm1, pm25, pm10, battery_v` |
+| Device → Backend | `air/node/{node_id}/status` | `online, battery_v, firmware` (heartbeat) |
+| Backend → Device | `air/node/{node_id}/config` | `interval_s, fuzzy_enabled, enabled` |
+
+Payload field ranges and a broker smoke test are documented in [docs/testing.md](docs/testing.md).
 
 ---
 
