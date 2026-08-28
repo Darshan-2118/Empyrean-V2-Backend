@@ -1,12 +1,87 @@
 # Fixed Bugs Log
 
 > Every fix from the audit in [`docs/bugs.md`](bugs.md), grouped by severity.
-> IDs are stable for traceability; full detail lives in git history. Landed
-> 2026-08-25 → 2026-08-27 across six waves (HIGH ×2, MEDIUM ×3, cosmetic pass).
+> IDs are stable for traceability; full detail lives in git history. Wave 1
+> landed 2026-08-25 → 2026-08-27 across six waves (HIGH A-2, MEDIUM A-3,
+> cosmetic pass); wave 2 (H37, M91–M111, L51–L78) landed 2026-08-28.
 
 ---
 
-## 🔴 HIGH (all 20 findings)
+## Wave 2 — 2026-08-28 (H37, M91–M111, L51–L78)
+
+### 🔴 HIGH
+
+| # | Fix |
+|---|-----|
+| H37 | `change_password` verifies against a hash fetched fresh from the DB (never the cached user) and invalidates the Redis user cache right after the commit; `password_hash` is no longer cached at all (`api/profile.py`, `api/jwt.py`). |
+
+### 🟡 MEDIUM
+
+| # | Fix |
+|---|-----|
+| M91 | Bootstrap-admin provisioning matches the username exactly; a case-variant account is logged and refused, never promoted (`api/auth.py`). |
+| M92 | `/profile/change-password` gets `rate_limit(10, 60)` per IP, mirroring `/login` (`api/profile.py`). |
+| M93 | WS re-auth window computed from the last *successful* auth — any frame no longer restarts the timer; deadline closes 4401 (`api/ws/routes.py`). |
+| M94 | WS handshake **and** re-auth check the jti blocklist via `_is_token_revoked`, mirroring the REST path (`api/ws/routes.py`). |
+| M95 | `/readings/history` caps grouped rows (`_HISTORY_MAX_ROWS = 50_000`, LIMIT cap+1 probe) → 422 with a narrow-range/pass-node_id hint on overflow (`api/readings.py`). |
+| M96 | `task_acks_on_failure_or_timeout=True` + honest at-most-once comments — ends both the silent reject-and-lose path and the hourly `visibility_timeout` redelivery loop (`celery_app.py`). |
+| M97 | `DATABASE_URL` scheme allowlist is now exactly `postgresql` / `postgres` / `postgresql+psycopg2` — the installed driver (`config`). |
+| M98 | `> 0` validators for `JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, `JWT_REFRESH_TOKEN_EXPIRY_DAYS`, `EXPORT_TIMEOUT_SECONDS`, `MQTT_QUEUE_MAX` (`config`). |
+| M99 | Alert-publisher client id suffixed `-{hostname}-{pid}` (H36 pattern) — prefork workers no longer takeover each other's broker session (`mqtt/publisher.py`). |
+| M100 | Publisher retry never sleeps in the caller's thread, processes a bounded batch (10) per call, and re-enqueues everything not published via `try/finally` — an interrupted batch can't lose messages (`mqtt/publisher.py`). |
+| M101 | Per-node rate limiter exempts replayed backlog (device timestamps ≥ 60 s old) so the post-reconnect QoS1 burst isn't dropped at ingest (`mqtt/client.py`). |
+| M102 | `_node_last_seen` bounded (10k cap, oldest-first eviction) — random node ids can't grow it without limit (`mqtt/client.py`). |
+| M103 | celery-beat's unprivileged `ExecStartPre` replaced with `RuntimeDirectory=empyrean` — the unit can actually start on a prod host (`deploy/celery-beat.service`). |
+| M104 | rsync excludes `.celery` and `.venv` — dev beat schedule DB and local site-packages no longer ship to prod (`deploy/deploy.sh`). |
+| M105 | Dedicated nginx `location /api/v1/export` with `proxy_read_timeout 330s` so 300 s CSV exports aren't 504'd (`deploy/nginx.conf`). |
+| M106 | Beat-schedule guard updated to the real five entries incl. `refresh-token-cleanup` — was failing today against the M79 schedule (`tests/test_celery_app.py`). |
+| M107 | Client-ID test updated to the H36 contract (prefix + hostname suffix) — was failing today, pinning the pre-H36 fixed id (`tests/mqtt/reconnection_test.py`). |
+| M108 | Reconnect-delay test asserts the real paho min/max (1/60) — the old `... or True` could never fail (`tests/mqtt/reconnection_test.py`). |
+| M109 | SUBACK test asserts granted topics, consumed mids, and readiness flipping — the old assertion was tautological (`tests/mqtt/reconnection_test.py`). |
+| M110 | Heartbeat test now exercises the REAL `_handle_status` against the DB and asserts `Node.last_seen` moves — the old test called a mock and asserted the mock was called (`tests/mqtt/reconnection_test.py`). |
+| M111 | Full-queue test asserts the drop, the warning, and the overflow counter increment — the old test had no assertions (`tests/mqtt/reconnection_test.py`). |
+
+### 🟢 LOW
+
+| # | Fix |
+|---|-----|
+| L51 | Blocklist is now per-jti keys (`SET jwt:blocklist:{jti} 1 EX ttl` — self-cleaning); logout also revokes the presented access token, and the docstrings now tell the truth (`api/jwt.py`, `api/auth.py`). |
+| L52 | Module-level config snapshots in `api/jwt.py` and `api/admin.py` resolved per call — no stale secret/expiry after `reset_config_cache()`. |
+| L53 | Redis URL logged with credentials redacted (`api/cache.py`). |
+| L54 | Settings PATCH re-validates the merged threshold pair under `SELECT … FOR UPDATE` inside the write transaction — concurrent patches can't commit an inverted pair (`api/admin.py`). |
+| L55 | `METRICS_SECRET` compared with `hmac.compare_digest` (`api/metrics.py`). |
+| L56 | Empty/whitespace `?node_id=` on export → 422, mirroring `/readings/history` (`api/export.py`). |
+| L57 | Dead `_validate_handshake_token` deleted (`api/ws/routes.py`). |
+| L58 | Engine-init debug log renders the DB URL with `hide_password=True` (`models/base.py`). |
+| L59 | `shutdown_tracing()` idempotent and registered as an `after_serving` hook when tracing is on — spans flush on SIGTERM (`app_factory/tracing.py`, `factory.py`). |
+| L60 | `.celery/` mkdir wrapped in `try/except OSError` — importing `celery_app` survives a read-only rootfs. |
+| L61 | `task_ignore_result=True` and the result backend dropped — nothing reads results (`celery_app.py`). |
+| L62 | Fleet retraining offset to `crontab(minute=37)` — no more hourly collision with aggregation (`celery_app.py`). |
+| L63 | Broker startup retries raised to 30 with an honest comment: bounded retries, then the process exits and systemd restarts it (`celery_app.py`). |
+| L64 | `.env.example` drift closed: `MQTT_ENABLED`, `MQTT_CLIENT_ID`, `MQTT_QUEUE_MAX`, `PASSWORD_MAX_BYTES`, `EXPORT_TIMEOUT_SECONDS`, `SMTP_*`, `ALERT_EMAIL`, `TASK_SOFT/HARD_TIME_LIMIT` added with safe defaults. |
+| L65 | MQTT lifecycle teardown registered before DB/Redis teardown — the producer stops first (`app_factory/factory.py`). |
+| L66 | Non-empty `BOOTSTRAP_ADMIN_PASSWORD` goes through the weak-secret gate (blocklist always, strength unless `APP_ENV=test`) (`config`). |
+| L68 | Rollback-failure path raises `rollback_error from original_exc` — the causing exception is no longer suppressed (`models/base.py`). |
+| L69 | Failed `subscribe()` sets a flag and a throttled retry re-subscribes — no more connected-but-never-ready ingestion (`mqtt/client.py`). |
+| L70 | 64 KB inbound payload cap before decode/enqueue; `firmware` bounded to 64 chars in `StatusPayload` (`mqtt/client.py`, `mqtt/validator.py`). |
+| L71 | Hourly aggregation starts at `watermark − 24h` so late device timestamps (H25 window) fold into closed hours via the idempotent UPSERT (`tasks/aggregation.py`). |
+| L72 | `check_health` redacts `REDIS_URL` in both the success detail and the exception branch (`scripts/check_health.py`). |
+| L73 | `seed.py` bootstrap-admin lookup uses exact match; case-variant rows are logged and refused — same semantics as M91 (`scripts/seed.py`). |
+| L74 | All three systemd units get `StartLimitIntervalSec=300` + `StartLimitBurst=5` — persistent boot failures reach a terminal `failed` state (`deploy/*.service`). |
+| L75 | `deploy.sh` fails loudly (stderr + `exit 1`) when `envsubst` is missing instead of printing SUCCESS with the nginx config never installed. |
+| L76 | Disconnect/restart lifecycle tests assert real state (readiness/subscription reset; duplicate `start()` is a no-op — guarded in `mqtt/client.py` so a second start no longer leaks a worker thread). |
+| L77 | Payload-truncation test asserts the log carries the truncated repr and never the full payload — the old test had no assertions (`tests/mqtt/reconnection_test.py`). |
+| L78 | `db.sh` extracts the password into `PGPASSWORD` and passes a sanitised URL to `psql` — the connection string (with password) no longer sits on argv visible via `ps`. |
+
+### Wave-2 verification & test-infrastructure repairs
+
+- Migration `0007` created for L67 (`refresh_tokens.expires_at` index; model stayed source of truth).
+- Full suite green after all wave-2 fixes: **326 passed, 0 failed** (2026-08-28).
+- 32 pre-existing Windows test failures repaired along the way (not audit findings): async engine forced to `NullPool` in tests + per-test async-pool/Redis isolation in `tests/conftest.py` (asyncpg/redis connections are loop-bound and died across per-test `asyncio.run` loops), and the stale pre-H36 client-id assertion in `tests/mqtt/reconnection_test.py` updated to the hostname-suffixed contract.
+
+---
+
+## Wave 1 — HIGH (all 20 findings)
 
 | # | Fix |
 |---|-----|
@@ -42,7 +117,7 @@
 
 ---
 
-## 🟡 MEDIUM (all findings)
+## Wave 1 — 🟡 MEDIUM (all findings)
 
 ### Circuit breaker & Celery (`celery_app.py`)
 
@@ -151,7 +226,7 @@
 
 ---
 
-## 🟢 LOW (all findings)
+## Wave 1 — 🟢 LOW (all findings)
 
 | # | Fix |
 |---|-----|
@@ -210,4 +285,4 @@
 
 - Rotate/remove the old `Darshan` credentials in existing DBs (H5).
 - Frontends reading `environment` from `/health` must switch to `/admin/health` (H3).
-- Full-suite verification run still pending by agreement.
+- ~~Full-suite verification run still pending by agreement.~~ Done 2026-08-28: 315 passed, 0 failed (non-integration), after wave-2 fixes + test-infra repairs.

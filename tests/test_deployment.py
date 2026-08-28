@@ -92,3 +92,54 @@ def test_env_example_has_required_keys():
     required = ("SECRET_KEY", "JWT_SECRET", "DATABASE_URL", "REDIS_URL", "MQTT_BROKER_HOST")
     for key in required:
         assert key in content, f".env.production.example missing {key}"
+
+
+def test_celery_beat_runtime_directory():
+    """M103: no unprivileged ExecStartPre; RuntimeDirectory creates /run/empyrean."""
+    content = (DEPLOY_DIR / "celery-beat.service").read_text()
+    directives = [l.strip() for l in content.splitlines() if not l.strip().startswith("#")]
+    assert not any(d.startswith("ExecStartPre") for d in directives), \
+        "celery-beat.service still has an ExecStartPre directive"
+    assert "RuntimeDirectory=empyrean" in content
+    # The flock pidfile/lock path must stay consistent with the runtime dir.
+    assert "/run/empyrean/celery-beat.lock" in content
+
+
+def test_units_have_start_limits():
+    """L74: all three units bound their restart loop via StartLimit*."""
+    for name in SYSTEMD_UNITS:
+        content = (DEPLOY_DIR / name).read_text()
+        unit_section = content.split("[Service]")[0]
+        assert "StartLimitIntervalSec=300" in unit_section, f"{name} missing StartLimitIntervalSec in [Unit]"
+        assert "StartLimitBurst=5" in unit_section, f"{name} missing StartLimitBurst in [Unit]"
+        assert "Restart=always" in content, f"{name} lost Restart=always"
+        assert "RestartSec=5" in content, f"{name} lost RestartSec=5"
+
+
+def test_deploy_sh_excludes_dev_state():
+    """M104: rsync must not ship .celery/ or .venv/ to production."""
+    content = (DEPLOY_DIR / "deploy.sh").read_text()
+    assert "--exclude .celery" in content
+    assert "--exclude .venv" in content
+    assert "--exclude venv" in content  # pre-existing exclude kept
+
+
+def test_deploy_sh_envsubst_required():
+    """L75: a missing envsubst must fail the deploy, not silently skip."""
+    content = (DEPLOY_DIR / "deploy.sh").read_text()
+    assert "envsubst not found" in content
+    lines = content.splitlines()
+    start = next(i for i, l in enumerate(lines) if "command -v envsubst" in l)
+    else_idx = next(i for i in range(start, len(lines)) if lines[i].strip() == "else")
+    fi_idx = next(i for i in range(else_idx, len(lines)) if lines[i].strip() == "fi")
+    branch = "\n".join(lines[else_idx:fi_idx])
+    assert "exit 1" in branch, "envsubst-missing branch must exit 1"
+
+
+def test_nginx_export_timeout():
+    """M105: /api/v1/export gets a 330s read timeout for 300s CSV exports."""
+    content = (DEPLOY_DIR / "nginx.conf").read_text()
+    assert "location /api/v1/export" in content
+    block = content.split("location /api/v1/export")[1].split("}")[0]
+    assert "proxy_pass http://127.0.0.1:8000" in block
+    assert "proxy_read_timeout 330s" in block

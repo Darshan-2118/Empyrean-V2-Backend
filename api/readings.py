@@ -57,6 +57,12 @@ _BUCKET_MAX_SPAN = {
     "1d": timedelta(days=3650),
 }
 
+# M95: hard cap on grouped rows returned by /readings/history. The span clamp
+# bounds buckets per node, but GROUP BY bucket, node_id is unbounded across
+# nodes (node registration is self-service) — queried with LIMIT cap+1 so an
+# overflow is detected and rejected with a 422 instead of materialised.
+_HISTORY_MAX_ROWS = 50_000
+
 
 def _latest_from_reading(r: SensorReading) -> dict:
     """Serialize a ``SensorReading`` ORM row via the ``LatestReading`` DTO."""
@@ -193,7 +199,7 @@ async def history():
     node_id = node_id or None
 
     where = "time >= :from_ts AND time <= :to_ts"
-    params: dict = {"from_ts": from_dt, "to_ts": to_dt}
+    params: dict = {"from_ts": from_dt, "to_ts": to_dt, "limit": _HISTORY_MAX_ROWS + 1}
     if node_id:
         where += " AND node_id = :node_id"
         params["node_id"] = node_id
@@ -216,6 +222,7 @@ async def history():
         WHERE {where}
         GROUP BY bucket, node_id
         ORDER BY bucket, node_id
+        LIMIT :limit
     """)
 
     async with async_engine.connect() as conn:
@@ -240,6 +247,17 @@ async def history():
                     "sensor_readings to a hypertable.",
                 )
             raise
+
+    # M95: the cap+1 probe row means the grouped result is unbounded — reject
+    # instead of materialising it; the span clamp alone doesn't bound rows
+    # across nodes.
+    if len(rows) > _HISTORY_MAX_ROWS:
+        return problem_json(
+            422,
+            "Unprocessable Entity",
+            f"result exceeds {_HISTORY_MAX_ROWS} rows — narrow the time range "
+            "and/or pass node_id",
+        )
 
     buckets = [_history_from_row(row) for row in rows]
     response = jsonify({"buckets": buckets})

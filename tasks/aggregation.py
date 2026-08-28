@@ -111,13 +111,14 @@ def hourly_aggregate() -> dict:
             logger.info("No readings to aggregate before %s", end)
             return {"buckets": 0}
 
-        # Watermark: the most recent hour already rolled up.  Start from it
-        # (inclusive) so late-arriving readings for the last aggregated hour are
-        # folded back in by the idempotent UPSERT on the next run.
+        # Watermark: the most recent hour already rolled up.  L71: start 24h
+        # behind it (inclusive) — H25 accepts device timestamps up to 24h in
+        # the past, so late readings can land in already-closed hours; the
+        # idempotent UPSERT folds them back in on the next run.
         watermark = session.execute(
             text("SELECT MAX(bucket) FROM hourly_agg")
         ).scalar()
-        start = earliest if watermark is None else max(earliest, watermark)
+        start = earliest if watermark is None else max(earliest, watermark - timedelta(hours=24))
 
         if start >= end:
             logger.info("Aggregation up to date — watermark %s >= end %s", watermark, end)

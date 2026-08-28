@@ -16,6 +16,7 @@ from opentelemetry.instrumentation.celery import CeleryInstrumentor
 
 _instrumented = False
 tracer_provider = None
+_tracing_shutdown = False  # L59: makes shutdown_tracing idempotent
 
 _log = logging.getLogger("empyrean.tracing")
 
@@ -29,13 +30,20 @@ def shutdown_tracing():
     ``ValueError: I/O operation on closed file`` after the test summary.
     Calling this at process/fixture teardown flushes pending spans while the
     stream is still open, then stops the thread cleanly.
+
+    L59: idempotent — registered as a Quart after_serving hook and also
+    called from test teardown, so it may run more than once per process.
     """
+    global _tracing_shutdown
+    if _tracing_shutdown:
+        return
     try:
         provider = trace.get_tracer_provider()
         if provider is not None and hasattr(provider, "shutdown"):
             provider.shutdown()
     except Exception:  # noqa: BLE001 - shutdown must never raise at teardown
         pass
+    _tracing_shutdown = True
 
 
 def instrument_app(app):
@@ -83,6 +91,12 @@ def instrument_app(app):
 
     # Quart is ASGI-based, so use ASGI middleware — per app instance.
     app.asgi_app = OpenTelemetryMiddleware(app.asgi_app)
+
+    # L59: flush the BatchSpanProcessor on graceful shutdown (SIGTERM) —
+    # register teardown once per app instance, only when span export is on.
+    if tracer_provider is not None and not getattr(app, "_tracing_shutdown_hook", False):
+        app.after_serving(shutdown_tracing)
+        app._tracing_shutdown_hook = True
 
 
 def get_tracer(name: str = __name__):

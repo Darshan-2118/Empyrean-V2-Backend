@@ -136,7 +136,12 @@ def _init_engines():
         expire_on_commit=False,
     )
     
-    logger.debug("Database engines initialized with URL: %s", sync_db_url)
+    # L58: never log the raw URL — it embeds the DB password and DEBUG is an
+    # operator-allowed log level.
+    logger.debug(
+        "Database engines initialized with URL: %s",
+        make_url(sync_db_url).render_as_string(hide_password=True),
+    )
 
 
 def get_sync_engine():
@@ -244,15 +249,17 @@ def get_sync_db() -> Generator:
     try:
         yield session
         session.commit()
-    except Exception:
+    except Exception as original_exc:
         # Log the original exception before rollback to preserve debuggability
         logger.exception("Database session rolled back due to error")
         try:
             session.rollback()
         except Exception as rollback_error:
-            # Chain the rollback error to help identify the root cause
+            # L68: chain the rollback error to the original failure so the
+            # exception that caused the rollback stays visible (``from None``
+            # suppressed it and broke upstream IntegrityError handling).
             logger.error("Database rollback also failed: %s", rollback_error, exc_info=True)
-            raise rollback_error from None
+            raise rollback_error from original_exc
         raise
     finally:
         session.close()

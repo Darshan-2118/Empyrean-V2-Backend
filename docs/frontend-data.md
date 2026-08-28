@@ -13,10 +13,10 @@
 - **Validation**:
   - Username/password format checks
   - Rate-limited to prevent brute force
-- **Default Admin Account**:
-  - `username`: `Darshan`
-  - `password`: `Darsh1812`
-  - `role`: `admin` (full permissions)
+- **Admin Account**:
+  - There is no hardcoded default admin. An admin is provisioned via the
+    `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` environment
+    variables (seeded by `scripts/seed.py`) with `role`: `admin`.
 
 ### Register Page
 - **Fields**:

@@ -2,7 +2,7 @@
 
 This document describes the high-level architecture of the Empyrean backend — a real-time, geospatially-aware IoT air-quality platform. It covers the system's services, end-to-end data flow, component responsibilities, and scalability considerations.
 
-> **Status:** Phases 1–12 (scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints, export, error-handling & middleware) are implemented. Phases 13–14 (exhaustive testing, deployment) are planned. The pipeline described below is the target architecture; the ingestion, processing, readings/forecast API layers, the admin/health tier, the streaming export endpoint, and the request-validation / request-logging middleware are live.
+> **Status:** all phases are implemented — scaffolding, DB models/migrations, auth & profile, MQTT ingestion, readings API, fuzzy engine, Celery tasks, forecast, nodes, alerts & WebSocket, admin endpoints, export, error-handling & middleware, the test suite (326 tests), and production deployment assets (`deploy/` systemd units, nginx config, deploy script). The pipeline described below is live.
 
 > **Deployment status:** the physical hardware is still in development, so the current live deployment runs a single node (`ESP32-01`). The architecture below — node registration, per-node MQTT topics, `node_id`-partitioned TimescaleDB storage — already supports many concurrent nodes and needs no backend changes to scale up as more physical nodes come online; see NFR target of ≥ 50 nodes under Performance & Reliability Targets in [security.md](security.md).
 
@@ -37,7 +37,7 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 | 4 | The valid reading is dispatched to the Celery `tasks.process_reading` task via the Redis queue. |
 | 5 | The worker runs Tsukamoto Fuzzy Inference on (Temperature, Humidity, PM2.5) to produce a 0–100 fuzzy score. |
 | 6 | The worker computes the EPA AQI from PM2.5/PM10 and runs a Z-score anomaly check. |
-| 7 | The enriched record is inserted into the `sensor_readings` table in PostgreSQL (will become a TimescaleDB hypertable later). |
+| 7 | The enriched record is inserted into the `sensor_readings` hypertable in PostgreSQL (TimescaleDB, 7-day chunks). |
 | 8 | The `readings:latest:{node_id}` Redis key is updated (TTL 60s), invalidating the stale cache. |
 | 9 | Celery Beat checks AQI thresholds every 60s; on breach, an alert row is written and pushed to connected clients over WebSocket. |
 | 10 | The frontend polls `GET /api/v1/readings/latest` every 5s, hitting the Redis cache for a sub-10ms response. The response is `{ "readings": [...] }` — an array of objects with `node_id`, `time` (ISO-8601 UTC `Z`), `pm25`, `pm10`, `temperature`, `humidity`, `aqi`, `aqi_category`, `fuzzy_score`, and `is_anomaly` (no `lat`/`lon`); the frontend joins node coordinates client-side for map display. |
@@ -66,7 +66,6 @@ The backend sits between the MQTT-publishing sensor nodes and the React frontend
 ## Related Docs
 
 - [api.md](api.md)
-- [mqtt.md](mqtt.md)
 - [database.md](database.md)
 - [fuzzy-engine.md](fuzzy-engine.md)
 - [getting-started.md](getting-started.md)

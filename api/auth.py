@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import bcrypt
-from quart import Blueprint, jsonify
+from quart import Blueprint, jsonify, request
 from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 
@@ -70,10 +70,24 @@ async def ensure_hardcoded_admin() -> User | None:
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(User).where(func.lower(User.username) == username.lower())
+            select(User).where(User.username == username)
         )
         user = result.scalar_one_or_none()
         if user is None:
+            # M91: only an EXACT username match may be promoted. If a
+            # case-variant row exists it belongs to whoever registered it —
+            # never touch it, never apply the bootstrap password to an
+            # existing row; refuse and let the operator resolve the clash.
+            variant = await session.execute(
+                select(User).where(func.lower(User.username) == username.lower())
+            )
+            if variant.scalar_one_or_none() is not None:
+                logger.error(
+                    "Bootstrap admin '%s' NOT provisioned: a case-variant "
+                    "account already exists and will not be promoted",
+                    username,
+                )
+                return None
             pwd_hash = await asyncio.to_thread(hash_password, password)
             user = User(
                 username=username,
@@ -394,7 +408,13 @@ async def refresh():
 @rate_limit(10, 60)  # M-12: per-IP cap on token revocation (write-flood surface)
 @validate_body(RefreshRequest)
 async def logout():
-    """Revoke a refresh token."""
+    """Revoke a refresh token and the presented access token.
+
+    L51: when a Bearer access token is present in the Authorization header it
+    is added to the per-jti blocklist so it dies immediately instead of
+    surviving for up to 15 minutes. Access-token revocation is best-effort
+    and never breaks the always-204 contract.
+    """
     data = validated_body()
 
     token_hash = hash_refresh_token(data.refresh_token)
@@ -411,6 +431,17 @@ async def logout():
         if rt is not None:
             rt.revoked = True
             await session.commit()
+
+    # L51: also revoke the access token presented in the Authorization header.
+    from api.jwt import decode_access_token, revoke_access_token
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        try:
+            payload = decode_access_token(auth_header[7:].strip())
+            await revoke_access_token(payload)
+        except Exception:  # noqa: BLE001 — revocation is best-effort
+            logger.warning("Could not revoke access token on logout")
 
     # Always return 204 — don't reveal whether the token existed
     return "", 204

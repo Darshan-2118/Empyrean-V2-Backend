@@ -32,8 +32,6 @@ logger = logging.getLogger("empyrean.admin")
 
 admin_bp = Blueprint("admin", __name__)
 
-cfg = get_config()
-
 _SETTING_DEFS: dict[str, dict[str, Any]] = {
     "aqi_warning_threshold": {
         "description": "AQI value that triggers a warning alert",
@@ -309,19 +307,21 @@ async def update_settings():
     # `warning=90` is rejected.
     current_settings = {s["key"]: s["value"] for s in await _load_settings()}
 
-    def _merged_int(key: str, fallback_cfg: int) -> int | None:
+    def _merged_int(current: dict[str, Any], key: str, fallback_cfg: int) -> int | None:
         """Effective int for ``key`` after the patch, or ``None`` if not numeric."""
         if key in updates and updates[key] is not None:
             return updates[key]
         # M84: stored values may be non-numeric; never let an eager int() 500.
-        raw = current_settings.get(key)
+        raw = current.get(key)
         try:
             return int(raw) if raw is not None and str(raw).strip() != "" else fallback_cfg
         except (TypeError, ValueError):
             return fallback_cfg
 
-    warning = _merged_int("aqi_warning_threshold", cfg.AQI_WARNING_THRESHOLD)
-    critical = _merged_int("aqi_critical_threshold", cfg.AQI_CRITICAL_THRESHOLD)
+    # L52: resolve config per call — the module-level ``cfg`` snapshot went
+    # stale after reset_config_cache().
+    warning = _merged_int(current_settings, "aqi_warning_threshold", get_config().AQI_WARNING_THRESHOLD)
+    critical = _merged_int(current_settings, "aqi_critical_threshold", get_config().AQI_CRITICAL_THRESHOLD)
 
     if warning is not None and critical is not None and warning >= critical:
         return problem_json(
@@ -335,14 +335,35 @@ async def update_settings():
     async with AsyncSessionLocal() as session:
         # M13: read the current DB value for every key we're about to touch so
         # an audit trail can record the change (old → new).
-        old_vals = {
-            s.key: s.value
-            for s in (
-                await session.execute(
-                    select(SystemSetting).where(SystemSetting.key.in_(updates.keys()))
+        # L54: FOR UPDATE locks the rows for the rest of this transaction,
+        # serialising concurrent patches; the threshold pair is always included
+        # so the merged pair can be re-validated below inside the write
+        # transaction (the pre-check above ran against a snapshot in another
+        # session — a TOCTOU that could commit an inverted pair).
+        locked = (
+            await session.execute(
+                select(SystemSetting)
+                .where(
+                    SystemSetting.key.in_(
+                        set(updates.keys())
+                        | {"aqi_warning_threshold", "aqi_critical_threshold"}
+                    )
                 )
-            ).scalars()
-        }
+                .with_for_update()
+            )
+        ).scalars()
+        locked_settings = {s.key: s.value for s in locked}
+        old_vals = {k: v for k, v in locked_settings.items() if k in updates}
+
+        warning = _merged_int(locked_settings, "aqi_warning_threshold", get_config().AQI_WARNING_THRESHOLD)
+        critical = _merged_int(locked_settings, "aqi_critical_threshold", get_config().AQI_CRITICAL_THRESHOLD)
+        if warning is not None and critical is not None and warning >= critical:
+            await session.rollback()
+            return problem_json(
+                422,
+                "Unprocessable Entity",
+                "aqi_warning_threshold must stay < aqi_critical_threshold",
+            )
 
         from models.setting import AuditLog
 

@@ -7,16 +7,19 @@ client **lazily** (module-level singleton per worker process) to publish
 threshold-breach alerts to ``air/alerts``. Fail-open by design: a broker outage
 is logged, never raised, so a beat task can never fail on a publish.
 
-Issue #25: Added exponential backoff retry for publish failures with a queue
-for failed messages to prevent data loss during transient broker outages.
+Issue #25: Failed publishes are queued for bounded retry to prevent data loss
+during transient broker outages. M100: the retry path never sleeps in the
+calling beat task, processes a bounded batch per invocation, and re-enqueues
+anything not published so an interrupted retry cannot lose messages.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import socket
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +32,9 @@ logger = logging.getLogger("empyrean.mqtt")
 
 _ALERTS_TOPIC = "air/alerts"
 _QOS = 1
+# M99: prefix only — the runtime id appends hostname + PID (mirroring H36 in
+# mqtt/client.py) so prefork worker processes never connect with the same
+# client id and drop each other's broker session on every CONNECT.
 _CLIENT_ID = "empyrean-alert-publisher"
 
 # Retry configuration (L21: these knobs are publisher-local on purpose).
@@ -37,9 +43,10 @@ _CLIENT_ID = "empyrean-alert-publisher"
 # does not re-dispatch on publish failure, so there is no second, divergent
 # retry strategy to reconcile with.
 _MAX_RETRY_ATTEMPTS = 5
-_BASE_RETRY_DELAY = 1.0  # seconds
-_MAX_RETRY_DELAY = 30.0  # seconds
-_RETRY_JITTER = 0.1  # 10% jitter
+# M100: per-call retry budget — at most this many queued alerts are retried
+# per invocation, leaving the rest in the deque for the next call so the
+# calling beat task is never blocked draining the queue.
+_RETRY_BATCH_SIZE = 10
 
 # Queue for failed messages.
 # M40: this is a per-worker-process module-level deque — Celery workers do
@@ -77,7 +84,11 @@ def _get_client() -> mqtt.Client | None:
     if _client is None:
         cfg = get_config()
         try:
-            c = mqtt.Client(client_id=_CLIENT_ID, protocol=mqtt.MQTTv311)
+            # M99: unique per host + worker process (hostname/PID suffix, as
+            # H36 does for the ingestion client) — a shared fixed id made
+            # prefork workers takeover each other's broker session.
+            client_id = f"{_CLIENT_ID}-{socket.gethostname().lower()}-{os.getpid()}"
+            c = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
             if cfg.MQTT_USE_TLS:
                 if not all((cfg.MQTT_CA_CERTS, cfg.MQTT_TLS_CERT, cfg.MQTT_TLS_KEY)):
                     logger.error("MQTT TLS requested but certs unset — alerts publish disabled")
@@ -110,22 +121,16 @@ def _get_client() -> mqtt.Client | None:
     return _client
 
 
-def _calculate_retry_delay(attempt: int) -> float:
-    """Calculate exponential backoff delay with jitter."""
-    import random
-    delay = min(_BASE_RETRY_DELAY * (2 ** attempt), _MAX_RETRY_DELAY)
-    # Add jitter: ±10%
-    jitter = delay * _RETRY_JITTER * (2 * random.random() - 1)
-    return delay + jitter
-
-
 def _retry_failed_messages() -> None:
-    """Retry failed messages from the queue with exponential backoff.
+    """Retry a bounded batch of queued failed messages (Issue #25).
 
-    Collects messages to retry under the lock, then retries them outside the
-    lock so time.sleep() does not block other publishers.
+    M100: never sleeps in the caller's thread and processes at most
+    ``_RETRY_BATCH_SIZE`` messages per invocation, leaving the rest in the
+    deque for the next call. The batch is popped under the lock (not
+    snapshot-and-cleared) and anything not successfully published is
+    re-enqueued in the ``finally``, so a mid-retry exception (e.g. Celery
+    ``SoftTimeLimitExceeded``) can never lose the outstanding batch.
     """
-    global _failed_queue
     if not _failed_queue:
         return
 
@@ -133,36 +138,42 @@ def _retry_failed_messages() -> None:
     if client is None:
         return  # Can't retry without a client
 
-    # Snapshot and clear under the lock, then retry without holding it
     with _lock:
-        to_retry = list(_failed_queue)
-        _failed_queue.clear()
+        batch: list[tuple[dict[str, Any], int]] = []
+        while _failed_queue and len(batch) < _RETRY_BATCH_SIZE:
+            batch.append(_failed_queue.popleft())
 
-    still_failed: list[tuple[dict[str, Any], int]] = []
-    for payload, attempt in to_retry:
-        if attempt >= _MAX_RETRY_ATTEMPTS:
-            logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
-            continue
+    try:
+        while batch:
+            payload, attempt = batch.pop(0)
+            if attempt >= _MAX_RETRY_ATTEMPTS:
+                logger.error("Max retry attempts reached for alert to node %s — dropping", payload.get("node_id", "unknown"))
+                continue
 
-        encoded = _encode(payload)
-        if encoded is None:
-            continue  # H22: unencodable payloads are dropped, not retried
+            encoded = _encode(payload)
+            if encoded is None:
+                continue  # H22: unencodable payloads are dropped, not retried
 
-        delay = _calculate_retry_delay(attempt)
-        time.sleep(delay)
+            try:
+                info = client.publish(_ALERTS_TOPIC, encoded, qos=_QOS)
+            except Exception:
+                # M100: re-enqueue the in-flight message, then let the finally
+                # re-enqueue the rest of the batch before propagating.
+                logger.exception("Retry publish raised for alert to node %s — requeueing", payload.get("node_id", "unknown"))
+                with _lock:
+                    _failed_queue.append((payload, attempt + 1))
+                raise
 
-        info = client.publish(_ALERTS_TOPIC, encoded, qos=_QOS)
-        if info.rc == 0:
-            logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
-        else:
-            logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
-            still_failed.append((payload, attempt + 1))
-
-    # Re-enqueue any that still failed
-    if still_failed:
-        with _lock:
-            for item in still_failed:
-                _failed_queue.append(item)
+            if info.rc == 0:
+                logger.info("Retry successful for alert to node %s (attempt %d)", payload.get("node_id", "unknown"), attempt + 1)
+            else:
+                logger.warning("Retry failed (rc=%s) for alert to node %s (attempt %d)", info.rc, payload.get("node_id", "unknown"), attempt + 1)
+                with _lock:
+                    _failed_queue.append((payload, attempt + 1))
+    finally:
+        if batch:
+            with _lock:
+                _failed_queue.extendleft(reversed(batch))
 
 
 def _encode(payload: dict[str, Any]) -> str | None:
@@ -187,8 +198,8 @@ def publish_alert(
     Best-effort: never raises to the caller. A down broker is logged; the alert
     row is committed independently by the caller.
 
-    Issue #25: Failed publishes are queued for exponential backoff retry to
-    prevent data loss during transient broker outages.
+    Issue #25: Failed publishes are queued for bounded retry to prevent data
+    loss during transient broker outages.
     """
     published = False
     with _lock:
@@ -222,15 +233,20 @@ def publish_alert(
 
             published = True
 
-    # Retry queued messages OUTSIDE the lock to avoid blocking other publishers
+    # Retry queued messages OUTSIDE the lock to avoid blocking other publishers.
+    # M100: the retry must never escape publish_alert's "never raises" contract
+    # — an interrupted batch has already re-enqueued itself in _retry's finally.
     if published:
-        _retry_failed_messages()
+        try:
+            _retry_failed_messages()
+        except Exception:
+            logger.exception("Alert retry batch interrupted — remaining messages re-queued")
 
 
 def _queue_failed_message(
     node_id: str, aqi: float, category: str | None, severity: str, timestamp: str
 ) -> None:
-    """Queue a failed message for retry with exponential backoff."""
+    """Queue a failed message for bounded retry (Issue #25)."""
     payload = {"node_id": node_id, "aqi": aqi, "category": category,
                "severity": severity, "timestamp": timestamp}
 

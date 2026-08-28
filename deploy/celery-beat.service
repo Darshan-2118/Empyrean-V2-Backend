@@ -2,6 +2,10 @@
 Description=Empyrean Celery Beat
 After=network-online.target postgresql.service redis-server.service
 Wants=network-online.target
+# L74: bound the restart loop — RestartSec=5 used to space attempts so the
+# default rate limit never engaged and a persistent boot failure looped forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,11 +13,13 @@ User=empyrean
 Group=empyrean
 WorkingDirectory=/opt/empyrean
 EnvironmentFile=/opt/empyrean/.env
+# M103: systemd creates and chowns /run/empyrean before ExecStart — the old
+# unprivileged ExecStartPre (install -d -o/-g) always failed, so beat never started.
+RuntimeDirectory=empyrean
 # M71: flock guard — two beat processes corrupt the shared
 # celerybeat-schedule file. The lock is held for the lifetime of the beat
 # process; a second unit start exits immediately instead of double-scheduling.
 ExecStart=/usr/bin/flock --nonblock /run/empyrean/celery-beat.lock /opt/empyrean/venv/bin/celery -A celery_app.celery_app beat --loglevel=info
-ExecStartPre=/usr/bin/install -d -o empyrean -g empyrean /run/empyrean
 Restart=always
 RestartSec=5
 

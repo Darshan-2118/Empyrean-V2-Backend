@@ -72,6 +72,64 @@ def test_production_accepts_strong_secrets():
     assert cfg.APP_ENV == "production"
 
 
+_STRONG_BOOTSTRAP = "S3cure!bootstrap#Passphrase$2024x"
+
+
+def test_bootstrap_password_placeholder_blocked_in_all_environments():
+    """L66: known dev placeholders are rejected even outside production."""
+    for env in ("development", "test"):
+        with pytest.raises(ValueError):
+            Config(
+                APP_ENV=env,
+                SECRET_KEY=_STRONG_SECRET_KEY,
+                JWT_SECRET=_STRONG_JWT,
+                BOOTSTRAP_ADMIN_PASSWORD="dev-secret-key",
+            )
+
+
+def test_bootstrap_password_weak_rejected_outside_test_env():
+    """L66: a set password gets the full strength check in real environments."""
+    with pytest.raises(ValueError):
+        Config(
+            APP_ENV="production",
+            SECRET_KEY=_STRONG_SECRET_KEY,
+            JWT_SECRET=_STRONG_JWT,
+            BOOTSTRAP_ADMIN_PASSWORD="short-pass!",
+        )
+
+
+def test_bootstrap_password_weak_allowed_in_test_env():
+    """L66: APP_ENV=test relaxes strength (mirrors SECRET_KEY/JWT_SECRET)."""
+    cfg = Config(
+        APP_ENV="test",
+        SECRET_KEY=_STRONG_SECRET_KEY,
+        JWT_SECRET=_STRONG_JWT,
+        BOOTSTRAP_ADMIN_PASSWORD="short-pass!",
+    )
+    assert cfg.BOOTSTRAP_ADMIN_PASSWORD == "short-pass!"
+
+
+def test_bootstrap_password_empty_is_valid_opt_out():
+    """L66: empty stays valid — it disables bootstrap provisioning."""
+    cfg = Config(
+        APP_ENV="production",
+        SECRET_KEY=_STRONG_SECRET_KEY,
+        JWT_SECRET=_STRONG_JWT,
+        BOOTSTRAP_ADMIN_PASSWORD="",
+    )
+    assert cfg.BOOTSTRAP_ADMIN_PASSWORD == ""
+
+
+def test_bootstrap_password_strong_accepted_in_production():
+    cfg = Config(
+        APP_ENV="production",
+        SECRET_KEY=_STRONG_SECRET_KEY,
+        JWT_SECRET=_STRONG_JWT,
+        BOOTSTRAP_ADMIN_PASSWORD=_STRONG_BOOTSTRAP,
+    )
+    assert cfg.BOOTSTRAP_ADMIN_PASSWORD == _STRONG_BOOTSTRAP
+
+
 def test_get_config_caches_but_reset_hook_refreshes(monkeypatch):
     """N-8: get_config() caches; reset_config_cache() forces a re-read.
 

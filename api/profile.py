@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from api.jwt import problem_json, jwt_required
+from api.rate_limit import rate_limit
 from api.schemas import ChangePasswordRequest, ProfileResponse, UpdateProfileRequest
 from api.validation import validate_body, validated_body
 from models.base import AsyncSessionLocal
@@ -138,6 +139,7 @@ async def update_profile():
 
 
 @profile_bp.route("/change-password", methods=["POST"])
+@rate_limit(10, 60)  # M92: brute-force throttle mirroring /login (10/min per IP)
 @jwt_required
 @validate_body(ChangePasswordRequest)
 async def change_password():
@@ -149,12 +151,22 @@ async def change_password():
     user: User = g.current_user
     data = validated_body()
 
+    # H37: verify against the hash fetched fresh from the DB — g.current_user
+    # may be a cache reconstruction whose password_hash is stale or absent.
+    async with AsyncSessionLocal() as session:
+        row = await session.execute(
+            select(User.password_hash).where(User.id == user.id)
+        )
+        current_hash = row.scalar_one_or_none()
+    if current_hash is None:
+        return problem_json(404, "Not Found", "User not found")
+
     # bcrypt cost-12 work runs off the event loop so a ~500 ms hash/compare
     # never blocks in-flight requests (H-6).
     current_ok = await asyncio.to_thread(
         bcrypt.checkpw,
         data.current_password.encode("utf-8"),
-        user.password_hash.encode("utf-8"),
+        current_hash.encode("utf-8"),
     )
     if not current_ok:
         return problem_json(401, "Unauthorized", "Current password is incorrect")
@@ -185,6 +197,12 @@ async def change_password():
         for rt in result.scalars().all():
             rt.revoked = True
         await session.commit()
+
+        # H37: evict the cached row so the new password hash is effective
+        # immediately (mirrors delete_profile's M12 invalidation).
+        from api.jwt import invalidate_user_cache
+
+        await invalidate_user_cache(user.id)
 
     # H16: also blocklist the *current* access token so the session that just
     # changed the password cannot keep using it for up to 15 minutes.

@@ -30,6 +30,7 @@ import time
 from typing import Any
 
 from redis.asyncio import Redis
+from sqlalchemy.engine import make_url
 
 from config import get_config
 
@@ -65,7 +66,12 @@ def get_client() -> Redis | None:
         # stale after reset_config_cache() in tests.
         redis_url = get_config().REDIS_URL
         _client = Redis.from_url(redis_url, decode_responses=True)
-        logger.info("Redis cache client created for %s", redis_url)
+        # L53: log with credentials redacted — the URL may embed a password.
+        try:
+            safe_url = make_url(redis_url).render_as_string(hide_password=True)
+        except Exception:  # noqa: BLE001 — never fail construction on logging
+            safe_url = redis_url.rsplit("@", 1)[-1]
+        logger.info("Redis cache client created for %s", safe_url)
     except Exception:
         now = time.monotonic()
         if now - _last_client_warn >= _CACHE_WARN_INTERVAL_S:

@@ -28,7 +28,7 @@ import time
 
 from quart import Blueprint, request, websocket
 
-from api.jwt import decode_access_token
+from api.jwt import _is_token_revoked, decode_access_token
 from api.ws.manager import manager
 from config import get_config
 from models import User
@@ -52,21 +52,6 @@ def _access_token() -> str | None:
     if auth.lower().startswith("bearer "):
         return auth.partition(" ")[2].strip()
     return websocket.args.get("token") or None
-
-
-def _validate_handshake_token(token: str | None) -> bool:
-    """Validate a token and its owning user. Shared by handshake + re-auth.
-
-    Returns True when the token decodes via the canonical
-    ``decode_access_token`` path *and* the subject is an active user.
-    """
-    if not token:
-        return False
-    try:
-        payload = decode_access_token(token)
-        return payload.get("sub") is not None
-    except Exception:  # noqa: BLE001 — any decode failure is an auth failure
-        return False
 
 
 def _is_origin_allowed(origin: str | None) -> bool:
@@ -111,6 +96,10 @@ async def alerts_ws() -> None:
         if token is None:
             raise ValueError("missing token")
         payload = decode_access_token(token)
+        # M94: mirror the REST path — reject tokens on the jti revocation
+        # blocklist (logout / password change) before accepting the socket.
+        if await _is_token_revoked(payload.get("jti")):
+            raise ValueError("token revoked")
         # Mirror the REST auth path (api.jwt._authenticate_user): reject a
         # soft-deleted or removed account rather than feeding its alerts.
         async with AsyncSessionLocal() as session:
@@ -143,9 +132,21 @@ async def alerts_ws() -> None:
         # re-auth, so a leaked token cannot hold a socket open indefinitely.
         last_auth = time.monotonic()
         while True:
+            # M93: wait only the REMAINING re-auth window computed from the
+            # last successful auth — previously every received frame (even a
+            # rejected re-auth) restarted the full interval, so one byte every
+            # 14 minutes held the socket open forever without a fresh token.
+            remaining = _REAUTH_INTERVAL_SECONDS - (time.monotonic() - last_auth)
+            if remaining <= 0:
+                logger.info(
+                    "WebSocket client did not re-authenticate within %ss — closing",
+                    _REAUTH_INTERVAL_SECONDS,
+                )
+                await websocket.close(code=4401)
+                return
             try:
                 frame = await asyncio.wait_for(
-                    websocket.receive(), timeout=_REAUTH_INTERVAL_SECONDS
+                    websocket.receive(), timeout=remaining
                 )
             except asyncio.TimeoutError:
                 logger.info(
@@ -181,8 +182,14 @@ async def alerts_ws() -> None:
                 try:
                     data = json.loads(frame)
                     new_token = data.get("token") if isinstance(data, dict) else None
+                    payload = decode_access_token(new_token or "")
+                    if await _is_token_revoked(payload.get("jti")):
+                        # M94: mirror the REST path — a revoked token must not
+                        # re-authenticate; close like the re-auth deadline.
+                        logger.warning("WebSocket re-auth rejected: token revoked")
+                        await websocket.close(code=4401)
+                        return
                     async with AsyncSessionLocal() as session:
-                        payload = decode_access_token(new_token or "")
                         user = await session.get(User, payload["sub"])
                     if user is not None and user.is_active:
                         last_auth = time.monotonic()

@@ -216,6 +216,9 @@ def main() -> bool:
     # -- 7. Redis ---------------------------------------------------------------
     print(f"\n[7/{total}] Redis")
     print(SEP)
+    # L72: redact credentials exactly like the DB check above — the raw
+    # REDIS_URL (and any echo of it in exception text) must never be printed.
+    redis_redacted = cfg.REDIS_URL.rsplit("@", 1)[-1]
     try:
         from redis import Redis
 
@@ -224,12 +227,12 @@ def main() -> bool:
             pong = client.ping()
             all_ok &= check(
                 "Redis reachable", bool(pong),
-                cfg.REDIS_URL if pong else "PING failed",
+                redis_redacted if pong else "PING failed",
             )
         finally:
             client.close()
     except Exception as e:
-        all_ok &= check("Redis reachable", False, str(e))
+        all_ok &= check("Redis reachable", False, str(e).replace(cfg.REDIS_URL, redis_redacted))
 
     # -- 8. Seed data (development only) --------------------------------------
     print(f"\n[8/{total}] Seed Data")

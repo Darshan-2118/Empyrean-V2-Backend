@@ -363,6 +363,18 @@ def test_export_validation_errors_422():
         assert resp.status_code == 422
         assert "365 days" in (await resp.get_json())["detail"]
 
+        # L56: explicit empty / whitespace-only node_id → 422, mirroring
+        # /readings/history (omit the parameter for all nodes).
+        resp = await client.get("/api/v1/export?node_id=", headers=headers)
+        assert resp.status_code == 422
+        err = await resp.get_json()
+        assert err["title"] == "Unprocessable Entity"
+        assert "node_id must not be empty when provided" in err["detail"]
+
+        resp = await client.get("/api/v1/export?node_id=%20%20", headers=headers)
+        assert resp.status_code == 422
+        assert "node_id must not be empty when provided" in (await resp.get_json())["detail"]
+
     _run(_scenario())
 
 

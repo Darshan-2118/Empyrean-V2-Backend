@@ -2,7 +2,7 @@
 Celery application instance for async task processing.
 
 Broker:    Redis (configured via REDIS_URL)
-Backend:   Redis (same URL)
+Backend:   none — task results are ignored (L61), nothing reads them
 Beat:      Scheduled tasks defined below
 
 Task modules under ``tasks/`` are imported eagerly via ``include`` so their
@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 
 # ── Celery storage directory (keeps root folder clean of schedule files) ────
 _CELERY_DIR = Path(__file__).resolve().parent / ".celery"
-_CELERY_DIR.mkdir(exist_ok=True)
+try:
+    _CELERY_DIR.mkdir(exist_ok=True)
+except OSError:  # L60: best-effort — import must not die on a read-only rootfs
+    pass
 _BEAT_SCHEDULE_FILENAME = str(_CELERY_DIR / "celerybeat-schedule")
 
 # ── Redis-backed circuit breaker (#15, M1/M2) ────────────────────────────────
@@ -261,7 +264,6 @@ def toggle_circuit_breaker(enabled: bool) -> None:
 celery_app = Celery(
     "empyrean",
     broker=cfg.REDIS_URL,
-    backend=cfg.REDIS_URL,
     include=[
         "tasks.aggregation",
         "tasks.alerts",
@@ -277,10 +279,23 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     beat_schedule_filename=_BEAT_SCHEDULE_FILENAME,
-    # At-least-once delivery (M-6): ack only after the task finishes
+    # L61: no result backend is configured and nothing in the repo reads task
+    # results (no AsyncResult.get), so drop results instead of storing them.
+    task_ignore_result=True,
+    # Delivery contract (M96): at-most-once for non-retriable failures.
+    # task_acks_late defers the ack until the task finishes, and
+    # task_reject_on_worker_lost still redelivers when a worker dies mid-task.
+    # But a task that *fails* (or is hard-killed by task_time_limit) is acked
+    # and removed for good: the old task_acks_on_failure_or_timeout=False did
+    # NOT deliver at-least-once — on_failure rejected with requeue=False,
+    # which Kombu's redis transport deletes anyway (silent message loss), and
+    # a hard-killed task left unacked was redelivered after visibility_timeout
+    # (3600 s) only to be re-killed every hour forever. With the ack on
+    # failure/timeout that redelivery loop is gone. Transient DB outages are
+    # still covered by the bounded OperationalError autoretry below.
     task_acks_late=True,
     task_reject_on_worker_lost=True,
-    task_acks_on_failure_or_timeout=False,
+    task_acks_on_failure_or_timeout=True,
     # Finite time bounds (I-35): configurable via config/__init__.py
     task_soft_time_limit=cfg.TASK_SOFT_TIME_LIMIT,
     task_time_limit=cfg.TASK_HARD_TIME_LIMIT,
@@ -290,12 +305,16 @@ celery_app.conf.update(
     # CPendingDeprecationWarning seen on every worker boot).
     broker_connection_retry_on_startup=True,
     # Don't cancel in-flight tasks on a transient broker blip; acks_late +
-    # reject_on_worker_lost already give at-least-once redelivery.
+    # reject_on_worker_lost still redeliver when a worker dies mid-task.
     worker_cancel_long_running_tasks_on_connection_loss=False,
-    # Keep retrying through startup/outage windows instead of giving up early,
-    # and enable TCP keepalive so an idle NAT/WSL connection isn't dropped.
+    # L63: startup retries are bounded, not "keep retrying forever": ~30
+    # attempts with the backoff below bridge a short broker outage at startup,
+    # and once exhausted the process exits so systemd (StartLimitIntervalSec/
+    # StartLimitBurst) restarts it. TCP keepalive keeps an idle NAT/WSL
+    # connection from being dropped.
+    broker_connection_max_retries=30,
     broker_transport_options={
-        "max_retries": 10,
+        "max_retries": 30,
         "interval_start": 1,
         "interval_step": 1,
         "interval_max": 5,
@@ -307,14 +326,16 @@ celery_app.conf.update(
             "task": "empyrean.tasks.alerts.check_thresholds",
             "schedule": 60.0,
         },
-        # ── Every hour (7 minutes past) ────────────────────────────
+        # ── Hourly: aggregation at :07, retraining at :37 ──────────
+        # L62: the two heaviest DB jobs used to share crontab(minute=7) and
+        # collided every hour; retraining is now offset by half an hour.
         "hourly-aggregation": {
             "task": "empyrean.tasks.aggregation.hourly_aggregate",
             "schedule": crontab(minute=7),
         },
         "forecast-model-retraining": {
             "task": "empyrean.tasks.forecast.retrain_model",
-            "schedule": crontab(minute=7),
+            "schedule": crontab(minute=37),
         },
         # ── Daily at 03:23 ───────────────────────────────
         "data-retention-cleanup": {
@@ -333,11 +354,11 @@ celery_app.conf.update(
 )
 
 # Shared task options (M-9 / #15): transient DB/connection blips should recover
-# automatically instead of being dropped (acks_late means a hard failure is
-# redelivered with no retry bound → permanent loss). All real tasks retry on
-# OperationalError with exponential backoff, capped so a flapping DB doesn't
-# storm the queue. Duplicate-PK handling in tasks.process_reading still governs
-# idempotent redelivery; this only bounds transient infra failures.
+# automatically instead of being dropped — with task_acks_on_failure_or_timeout
+# (M96) a non-retried failure is acked and gone, so this bounded
+# OperationalError autoretry is the only redelivery path for transient infra
+# failures. Capped so a flapping DB doesn't storm the queue. Duplicate-PK
+# handling in tasks.process_reading still governs idempotent redelivery.
 _TASK_AUTORETRY = dict(
     autoretry_for=(OperationalError,),
     retry_backoff=True,

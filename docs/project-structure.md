@@ -35,17 +35,20 @@ Empyrean-V2-Backend/
 │   ├── deploy.sh           # Idempotent rsync + systemctl + alembic upgrade
 │   └── .env.production.example  # Template with SECRET_KEY, JWT_SECRET, DATABASE_URL, REDIS_URL, MQTT_BROKER_HOST
 ├── docs/                   # Project documentation
-│   ├── TODO.md
 │   ├── api.md
 │   ├── architecture.md
+│   ├── bugs.md             # Audit findings ledger (all closed)
 │   ├── configuration.md
 │   ├── database.md
-│   ├── deployment.md       # Production deployment guide (Phase 14)
+│   ├── database-setup.md   # PostgreSQL & TimescaleDB setup guide
+│   ├── FIXED_BUGS.md       # Fix log for every closed audit finding
+│   ├── frontend-data.md
 │   ├── fuzzy-engine.md
-│   ├── getting-started.md
+│   ├── getting-started.md  # Local setup + production deployment
 │   ├── overview.md         # Comprehensive system overview & purpose
 │   ├── project-structure.md
-│   └── security.md
+│   ├── security.md
+│   └── testing.md          # Manual testing & hardware simulation guide
 ├── fuzzy/                  # Tsukamoto fuzzy inference engine
 │   ├── __init__.py         # Public API re-exports (fuzzy_score, infer)
 │   ├── membership.py       # Membership functions (triangular/trapezoidal)

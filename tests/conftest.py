@@ -73,6 +73,30 @@ from api.cache import reset_cache_client
 
 reset_cache_client()
 
+# Test-only: force the async engine to NullPool. Almost every test runs its
+# scenario via ``asyncio.run`` (a fresh event loop per test), and asyncpg
+# connections are bound to the loop that created them — a pooled connection
+# reused by the next test is dead and dies with ``Event loop is closed`` /
+# proactor ``AttributeError`` on Windows. NullPool opens a fresh connection
+# per checkout and closes it on checkin, so nothing survives a loop boundary.
+# ``models.base._init_engines`` builds the engine lazily, so patching the
+# module's ``create_async_engine`` reference before first engine access is
+# enough; pool-only kwargs it passes are stripped (NullPool rejects them).
+import models.base as _models_base  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
+
+_orig_create_async_engine = _models_base.create_async_engine
+
+
+def _create_async_engine_null_pool(*args, **kwargs):
+    kwargs["poolclass"] = NullPool
+    kwargs.pop("pool_size", None)
+    kwargs.pop("max_overflow", None)
+    return _orig_create_async_engine(*args, **kwargs)
+
+
+_models_base.create_async_engine = _create_async_engine_null_pool
+
 from models import Base, Node, SystemSetting, User
 from models.helpers import hash_password
 
@@ -121,6 +145,40 @@ def create_test_tables():
 
 
 # ── Function-scoped: isolated transaction ─────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _isolate_async_globals_between_tests():
+    """Drop loop-bound async globals after every test.
+
+    The async DB engine's pool and the async Redis client hold connections
+    bound to the event loop that created them. Most tests run their scenario
+    via ``asyncio.run`` (a fresh loop per test), so a pooled connection that
+    survives into the next test is dead — on Windows this surfaces as
+    ``AttributeError: 'NoneType' object has no attribute 'send'`` or a 500
+    on the first DB touch. Disposing the pool and resetting the Redis client
+    after each test forces every test to build connections on its own loop.
+
+    The isolated test Redis DB is also flushed so cached API payloads (e.g.
+    ``readings:latest``, 60 s TTL) and rate-limit counters written by one
+    test can never leak into the next — mirroring the per-test DB rollback.
+    """
+    yield
+    import asyncio
+
+    from models.base import async_engine
+
+    try:
+        asyncio.run(async_engine.dispose())
+    except Exception:  # noqa: BLE001 - teardown must never fail a test
+        pass
+    reset_cache_client()
+    try:
+        from redis import Redis as _SyncRedis
+
+        _SyncRedis.from_url(_TEST_REDIS_URL).flushdb()
+    except Exception:  # noqa: BLE001 - Redis down must not break teardown
+        pass
+
 
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:

@@ -30,7 +30,7 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 from config import get_config
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from models import (
     Node,
@@ -110,8 +110,11 @@ def seed(force: bool = False) -> None:
             os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip(),
         )
         if cfg_creds[0] and cfg_creds[1]:
+            # L73: EXACT match only, same semantics as the API's startup
+            # provisioning — the old ilike lookup let _/% wildcards in
+            # BOOTSTRAP_ADMIN_USERNAME force-promote unrelated users.
             existing_bootstrap = session.scalar(
-                select(User).where(User.username.ilike(cfg_creds[0]))
+                select(User).where(User.username == cfg_creds[0])
             )
             if existing_bootstrap:
                 if existing_bootstrap.role != "admin" or not existing_bootstrap.is_active:
@@ -120,16 +123,28 @@ def seed(force: bool = False) -> None:
                     session.commit()
                 logger.info("Bootstrap admin user '%s' already exists — ensured admin role.", cfg_creds[0])
             else:
-                bootstrap = User(
-                    username=cfg_creds[0],
-                    email=cfg_creds[2] or f"{cfg_creds[0].lower()}@empyrean.local",
-                    password_hash=hash_password(cfg_creds[1]),
-                    role="admin",
-                    is_active=True,
-                    notification_prefs={"email_on_critical": True},
+                case_variant = session.scalar(
+                    select(User.username)
+                    .where(func.lower(User.username) == cfg_creds[0].lower())
+                    .limit(1)
                 )
-                session.add(bootstrap)
-                logger.info("Created bootstrap admin user: '%s' (password from BOOTSTRAP_ADMIN_PASSWORD)", cfg_creds[0])
+                if case_variant is not None:
+                    logger.error(
+                        "Bootstrap admin '%s' has no exact match but case-variant "
+                        "user '%s' exists — refusing to promote it.",
+                        cfg_creds[0], case_variant,
+                    )
+                else:
+                    bootstrap = User(
+                        username=cfg_creds[0],
+                        email=cfg_creds[2] or f"{cfg_creds[0].lower()}@empyrean.local",
+                        password_hash=hash_password(cfg_creds[1]),
+                        role="admin",
+                        is_active=True,
+                        notification_prefs={"email_on_critical": True},
+                    )
+                    session.add(bootstrap)
+                    logger.info("Created bootstrap admin user: '%s' (password from BOOTSTRAP_ADMIN_PASSWORD)", cfg_creds[0])
         else:
             logger.info(
                 "BOOTSTRAP_ADMIN_USERNAME/PASSWORD not both set — skipping "

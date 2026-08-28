@@ -2,6 +2,10 @@
 Description=Empyrean Quart API
 After=network-online.target postgresql.service redis-server.service
 Wants=network-online.target
+# L74: bound the restart loop — RestartSec=5 used to space attempts so the
+# default rate limit never engaged and a persistent boot failure looped forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple

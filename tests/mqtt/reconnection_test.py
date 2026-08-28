@@ -67,18 +67,25 @@ class TestMQTTReconnection:
 
     @pytest.mark.integration
     def test_on_subscribe_with_granted_qos(self, mqtt_client):
-        """Test successful subscription with granted QoS."""
-        topic = "air/node/test_node/reading"
+        """M109: SUBACK grants are recorded, mids consumed, readiness flips.
 
-        with patch.object(mqtt_client._client, "subscribe", return_value=(0, 1)):
-            result, mid = mqtt_client._client.subscribe(topic, 1)
-            assert result == 0  # Success
+        The old assertion (``topic in _pending_subs or not _pending_subs``)
+        was tautological — it passed regardless of the outcome.
+        """
+        from mqtt.client import _READING_TOPIC, _STATUS_TOPIC
 
-        # Simulate SUBACK
-        mqtt_client._pending_subs[mid] = topic
-        mqtt_client._on_subscribe(mqtt_client._client, None, mid, (1,))
+        # Simulate the two required SUBSCRIBEs and their SUBACKs.
+        mqtt_client._pending_subs[1] = _READING_TOPIC
+        mqtt_client._pending_subs[2] = _STATUS_TOPIC
+        mqtt_client._on_subscribe(mqtt_client._client, None, 1, (1,))
+        assert mqtt_client._ready is False  # only 1/2 granted so far
 
-        assert topic in mqtt_client._pending_subs or not mqtt_client._pending_subs
+        mqtt_client._on_subscribe(mqtt_client._client, None, 2, (1,))
+
+        assert _READING_TOPIC in mqtt_client._granted_topics
+        assert _STATUS_TOPIC in mqtt_client._granted_topics
+        assert mqtt_client._pending_subs == {}  # mids consumed by the SUBACKs
+        assert mqtt_client._ready is True  # M36: readiness by granted topic set
 
     @pytest.mark.integration
     def test_on_subscribe_with_denied_qos(self, mqtt_client, caplog):
@@ -109,14 +116,27 @@ class TestMQTTReconnection:
             assert mock_dispatch.called
 
     @pytest.mark.integration
-    def test_consecutive_disconnects_handling(self, mqtt_client, caplog):
-        """Test handling multiple consecutive disconnections."""
-        # Simulate three consecutive disconnects
-        for rc in [0, 0, 1]:  # 0 = connect success, 1 = normal disconnection
-            mqtt_client._on_connect(mqtt_client._client, None, None, rc)
+    def test_consecutive_disconnects_handling(self, mqtt_client):
+        """L76: repeated disconnects reset readiness/subscription state.
 
-        # Client should still be in valid state
-        assert isinstance(mqtt_client.is_connected(), bool)
+        The old assertion (``isinstance(..., bool)``) was always true and
+        verified nothing about the M88/L23 reset behaviour.
+        """
+        from mqtt.client import _READING_TOPIC, _STATUS_TOPIC
+
+        # Reach a granted/ready state first.
+        mqtt_client._pending_subs[1] = _READING_TOPIC
+        mqtt_client._pending_subs[2] = _STATUS_TOPIC
+        mqtt_client._on_subscribe(mqtt_client._client, None, 1, (1,))
+        mqtt_client._on_subscribe(mqtt_client._client, None, 2, (1,))
+        assert mqtt_client._ready is True
+
+        # Two consecutive unexpected disconnects must each reset cleanly.
+        for rc in (7, 7):
+            mqtt_client._on_disconnect(mqtt_client._client, None, rc)
+            assert mqtt_client._ready is False
+            assert mqtt_client._granted_topics == set()
+            assert mqtt_client._pending_subs == {}
 
     @pytest.mark.integration
     def test_topic_parsing_on_message(self, mqtt_client):
@@ -134,11 +154,24 @@ class TestMQTTReconnection:
 
     @pytest.mark.integration
     def test_raw_payload_truncation_logging(self, mqtt_client, caplog):
-        """Test that large payloads are truncated in logs."""
-        large_payload = "{" + '"x":' * 500 + "}"  # ~5000 characters
+        """L77: oversized invalid payloads are truncated in logs, never full.
+
+        The old test had no assertions, so it could not detect whether the
+        payload was logged in full or truncated.
+        """
+        large_payload = "{" + '"x":' * 500 + "}"  # ~3000 chars, invalid JSON
 
         with caplog.at_level("DEBUG"):
             _handle_reading("test_node", large_payload)
+
+        drop_lines = [
+            r.getMessage() for r in caplog.records
+            if "Dropping invalid JSON" in r.getMessage()
+        ]
+        assert drop_lines, "expected the invalid payload to be dropped and logged"
+        logged = drop_lines[0]
+        assert large_payload not in logged  # never logged in full
+        assert "...<" in logged and "more>" in logged  # truncation marker
 
 
 class TestMQTTClientLifecycle:
@@ -159,19 +192,70 @@ class TestMQTTClientLifecycle:
 
     @pytest.mark.integration
     def test_multiple_start_attempts(self, mqtt_client):
-        """Test that starting client twice is safe."""
-        assert isinstance(mqtt_client.is_connected(), bool)
+        """L76: a second start() while the worker is running is a no-op.
+
+        The old assertion (``isinstance(..., bool)``) was always true; a
+        duplicate start() used to spawn a second worker thread.
+        """
+        with patch.object(mqtt_client._client, "connect_async"), \
+             patch.object(mqtt_client._client, "loop_start"):
+            mqtt_client.start()
+            first_worker = mqtt_client._worker_thread
+            assert first_worker is not None and first_worker.is_alive()
+
+            mqtt_client.start()  # must be ignored, not duplicate the worker
+
+            assert mqtt_client._worker_thread is first_worker
 
     @pytest.mark.integration
-    def test_status_heartbeat_updates_user(self, mqtt_client):
-        """Test that status heartbeats update Node.last_seen."""
-        with patch("mqtt.client._handle_status") as mock_handle:
-            mock_handle("test_node", '{"online": true, "timestamp": "2026-08-20T12:00:00Z"}')
-            assert mock_handle.called
+    def test_status_heartbeat_updates_user(self):
+        """M110: the REAL _handle_status updates Node.last_seen in the DB.
+
+        The old test patched _handle_status, called the mock, and asserted
+        the mock was called — it never exercised production code.
+        """
+        import secrets
+
+        from sqlalchemy import delete, select
+
+        from models import Node
+        from models.base import get_sync_db
+        from mqtt.client import _handle_status
+
+        node_id = f"HB-{secrets.token_hex(3).upper()}"
+        with get_sync_db() as session:
+            session.add(Node(
+                node_id=node_id, name="heartbeat test", location_name="Test Lab",
+                lat=0.0, lon=0.0, reading_interval=30, is_active=True,
+            ))
+
+        try:
+            with get_sync_db() as session:
+                before = session.scalar(
+                    select(Node.last_seen).where(Node.node_id == node_id)
+                )
+
+            _handle_status(node_id, '{"online": true}')
+
+            with get_sync_db() as session:
+                after = session.scalar(
+                    select(Node.last_seen).where(Node.node_id == node_id)
+                )
+            assert after is not None, "online heartbeat must stamp last_seen"
+            assert before is None or after > before
+        finally:
+            with get_sync_db() as session:
+                session.execute(delete(Node).where(Node.node_id == node_id))
 
     @pytest.mark.integration
     def test_enqueuing_message_on_full_queue(self, mqtt_client, caplog):
-        """Test that message is dropped when queue is full."""
+        """M111: a persistently-full queue drops, warns, and bumps the
+        overflow counter surfaced by /admin/health (M37/M38).
+
+        The old test had no assertions.
+        """
+        from mqtt.client import get_queue_overflow_count
+
         # Fill the queue
         for _ in range(mqtt_client._queue.maxsize):
             try:
@@ -179,9 +263,16 @@ class TestMQTTClientLifecycle:
             except queue.Full:
                 break
 
-        # Attempt to add one more
+        size_before = mqtt_client._queue.qsize()
+        overflow_before = get_queue_overflow_count()
+
+        # Attempt to add one more — persists through all bounded retries
         with caplog.at_level("WARNING"):
             mqtt_client._enqueue("test_node", "reading", "payload")
+
+        assert mqtt_client._queue.qsize() == size_before  # still full
+        assert "Ingestion queue full" in caplog.text
+        assert get_queue_overflow_count() == overflow_before + 1
 
 
 class TestMQTTConfigLimits:
@@ -202,14 +293,27 @@ class TestMQTTConfigLimits:
         client.stop()
 
     def test_reconnect_delay_configuration(self):
-        """Test that paho client reconnect delay is set correctly."""
+        """Test that paho client reconnect delay is set correctly.
+
+        M108: real assertions — the old ``... or True`` could never fail.
+        """
         client = MQTTClient()
-        assert client._client._reconnect_min_delay == 1 or client._client._reconnect_delay_min == 1 or True
+        assert client._client._reconnect_min_delay == 1
+        assert client._client._reconnect_max_delay == 60
         client.stop()
 
     def test_client_id_is_fixed(self):
-        """Test that MQTT client ID is fixed for persistent session."""
+        """H36: client ID is the stable per-host prefix + hostname suffix.
+
+        An explicit MQTT_CLIENT_ID wins; otherwise the id is derived as
+        ``empyrean-backend-<hostname>`` so two hosts never share a broker
+        session while one host keeps the same id across restarts
+        (clean_session=False offline queue depends on that stability).
+        """
         assert _CLIENT_ID == "empyrean-backend"
         client = MQTTClient()
-        assert client._client._client_id == b"empyrean-backend" or client._client._client_id == "empyrean-backend"
+        cid = client._client._client_id
+        if isinstance(cid, bytes):
+            cid = cid.decode()
+        assert cid.startswith("empyrean-backend")
         client.stop()
