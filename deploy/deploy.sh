@@ -19,9 +19,14 @@ trap 'echo "[deploy] FAILED — see error output above" >&2' ERR
 echo "[deploy] Deploying to $SERVER_USER@$SERVER_HOST:$APP_DIR"
 
 # --- Sync code ---
+# M104: exclude .celery (local beat schedule DB — shipping it clobbers the
+# production schedule, possibly while live beat holds it open) and .venv
+# (the "venv" exclude does not match a dotted dir).
 rsync -az --delete \
   --exclude .git \
   --exclude venv \
+  --exclude .venv \
+  --exclude .celery \
   --exclude __pycache__ \
   --exclude .pytest_cache \
   --exclude .env \
@@ -54,6 +59,10 @@ if [ -n "$DOMAIN" ] && [ -f "$APP_DIR/deploy/nginx.conf" ]; then
     envsubst '${DOMAIN}' < "$APP_DIR/deploy/nginx.conf" | sudo tee /etc/nginx/sites-available/empyrean >/dev/null
     sudo ln -sf /etc/nginx/sites-available/empyrean /etc/nginx/sites-enabled/empyrean
     echo "[deploy] Nginx configuration updated for $DOMAIN"
+  else
+    # L75: never proceed to a false SUCCESS without installing the site.
+    echo "[deploy] WARNING: envsubst not found — nginx config NOT updated" >&2
+    exit 1
   fi
 fi
 

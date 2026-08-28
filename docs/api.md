@@ -2,7 +2,7 @@
 
 Base URL: `/api/v1`
 
-REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/login` and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment, and `GET /metrics`, which returns Prometheus text exposition format (`text/plain`)**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/register`, `POST /auth/login`, and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment, and `GET /metrics`, which returns Prometheus text exposition format (`text/plain`)**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
 ---
 
@@ -19,7 +19,7 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 | `/auth/register` | POST | No | Register a new user and auto-login (returns `access_token`, `refresh_token`, `expires_in`, `role`) |
 | `/auth/login` | POST | No | Returns `access_token`, `refresh_token`, `expires_in`, `role` |
 | `/auth/refresh` | POST | No | Exchanges a refresh token for a new access token |
-| `/auth/logout` | POST | No | Revokes a refresh token |
+| `/auth/logout` | POST | No | Revokes a refresh token **and** the presented access token (jti blocklist) |
 
 ### Sensor Readings
 
@@ -49,10 +49,11 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 
 ### WebSocket — `/ws/alerts`
 
-A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages to every connected client through the connection manager; it never echoes or responds to client frames (push only, no client→server messaging).
+A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages to every connected client through the connection manager; it never echoes application data back. The only client→server frame the server consumes is the periodic **re-authentication** frame (see below).
 
 - **Auth:** JWT via the `Authorization: Bearer <access_token>` header (non-browser clients) or the `?token=<access_token>` query param (browser WebSockets cannot set headers).
-- **Handshake:** the JWT is validated **before** `accept()` — an unauthenticated or invalid-token handshake is closed rather than accepted.
+- **Handshake:** the JWT is validated **before** `accept()` — an unauthenticated, invalid, or **revoked** (jti blocklist) token handshake is closed rather than accepted.
+- **Re-authentication:** every 15 minutes the client must send a `{"token": "<fresh_access_token>"}` text frame. The fresh token is validated (signature, expiry, **and** the jti blocklist); the re-auth window is measured from the last *successful* auth, and any other frame does not extend it. Missing or invalid re-auth closes the socket with code `4401`.
 - **Payload:** the `air/alerts` MQTT message `{ node_id, aqi, category, severity, timestamp }`, broadcast as JSON.
 - The socket is only live once the MQTT broker publishes to `air/alerts`; with no broker a client connects but receives nothing until a broadcast arrives.
 
@@ -78,7 +79,7 @@ A **broadcast-only** push socket. The server pushes `air/alerts` MQTT messages t
 |---|---|---|---|
 | `from` | ISO-8601 datetime | 24h ago | Start of range (inclusive). Naive timestamps treated as UTC. |
 | `to` | ISO-8601 datetime | now | End of range (inclusive). Naive timestamps treated as UTC. |
-| `node_id` | string | all nodes | Restrict to a single node. Unknown node → empty CSV. |
+| `node_id` | string | all nodes | Restrict to a single node. Unknown node → empty CSV. An explicitly **empty** `node_id` (`?node_id=`) is rejected with `422` — omit the param for all nodes. |
 
 The span `to − from` is capped at **365 days** (`MAX_EXPORT_SPAN`, matching the default data-retention window); a wider request gets `422` rather than a silent truncation.
 
@@ -92,7 +93,7 @@ Cells: `time` is ISO-8601 UTC with a trailing `Z` (e.g. `2026-08-10T12:00:00Z`);
 
 **Response headers:** `Content-Type: text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="readings_export_<from>_<to>.csv"` (bounds formatted `%Y%m%dT%H%M%SZ`, no colons/spaces), `Cache-Control: no-store`, plus `X-RateLimit-*` from the 200/min per-IP cap.
 
-**Errors:** `401` (missing/invalid token), `422` (malformed `from`/`to`, `from` ≥ `to`, or span over 365 days), `429` (rate limited) — all RFC 7807 problem+json.
+**Errors:** `401` (missing/invalid token), `422` (malformed `from`/`to`, `from` ≥ `to`, span over 365 days, or explicitly empty `node_id`), `429` (rate limited) — all RFC 7807 problem+json.
 
 ### Profile
 
@@ -302,7 +303,7 @@ Exchange a refresh token for a new access+refresh pair (token rotation — old t
 
 ### POST `/auth/logout`
 
-Revoke a refresh token. Returns `204` regardless of whether the token was valid (no information leakage).
+Revoke a refresh token. If a Bearer access token is also presented in the `Authorization` header, its `jti` is blocklisted in Redis (TTL = remaining token lifetime, self-cleaning) so it dies immediately instead of surviving up to 15 minutes — best-effort, never breaking the always-`204` contract. Returns `204` regardless of whether the token was valid (no information leakage).
 
 **Request body:**
 
@@ -409,7 +410,7 @@ All fields are optional. Omitting a field leaves it unchanged.
 
 ### POST `/profile/change-password`
 
-Change the current user's password.
+Change the current user's password. Rate-limited to **10 requests/minute/IP** (brute-force throttle, mirroring `/login`). On success **all** outstanding refresh tokens are revoked and the access token used for this request is blocklisted — every session (including the current one) must log in again with the new password.
 
 **Request body:**
 
@@ -428,19 +429,19 @@ Change the current user's password.
 }
 ```
 
-**Errors:** `400` (missing body), `401` (current password incorrect), `422` (validation).
+**Errors:** `400` (missing body), `401` (current password incorrect), `422` (validation), `429` (rate limited).
 
 ---
 
 ### DELETE `/profile`
 
-Soft-delete the current user's account (sets `is_active = false` and revokes all refresh tokens).
+Deactivate the current user's account (soft delete: sets `is_active = false`, revokes all refresh tokens, and blocklists the access token used for this request). The row and reading history are retained; long-deactivated accounts have their PII anonymised by the data-retention task once past the retention window.
 
 **Success response** `200 OK`:
 
 ```json
 {
-  "message": "Account deleted successfully"
+  "message": "Account deactivated successfully"
 }
 ```
 
@@ -497,8 +498,10 @@ Time-bucketed averages over the `sensor_readings` hypertable using TimescaleDB `
 |---|---|---|---|
 | `from` | ISO-8601 datetime | 24h ago | Start of range (inclusive). Naive timestamps treated as UTC. |
 | `to` | ISO-8601 datetime | now | End of range (inclusive). Naive timestamps treated as UTC. |
-| `node_id` | string | all nodes | Restrict to a single node. |
+| `node_id` | string | all nodes | Restrict to a single node. An explicitly **empty** `node_id` (`?node_id=`) is rejected with `422` — omit the param for all nodes. |
 | `bucket` | string | `1h` | Bucket interval — one of `1m`, `5m`, `15m`, `1h`, `6h`, `1d`. |
+
+The query is capped at **50,000 buckets** (`MAX_HISTORY_ROWS`): a range/bucket combination that would produce more rows is rejected with `422` before hitting the database — narrow the range or widen the bucket instead.
 
 **Success response** `200 OK`:
 
@@ -523,7 +526,7 @@ Time-bucketed averages over the `sensor_readings` hypertable using TimescaleDB `
 
 `avg_*` fields are averages over the readings in the bucket; `max_aqi`/`min_aqi` are the extreme AQI values; `reading_count` is the number of readings aggregated. Returns `{"buckets": []}` when no readings fall in the range.
 
-**Errors:** `401` (missing/invalid token), `422` (malformed `from`/`to`, `from` ≥ `to`, or unknown `bucket`), `429` (rate limited).
+**Errors:** `401` (missing/invalid token), `422` (malformed `from`/`to`, `from` ≥ `to`, unknown `bucket`, explicitly empty `node_id`, or result would exceed the 50,000-bucket cap), `429` (rate limited).
 
 ---
 
@@ -533,7 +536,7 @@ All forecast endpoints require a valid JWT access token (`Authorization: Bearer 
 
 ### GET `/forecast`
 
-Next-60-minute AQI forecast for one node, generated by a linear-regression model fit on the node's last-7-days of AQI readings (retrained hourly by the Celery beat task `empyrean.tasks.forecast.retrain_model`). Served from the `celery:forecast:{node_id}` Redis cache (TTL 3600s) when present; on a cache miss the forecast is computed on the fly and cached. Redis being down degrades to computing from the DB — never a 500 on a cache problem.
+Next-60-minute AQI forecast for one node, generated by a linear-regression model fit on the node's last-7-days of AQI readings (retrained hourly by the Celery beat task `empyrean.tasks.forecast.retrain_model`). Served from the versioned Redis forecast cache (`celery:forecast:{node_id}:{model-version}`, TTL 3600s) when present — the version is the model's `trained_at`, so a retrain automatically invalidates stale forecasts; on a cache miss the forecast is computed on the fly and cached. Redis being down degrades to computing from the DB — never a 500 on a cache problem.
 
 **Query params:**
 
@@ -568,7 +571,7 @@ Next-60-minute AQI forecast for one node, generated by a linear-regression model
 
 Prometheus metrics exposition endpoint. Exposes `empyrean_http_requests_total` (counter by method, route, status) and `empyrean_http_request_duration_seconds` (histogram by method, route, status). **Internal only** — nginx restricts access to `127.0.0.1` so Prometheus must scrape from the host or an internal IP.
 
-**No auth required** (protected by network-level restriction).
+**Auth:** no JWT. When `METRICS_SECRET` is set in the environment, scrapes must additionally present a matching `X-Metrics-Secret` header (constant-time compared) — a mismatch gets `403`. With `METRICS_SECRET` unset the endpoint relies on the network-level restriction alone.
 
 **Success response** `200 OK` — Prometheus text format.
 
@@ -637,6 +640,7 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 | `POST /auth/login` | **10** |
 | `POST /auth/refresh` | **10** |
 | `POST /auth/logout` | **10** |
+| `POST /profile/change-password` | **10** |
 | `GET /readings/latest` | 200 |
 | `GET /readings/history` | 200 |
 | `GET /forecast` | 200 |
@@ -644,8 +648,10 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 | `GET /nodes` | 200 |
 | `POST /nodes` | 200 |
 | `PATCH /nodes/:node_id` | 200 |
+| `GET /alerts` | 200 |
+| `PATCH /alerts/:alert_id/acknowledge` | 200 |
 
-`/profile/*` (GET/PATCH/change-password/DELETE) is **not** rate-limited. The JWT **authentication** endpoints — `register`, `login`, `refresh`, `logout` — **are** rate-limited; the caps in the table above apply to them.
+`GET`/`PATCH`/`DELETE /profile` and `/admin/*` are **not** rate-limited (privileged, low-volume calls). The credential and session endpoints — `register`, `login`, `refresh`, `logout`, `change-password` — carry tight caps (brute-force defence); the read/mutation endpoints above use the default 200/min.
 
 > Auth caps are deliberately tight (brute-force defence) — a frontend that retries login more than 10×/min (or refresh on every tab focus) will be answered `429`.
 

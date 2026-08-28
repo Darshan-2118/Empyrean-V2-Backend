@@ -25,9 +25,17 @@ if [[ -z "${DB_URL_LINE:-}" ]]; then
 fi
 export "$DB_URL_LINE"
 
-# psql accepts a full connection URI, so no manual URL parsing is needed
-# (this also handles the password correctly without exposing it on the CLI).
-_PSQL=(psql "$DATABASE_URL")
+# psql accepts a full connection URI, but passing it on argv exposes the
+# password to any local user via `ps` / /proc/*/cmdline (L78). Extract the
+# password into PGPASSWORD (read by libpq, never shown) and pass a sanitised
+# URL instead. URLs without embedded credentials pass through unchanged.
+if [[ "$DATABASE_URL" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*)://([^:@/]+):([^@/]*)@(.+)$ ]]; then
+  export PGPASSWORD="${BASH_REMATCH[3]}"
+  _PSQL_URL="${BASH_REMATCH[1]}://${BASH_REMATCH[2]}@${BASH_REMATCH[4]}"
+else
+  _PSQL_URL="$DATABASE_URL"
+fi
+_PSQL=(psql "$_PSQL_URL")
 
 case "${1:-help}" in
   connect)

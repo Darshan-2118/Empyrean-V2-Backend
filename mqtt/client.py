@@ -128,8 +128,16 @@ def _increment_queue_overflow() -> None:
 # the worker queue with payloads that each cost json.loads + pydantic
 # validation with no bound. Devices report on a ~30 s cadence, so anything
 # above this per-node frequency is excess and is dropped before it reaches
-# the worker queue. Keyed by topic-validated node ids (bounded fleet).
+# the worker queue. Keyed by topic-validated node ids — regex-validated only,
+# never checked against the fleet table, hence the M102 cap/eviction below.
 _NODE_MSG_MIN_INTERVAL_S = 0.5
+# M102: bound _node_last_seen — a device with valid broker credentials can
+# publish unique random node ids at wire rate, and entries were never evicted
+# (unbounded memory growth). When the dict exceeds the cap on insertion,
+# prune oldest-first (by last-seen time) back to the prune target so the hot
+# path only pays the sort occasionally, not on every insert over cap.
+_NODE_LAST_SEEN_MAX = 10_000
+_NODE_LAST_SEEN_PRUNE_TO = 9_000
 _node_last_seen: dict[str, float] = {}
 _node_last_seen_lock = threading.Lock()
 
@@ -142,7 +150,58 @@ def _node_rate_limited(node_id: str) -> bool:
         if last is not None and now - last < _NODE_MSG_MIN_INTERVAL_S:
             return True
         _node_last_seen[node_id] = now
+        if len(_node_last_seen) > _NODE_LAST_SEEN_MAX:
+            # M102: evict oldest-first back under the cap.
+            oldest_first = sorted(_node_last_seen, key=_node_last_seen.get)
+            for key in oldest_first[: len(_node_last_seen) - _NODE_LAST_SEEN_PRUNE_TO]:
+                del _node_last_seen[key]
         return False
+
+
+# M101: backlog-replay exemption for the M39 limiter. clean_session=False lets
+# the broker keep our offline QoS1 queue, and after any restart Mosquitto
+# delivers that backlog as a fast burst the per-node limiter would mostly drop.
+# A reading whose device timestamp is older than this threshold is replayed
+# backlog and bypasses the limiter; fresh (current-timestamp) readings stay
+# rate-limited as before.
+_BACKLOG_FRESHNESS_S = 60.0
+
+
+def _device_time_is_stale(raw: str) -> bool:
+    """True when the payload's device ``time`` is backlog, not fresh (M101).
+
+    Missing/unparseable/non-string timestamps are treated as fresh so the
+    limiter keeps applying — only an explicitly old device timestamp exempts
+    a message.
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    value = data.get("time")
+    if not isinstance(value, str):
+        return False
+    try:
+        device_time = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if device_time.tzinfo is None:
+        device_time = device_time.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - device_time).total_seconds()
+    return age >= _BACKLOG_FRESHNESS_S
+
+
+# L70: inbound payload size cap, enforced before decode/enqueue. Mosquitto's
+# default message_size_limit is 256 MB and the worker queue holds up to
+# _QUEUE_MAX raw strings, so an uncapped decode lets a credentialed device
+# OOM the process.
+_MAX_PAYLOAD_BYTES = 64 * 1024
+
+# L69: minimum spacing between worker-tick re-subscribe attempts after a
+# failed/denied subscribe, so a persistently-denying broker isn't hammered.
+_SUBSCRIBE_RETRY_INTERVAL_S = 5.0
 
 
 def _resolve_payload(data: bytes | str) -> str | None:
@@ -297,6 +356,10 @@ class MQTTClient:
         # the status topic ever being subscribed.
         self._granted_topics: set[str] = set()
         self._tls_configured = False  # True only after tls_set() succeeds (H-4)
+        # L69: a failed/denied subscribe leaves the client connected but never
+        # ready; paho does not retry it, so the worker tick re-subscribes.
+        self._subscribe_failed = False
+        self._next_subscribe_retry = 0.0
 
         # H36: unique-per-host session id. An explicit MQTT_CLIENT_ID wins;
         # otherwise derive from the hostname so a second backend host (or a
@@ -376,12 +439,19 @@ class MQTTClient:
         if rc != 0:
             logger.error("Broker connection refused with rc=%s — will retry", rc)
             return
+        subscribe_failed = False
         for topic in (_READING_TOPIC, _STATUS_TOPIC, _ALERTS_TOPIC):
             result, mid = client.subscribe(topic, qos=_QOS)
             if result != mqtt.MQTT_ERR_SUCCESS:
                 logger.error("Failed to subscribe to %s (rc=%s)", topic, result)
+                subscribe_failed = True
             else:
                 self._pending_subs[mid] = topic
+        # L69: paho never retries a failed subscribe() and the client would
+        # stay connected with _ready False forever. disconnect() is not an
+        # option either — paho 1.6's loop_forever exits its thread for good
+        # when a callback disconnects — so flag it for the worker-tick retry.
+        self._subscribe_failed = subscribe_failed
 
     def _on_subscribe(self, client, userdata, mid, granted_qos) -> None:
         """Verify the granted QoS on SUBACK and surface denials (L-23).
@@ -403,9 +473,14 @@ class MQTTClient:
             logger.error(
                 "Subscription to %s denied by broker (granted QoS %s)", topic, granted
             )
+            # L69: a denied subscription also leaves the client never-ready;
+            # retry it from the worker tick alongside failed subscribe() calls.
+            self._subscribe_failed = True
             return
 
         self._granted_topics.add(topic)
+        if {_READING_TOPIC, _STATUS_TOPIC, _ALERTS_TOPIC} <= self._granted_topics:
+            self._subscribe_failed = False  # L69: everything is subscribed now
 
         if {_READING_TOPIC, _STATUS_TOPIC} <= self._granted_topics:
             if not self._ready:
@@ -439,10 +514,44 @@ class MQTTClient:
         self._ready = False
         self._granted_topics.clear()
         self._pending_subs.clear()
+        # L69: the next _on_connect re-subscribes and re-sets the flag as needed.
+        self._subscribe_failed = False
+
+    def _maybe_retry_subscribes(self) -> None:
+        """Re-issue failed/denied subscriptions on a throttle (L69).
+
+        Called from the worker tick. paho never retries a failed subscribe()
+        from ``_on_connect`` and a disconnect from the callback would exit
+        the loop thread for good, so failed subscribes are flagged there and
+        re-issued here while the client is connected.
+        """
+        if not self._subscribe_failed:
+            return
+        now = time.monotonic()
+        if now < self._next_subscribe_retry:
+            return
+        self._next_subscribe_retry = now + _SUBSCRIBE_RETRY_INTERVAL_S
+        if not self._client.is_connected():
+            return
+        for topic in (_READING_TOPIC, _STATUS_TOPIC, _ALERTS_TOPIC):
+            if topic in self._granted_topics:
+                continue
+            result, mid = self._client.subscribe(topic, qos=_QOS)
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                logger.error("Retry subscribe to %s failed (rc=%s)", topic, result)
+            else:
+                self._pending_subs[mid] = topic
 
     def _on_message(self, client, userdata, msg) -> None:
         """Decode + route on the paho loop; heavier work goes to the worker."""
         try:
+            # L70: drop oversized payloads before any decode/enqueue.
+            if len(msg.payload) > _MAX_PAYLOAD_BYTES:
+                logger.warning(
+                    "Dropping oversized payload on %r (%d bytes > %d) (L70)",
+                    msg.topic, len(msg.payload), _MAX_PAYLOAD_BYTES,
+                )
+                return
             raw = _resolve_payload(msg.payload)
             if raw is None:
                 return
@@ -468,7 +577,10 @@ class MQTTClient:
 
             # M39: bound per-node inbound cadence before the worker queue so
             # a flooding node can't force unbounded parse/validate cost.
-            if _node_rate_limited(node_id):
+            # M101: replayed backlog (device timestamp older than the
+            # freshness threshold) bypasses the limiter so the broker's
+            # offline-queued QoS1 burst isn't dropped on reconnect.
+            if _node_rate_limited(node_id) and not _device_time_is_stale(raw):
                 logger.debug(
                     "Rate-limiting inbound %s for node %r (M39)", match.group("kind"), node_id
                 )
@@ -505,6 +617,7 @@ class MQTTClient:
     def _run_worker(self) -> None:
         """Consume the dispatch queue on a dedicated thread (M-9)."""
         while not self._stop_event.is_set():
+            self._maybe_retry_subscribes()  # L69: throttled subscribe retry
             try:
                 node_id, kind, raw = self._queue.get(timeout=0.2)
             except queue.Empty:
@@ -533,6 +646,13 @@ class MQTTClient:
                 "MQTT TLS requested (MQTT_USE_TLS=True) but TLS was not "
                 "configured — refusing to connect"
             )
+
+        # L76: a duplicate start() while the worker is alive used to spawn a
+        # second worker thread (and replace the stop event the first one was
+        # watching). Ignore it instead of leaking threads.
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            logger.warning("MQTT client already started — ignoring duplicate start()")
+            return
 
         self._stop_event = threading.Event()
         self._worker_thread = threading.Thread(

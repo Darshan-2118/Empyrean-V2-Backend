@@ -35,10 +35,12 @@ def create_app() -> Quart:
     # not HTTP, so it is not bounded by this.
     app.config["MAX_CONTENT_LENGTH"] = cfg.MAX_CONTENT_LENGTH
 
+    # L65: MQTT lifecycle registers first — Quart runs after_serving hooks in
+    # registration order, so the producer stops before DB/Redis tear down.
+    register_mqtt_lifecycle(app, cfg, logger)
     register_database_lifecycle(app, logger)
     register_redis_lifecycle(app)
     register_startup_checks(app, cfg, logger)
-    register_mqtt_lifecycle(app, cfg, logger)
 
     # Setup distributed tracing (M4): a normal package import. Tracing lives
     # in app_factory/, so there is no root-module collision to hack around.

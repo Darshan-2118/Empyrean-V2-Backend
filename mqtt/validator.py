@@ -82,7 +82,10 @@ class StatusPayload(BaseModel):
 
     online: bool
     battery_v: float | None = Field(None, ge=0, le=5)
-    firmware: str | None = None
+    # L70: bound the firmware string so a device can't bloat validated
+    # payloads with an unbounded value (pairs with the _MAX_PAYLOAD_BYTES
+    # drop in mqtt/client.py).
+    firmware: str | None = Field(None, max_length=64)
 
 
 def validate_reading(data: dict) -> "ReadingPayload | None":

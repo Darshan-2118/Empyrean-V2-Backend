@@ -181,8 +181,10 @@ Use Postman, Thunder Client, or `curl`.
 ### 1. Check API Liveness & System Health
 ```http
 GET http://localhost:8000/health
-GET http://localhost:8000/admin/health
+GET http://localhost:8000/api/v1/admin/health
+Authorization: Bearer <admin_access_token>
 ```
+(`/health` is public liveness; `/api/v1/admin/health` requires an admin JWT and reports per-component status.)
 
 ### 2. User Authentication
 ```http
@@ -198,13 +200,13 @@ Content-Type: application/json
 
 ### 3. Retrieve Latest Live Reading
 ```http
-GET http://localhost:8000/api/v1/readings/live?node_id=ESP32-01
+GET http://localhost:8000/api/v1/readings/latest
 Authorization: Bearer <token>
 ```
 
 ### 4. Query Historical Time-Series Readings
 ```http
-GET http://localhost:8000/api/v1/readings/history?node_id=ESP32-01&limit=50
+GET http://localhost:8000/api/v1/readings/history?node_id=ESP32-01&from=2026-08-01T00:00:00Z&to=2026-08-02T00:00:00Z&bucket=1h
 Authorization: Bearer <token>
 ```
 
@@ -218,15 +220,12 @@ Authorization: Bearer <token>
 
 ## 7. Testing Real-Time WebSockets
 
-You can connect using Postman (WebSocket Request), `wscat`, or browser developer tools.
+You can connect using Postman (WebSocket Request), `wscat`, or browser developer tools. There is one socket: `/ws/alerts` (broadcast-only).
 
-### A. Live Telemetry Stream
-- **URL:** `ws://localhost:8000/ws/live`
-- Publish a mock message via MQTT while connected to this WebSocket. You should see the ingested data broadcast immediately.
-
-### B. Live Alerts Stream
-- **URL:** `ws://localhost:8000/ws/alerts`
+### Live Alerts Stream
+- **URL:** `ws://localhost:8000/ws/alerts?token=<access_token>` (or send the token via the `Authorization: Bearer` header where the client supports it).
 - Publish an extreme PM2.5 value (e.g. `"pm25": 250.0`) to trigger an alert and verify the instant breach notification.
+- The socket must re-authenticate every 15 minutes by sending a `{"token": "<fresh_access_token>"}` text frame; otherwise the server closes it with code `4401`.
 
 ---
 
@@ -235,7 +234,7 @@ You can connect using Postman (WebSocket Request), `wscat`, or browser developer
 ### Check Celery Worker Console
 When a reading is published, the Celery worker window will log:
 ```
-[INFO] Task tasks.readings.process_reading[...] received
+[INFO] Task empyrean.tasks.process_reading[...] received
 [INFO] Processed reading for node ESP32-01: AQI=..., FuzzyScore=...
 ```
 
@@ -249,7 +248,7 @@ ORDER BY time DESC
 LIMIT 10;
 
 -- Check recorded alerts:
-SELECT * FROM alerts ORDER BY created_at DESC LIMIT 10;
+SELECT * FROM alerts ORDER BY triggered_at DESC LIMIT 10;
 ```
 
 ---

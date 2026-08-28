@@ -1,3 +1,4 @@
+import hmac
 import time
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -62,7 +63,10 @@ def register_metrics(app):
         secret = get_config().METRICS_SECRET
         if secret:
             provided = request.headers.get("X-Metrics-Secret", "")
-            if provided != secret:
+            # L55: constant-time comparison; an empty header never matches.
+            if not provided or not hmac.compare_digest(
+                provided.encode(), secret.encode()
+            ):
                 return "Forbidden", 403
         # A 2-tuple (body, content_type) would be parsed as a status code.
         return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}

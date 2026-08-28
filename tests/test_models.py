@@ -26,6 +26,28 @@ TARGETED_SERVER_DEFAULTS = {
 }
 
 
+def test_get_sync_db_chains_rollback_error_to_original(monkeypatch):
+    """L68: when the rollback itself fails, the raised error chains back to
+    the original failure instead of suppressing it (old ``from None``)."""
+    import models.base as base
+
+    class _FakeSession:
+        def commit(self):
+            raise ValueError("original failure")
+
+        def rollback(self):
+            raise RuntimeError("rollback failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(base, "get_sync_session_local", lambda: (lambda: _FakeSession()))
+    with pytest.raises(RuntimeError) as excinfo:
+        with base.get_sync_db():
+            pass
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
 @pytest.mark.parametrize("tbl,col", sorted(TARGETED_SERVER_DEFAULTS))
 def test_server_default_declared(tbl, col):
     """Each M-17 column declares a ``server_default`` on its mapped column."""

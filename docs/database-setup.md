@@ -213,6 +213,9 @@ The migration sequence:
 2. `0002_add_timescaledb_hypertable.py`: Runs `CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE` and transforms `sensor_readings` into a TimescaleDB hypertable with 7-day chunking on the `time` column.
 3. `0003_add_alerts_partial_unique.py`: Adds active alert deduplication indexes.
 4. `0004_add_server_defaults.py`: Ensures PostgreSQL-level default timestamps and flags.
+5. `0005_add_audit_logs.py`: Creates the `audit_logs` table backing the admin settings audit trail.
+6. `0006_add_alert_constraints.py`: Adds alert hardening — `CHECK (LENGTH(message) <= 10000)`, the partial `(triggered_at DESC) WHERE unacked` index, and `refresh_tokens.token_hash` narrowed to `VARCHAR(64)`.
+7. `0007_add_refresh_token_expiry_index.py`: Adds the `(expires_at)` index on `refresh_tokens` so expiry sweeps stop seq-scanning.
 
 ### Apply Migrations:
 
@@ -238,10 +241,10 @@ python scripts/seed.py
 ```
 
 ### Seeded Defaults:
-- **Admin Account**:
-  - **Username**: `Darshan`
-  - **Password**: `Darsh1812`
-  - **Role**: `admin`
+- **Admin Account**: there is no hardcoded admin. Set `BOOTSTRAP_ADMIN_USERNAME` /
+  `BOOTSTRAP_ADMIN_PASSWORD` (optionally `BOOTSTRAP_ADMIN_EMAIL`) in `.env` before
+  seeding; the seeder creates that user with the `admin` role. The password must
+  pass the strength gate (≥ 8 chars, mixed case, digit, symbol).
 - **Default Node**:
   - **Node ID**: `ESP32-01`
   - **Location**: `Lab 1 - Central Monitoring`

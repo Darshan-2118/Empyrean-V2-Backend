@@ -289,7 +289,16 @@ async def export():
             f"range exceeds the maximum export span of {MAX_EXPORT_SPAN.days} days",
         )
 
-    node_id = request.args.get("node_id") or None
+    node_id = request.args.get("node_id")
+    # L56: mirror /readings/history's M35 guard — an explicit empty/whitespace
+    # ``?node_id=`` is a 422, not silently "all nodes".
+    if node_id is not None and not node_id.strip():
+        return problem_json(
+            422,
+            "Unprocessable Entity",
+            "node_id must not be empty when provided (omit the parameter for all nodes)",
+        )
+    node_id = node_id or None
 
     # H18: per-user throttle — one export per EXPORT_COOLDOWN_SECONDS.
     from quart import g

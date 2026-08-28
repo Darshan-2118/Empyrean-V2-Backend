@@ -27,30 +27,30 @@ Empyrean V2 is a real-time air quality ingestion, analysis, alerting, and foreca
 |  Empyrean Backend Services                                |
 |                                                           |
 |  [MQTT Client Lifecycle]                                  |
-|         │ (validates schema, extracts node_id)            |
-|         ▼                                                 |
+|         | (validates schema, extracts node_id)            |
+|         v                                                 |
 |  [Celery Task Queue: Redis Broker]                        |
-|         │                                                 |
-|         ├──▶ [process_reading] ──▶ Anomaly Detection      |
-|         │                      ──▶ TimescaleDB Storage    |
-|         │                      ──▶ AQI Calculation        |
-|         │                      ──▶ Threshold & Alerts     |
-|         │                                                 |
-|         └──▶ [Celery Beat Schedulers]                     |
-|                ├── Node offline heartbeats                |
-|                ├── Daily statistical aggregations         |
-|                ├── Data retention cleanup                 |
-|                └── Hourly AQI forecast updates            |
+|         |                                                 |
+|         +--> [process_reading] --> Anomaly Detection      |
+|         |                      --> TimescaleDB Storage    |
+|         |                      --> AQI Calculation        |
+|         |                      --> Threshold & Alerts     |
+|         |                                                 |
+|         \--> [Celery Beat Schedulers]                     |
+|                +-- Node offline heartbeats                |
+|                +-- Daily statistical aggregations         |
+|                +-- Data retention cleanup                 |
+|                \-- Hourly AQI forecast updates            |
 |                                                           |
 |  [Quart ASGI HTTP & WebSocket Server] (Hypercorn)         |
-|         ├── REST API: /api/v1/{auth, readings, nodes, ...}|
-|         ├── Live WebSocket: /ws/alerts, /ws/live          |
-|         ├── Prometheus Metrics: /metrics                  |
-|         └── System Health: /admin/health                  |
+|         +-- REST API: /api/v1/{auth, readings, nodes, ...}|
+|         +-- Live WebSocket: /ws/alerts                    |
+|         +-- Prometheus Metrics: /metrics                  |
+|         \-- System Health: /api/v1/admin/health           |
 |                                                           |
 |  [Persistence & Cache Layer]                              |
-|         ├── PostgreSQL + TimescaleDB (time-series)        |
-|         └── Redis (rate limiting, cache, celery broker)   |
+|         +-- PostgreSQL + TimescaleDB (time-series)        |
+|         \-- Redis (rate limiting, cache, celery broker)   |
 +-----------------------------------------------------------+
 ```
 
@@ -129,11 +129,13 @@ python scripts/seed.py
 > 📖 **Need help installing or configuring PostgreSQL & TimescaleDB?**  
 > See our step-by-step [PostgreSQL & TimescaleDB Setup Guide](docs/database-setup.md) for Docker, Windows (WSL2 / Native), Linux, macOS, and Cloud setup, or watch this [TimescaleDB Installation Video Tutorial (YouTube)](https://youtu.be/KlOGfFzLdqA).
 
-> 💡 **Default Admin Access:**
-> A hardcoded admin user is available out-of-the-box for frontend integration and administrative access:
-> - **Username:** `Darshan`
-> - **Password:** `Darsh1812`
-> - **Role:** `admin` (full permissions across all regular and `@admin_required` endpoints)
+> 💡 **Admin Access:**
+> There are no hardcoded credentials. To provision an admin account, set
+> `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, and (optionally)
+> `BOOTSTRAP_ADMIN_EMAIL` in `.env` **before** running `python scripts/seed.py` —
+> the seeder creates (or promotes) that user with the `admin` role. The password
+> must pass the strength gate (≥ 8 chars, mixed case, digit, symbol) and is never
+> a known-weak value.
 
 ### 5. Pre-flight Stack Health Check
 
@@ -219,11 +221,13 @@ pytest tests/test_phase_coverage.py -v
 
 ### Verify Live Service Health
 
-Once the stack is running, confirm all components are healthy via the admin endpoint:
+Once the stack is running, confirm all components are healthy via the admin endpoint (requires an admin JWT):
 
 ```bash
-curl http://localhost:8000/admin/health
+curl -H "Authorization: Bearer <admin_access_token>" http://localhost:8000/api/v1/admin/health
 ```
+
+For an unauthenticated liveness check, use `GET /health` at the root.
 
 ---
 
@@ -234,20 +238,21 @@ curl http://localhost:8000/admin/health
 | **Auth** | `/api/v1/auth/register` | `POST` | Register a new user |
 | | `/api/v1/auth/login` | `POST` | Authenticate and obtain JWT token pair |
 | | `/api/v1/auth/refresh` | `POST` | Rotate and issue fresh access/refresh tokens |
-| | `/api/v1/auth/logout` | `POST` | Invalidate active refresh token |
-| | `/api/v1/auth/me` | `GET` / `PATCH` | Current user profile |
+| | `/api/v1/auth/logout` | `POST` | Revoke refresh token and the presented access token |
+| **Profile** | `/api/v1/profile` | `GET` / `PATCH` / `DELETE` | Current user profile (view, update, deactivate) |
+| | `/api/v1/profile/change-password` | `POST` | Change password (revokes all sessions) |
 | **Readings** | `/api/v1/readings/latest` | `GET` | Latest telemetry across nodes |
 | | `/api/v1/readings/history` | `GET` | Aggregated time-series history (`time_bucket`) |
-| | `/api/v1/readings/export` | `GET` | Export sensor telemetry (CSV / JSON) |
+| **Export** | `/api/v1/export` | `GET` | Streaming CSV export of raw readings |
 | **Nodes** | `/api/v1/nodes` | `GET` / `POST` | List and register IoT sensor nodes |
-| | `/api/v1/nodes/<node_id>` | `GET` / `PATCH` | Node detail and configuration updates |
-| **Alerts** | `/api/v1/alerts` | `GET` | List active & historic alerts |
-| | `/api/v1/alerts/<id>/ack` | `POST` | Acknowledge active alert |
-| **Forecast** | `/api/v1/forecast/<node_id>` | `GET` | Short-term AQI trend forecast |
-| **System** | `/admin/health` | `GET` | Component health diagnostics |
+| | `/api/v1/nodes/<node_id>` | `PATCH` | Node configuration updates |
+| **Alerts** | `/api/v1/alerts` | `GET` | List unacknowledged alerts |
+| | `/api/v1/alerts/<id>/acknowledge` | `PATCH` | Acknowledge an alert |
+| **Forecast** | `/api/v1/forecast?node_id=<node_id>` | `GET` | Short-term AQI trend forecast |
+| **System** | `/api/v1/admin/health` | `GET` | Component health diagnostics (admin) |
+| | `/api/v1/admin/settings` | `GET` / `PATCH` | System settings registry (admin) |
 | | `/metrics` | `GET` | Prometheus instrumentation metrics |
 | **WebSockets** | `/ws/alerts` | `WS` | Real-time threshold breach notifications |
-| | `/ws/live` | `WS` | Live sensor telemetry stream |
 
 > 📖 For complete endpoint contracts, request/response schemas, and query parameters, see [docs/api.md](docs/api.md).
 
@@ -263,7 +268,7 @@ Detailed guides and specifications are available in the [`docs/`](docs/) directo
 - [Database Schema & Migrations](docs/database.md)
 - [API Reference](docs/api.md)
 - [Fuzzy Inference Engine](docs/fuzzy-engine.md)
-- [Production Deployment Guide](docs/deployment.md)
+- [Production Deployment (Getting Started § Production)](docs/getting-started.md#production-deployment)
 - [Security & Hardening](docs/security.md)
 - [Testing & Quality Assurance](docs/testing.md)
 - [Project Structure](docs/project-structure.md)

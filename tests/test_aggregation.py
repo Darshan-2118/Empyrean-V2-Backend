@@ -75,3 +75,51 @@ def test_hourly_aggregate_is_idempotent():
     # Idempotent: still exactly one bucket, identical values.
     assert rows2 == rows1
     assert second["buckets"] >= 0
+
+
+def test_hourly_aggregate_folds_late_readings_behind_watermark():
+    """L71: a late reading landing in an already-closed hour behind the
+    watermark (H25 accepts device timestamps up to 24h in the past) is folded
+    in on the next run instead of being skipped forever."""
+    tag = secrets.token_hex(3)
+    node_id = f"AGG-{tag.upper()}"
+
+    now = datetime.now(timezone.utc)
+    closed_hour = (now - timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    late_hour = closed_hour - timedelta(hours=1)
+
+    with get_sync_db() as session:
+        session.execute(text("DELETE FROM hourly_agg"))
+        session.add(Node(
+            node_id=node_id, name="agg late fold", location_name="Test Lab",
+            lat=0.0, lon=0.0, reading_interval=30, is_active=True,
+        ))
+        session.add(SensorReading(
+            node_id=node_id,
+            time=closed_hour + timedelta(minutes=5),
+            temperature=20.0, humidity=40.0, pm25=30.0,
+            aqi=90, aqi_category="Moderate", fuzzy_score=40.0,
+            is_anomaly=False,
+        ))
+
+    first = hourly_aggregate()
+    assert first["buckets"] >= 1
+    assert len(_node_rows(node_id)) == 1
+
+    with get_sync_db() as session:
+        # Late reading for an hour already BEHIND the watermark (within 24h).
+        session.add(SensorReading(
+            node_id=node_id,
+            time=late_hour + timedelta(minutes=5),
+            temperature=25.0, humidity=50.0, pm25=35.0,
+            aqi=100, aqi_category="Moderate", fuzzy_score=45.0,
+            is_anomaly=False,
+        ))
+
+    hourly_aggregate()
+    rows = _node_rows(node_id)
+    assert len(rows) == 2, f"expected the late hour folded in, got {rows!r}"
+    late_rows = [r for r in rows if r[0] == late_hour]
+    assert late_rows and late_rows[0][1] == 1  # reading_count

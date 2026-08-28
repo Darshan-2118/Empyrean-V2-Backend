@@ -26,8 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app import create_app
 from api.jwt import create_access_token, generate_refresh_token
@@ -269,3 +272,189 @@ def test_no_hardcoded_admin_without_env_config():
         username, password, _ = creds
         assert password != "Darsh1812"
         assert username.lower() != "darshan"
+
+
+# ── M91: bootstrap admin must not promote a case-variant account ─────────────
+
+
+def test_m91_bootstrap_refuses_case_variant_account(monkeypatch):
+    """A pre-registered case-variant account is never promoted (M91)."""
+    import api.auth
+    from config import get_config as real_get_config
+
+    tag = secrets.token_hex(4)
+    existing_username = f"BootAdmin_{tag}"  # registered by an "attacker"
+    bootstrap_username = f"bootadmin_{tag}"  # differs only in case
+
+    attacker_hash = hash_password("attacker-pass-1", rounds=4)
+    with get_sync_db() as session:
+        user = User(
+            username=existing_username,
+            email=f"{existing_username.lower()}@example.com",
+            password_hash=attacker_hash,
+            role="user",
+            is_active=True,
+            notification_prefs={},
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+
+    real_cfg = real_get_config()
+
+    class _Cfg:
+        """Real config with bootstrap admin fields overridden."""
+
+        def __getattr__(self, name):
+            return getattr(real_cfg, name)
+
+    cfg = _Cfg()
+    cfg.BOOTSTRAP_ADMIN_USERNAME = bootstrap_username
+    cfg.BOOTSTRAP_ADMIN_PASSWORD = f"B00tstrap-{tag}-pass!"
+    cfg.BOOTSTRAP_ADMIN_EMAIL = ""
+    monkeypatch.setattr(api.auth, "get_config", lambda: cfg)
+
+    async def _scenario():
+        result = await api.auth.ensure_hardcoded_admin()
+        # M91: refuse to promote — never touch the case-variant row.
+        assert result is None
+
+    _run_async(_scenario())
+
+    with get_sync_db() as session:
+        row = session.get(User, user_id)
+        assert row is not None
+        assert row.username == existing_username
+        assert row.role == "user"
+        assert row.is_active is True
+        assert row.password_hash == attacker_hash
+        # No account with the exact bootstrap username was created either.
+        from sqlalchemy import select
+
+        created = session.execute(
+            select(User).where(User.username == bootstrap_username)
+        ).scalar_one_or_none()
+        assert created is None
+
+
+# ── L51: logout revokes the presented access token ───────────────────────────
+
+
+async def _redis_or_skip():
+    """Return the live cache client, or pytest.skip when Redis is unreachable."""
+    from api.cache import get_client
+
+    client = get_client()
+    if client is None:
+        pytest.skip("Redis unavailable — jti blocklist requires Redis")
+    try:
+        assert await client.ping()
+    except Exception:  # noqa: BLE001 - Redis down must skip, not fail
+        pytest.skip("Redis unavailable — jti blocklist requires Redis")
+    return client
+
+
+def test_l51_logout_revokes_presented_access_token():
+    """Logout blocklists the Bearer token presented in the Authorization header."""
+    user_id = _seed_user("t51")
+    token = create_access_token(user_id, "user")
+    raw_refresh, _, _ = _seed_refresh_token(
+        user_id, expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+
+    async def _scenario():
+        redis = await _redis_or_skip()
+        client = create_app().test_client()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # The access token works before logout.
+        resp = await client.get("/api/v1/profile", headers=headers)
+        assert resp.status_code == 200, (resp.status_code, await resp.get_data())
+
+        resp = await client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": raw_refresh},
+            headers=headers,
+        )
+        assert resp.status_code == 204
+
+        # L51: the same access token is now blocklisted via its jti.
+        resp = await client.get("/api/v1/profile", headers=headers)
+        assert resp.status_code == 401, (resp.status_code, await resp.get_data())
+
+        # The per-jti key carries a TTL (self-cleaning blocklist).
+        from api.jwt import _BLOCKLIST_KEY_PREFIX, decode_access_token
+
+        jti = decode_access_token(token)["jti"]
+        ttl = await redis.ttl(_BLOCKLIST_KEY_PREFIX + jti)
+        assert ttl > 0
+
+    _run_async(_scenario())
+
+
+def test_l51_logout_best_effort_never_breaks_204():
+    """Logout with a Bearer token still returns 204 even if revocation degrades."""
+    user_id = _seed_user("t51b")
+    token = create_access_token(user_id, "user")
+    raw_refresh, _, _ = _seed_refresh_token(
+        user_id, expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+
+    async def _scenario():
+        client = create_app().test_client()
+        resp = await client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": raw_refresh},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 204
+
+    _run_async(_scenario())
+
+
+# ── H37: password_hash is never served from the user cache ───────────────────
+
+
+def test_h37_password_hash_excluded_from_user_cache():
+    """The cached User payload omits password_hash entirely (H37)."""
+    user_id = _seed_user("t37")
+    token = create_access_token(user_id, "user")
+
+    async def _scenario():
+        redis = await _redis_or_skip()
+        client = create_app().test_client()
+
+        resp = await client.get(
+            "/api/v1/profile", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert resp.status_code == 200, (resp.status_code, await resp.get_data())
+
+        from api.jwt import _user_cache_key
+
+        raw = await redis.get(_user_cache_key(user_id))
+        assert raw is not None  # the auth step populated the cache
+        payload = json.loads(raw)
+        assert "password_hash" not in payload
+
+    _run_async(_scenario())
+
+
+# ── M92: change-password is rate limited ─────────────────────────────────────
+
+
+def test_m92_change_password_is_rate_limited():
+    """/profile/change-password carries the per-IP rate-limit headers (M92)."""
+    user_id = _seed_user("t92")
+    token = create_access_token(user_id, "user")
+
+    async def _scenario():
+        client = create_app().test_client()
+        resp = await client.post(
+            "/api/v1/profile/change-password",
+            json={"current_password": "wrong-pass", "new_password": "New-pass-123!"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 401  # wrong current password
+        assert resp.headers.get("X-RateLimit-Limit") == "10"
+
+    _run_async(_scenario())

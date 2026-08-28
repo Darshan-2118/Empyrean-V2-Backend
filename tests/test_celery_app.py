@@ -17,12 +17,26 @@ def test_task_time_limits_and_prefetch_tuning():
     assert conf.worker_prefetch_multiplier == 1
 
 
-def test_at_least_once_delivery_settings_preserved():
-    """M-6 entries must survive the L-5/L-15 edit."""
+def test_ack_contract_is_at_most_once_for_failures():
+    """M96: failed/hard-killed tasks are acked (at-most-once for non-retriable
+    failures); a worker dying mid-task still redelivers via reject_on_worker_lost."""
     conf = celery_app.celery_app.conf
     assert conf.task_acks_late is True
     assert conf.task_reject_on_worker_lost is True
-    assert conf.task_acks_on_failure_or_timeout is False
+    assert conf.task_acks_on_failure_or_timeout is True
+
+
+def test_task_results_are_ignored():
+    """L61: nothing reads task results, so they are dropped, not stored."""
+    conf = celery_app.celery_app.conf
+    assert conf.task_ignore_result is True
+
+
+def test_broker_startup_retries_are_bounded():
+    """L63: startup retries are capped; systemd restarts after exhaustion."""
+    conf = celery_app.celery_app.conf
+    assert conf.broker_connection_max_retries == 30
+    assert conf.broker_transport_options["max_retries"] == 30
 
 
 def test_alert_check_keeps_fixed_60s_interval():
@@ -37,10 +51,11 @@ def test_hourly_aggregation_is_cron_minute_7():
     assert sched["hourly-aggregation"]["schedule"] == crontab(minute=7)
 
 
-def test_model_retraining_is_cron_minute_7():
-    """L-15: retraining aligns with aggregation at minute 7."""
+def test_model_retraining_is_cron_minute_37():
+    """L62: retraining is offset from aggregation (minute 7) so the two
+    heaviest DB jobs no longer collide every hour."""
     sched = celery_app.celery_app.conf.beat_schedule
-    assert sched["forecast-model-retraining"]["schedule"] == crontab(minute=7)
+    assert sched["forecast-model-retraining"]["schedule"] == crontab(minute=37)
 
 
 def test_retention_cleanup_is_daily_cron_0323():
@@ -49,12 +64,14 @@ def test_retention_cleanup_is_daily_cron_0323():
     assert sched["data-retention-cleanup"]["schedule"] == crontab(hour=3, minute=23)
 
 
-def test_beat_schedule_has_exactly_four_keys():
-    """Guard against accidental add/remove of entries."""
+def test_beat_schedule_has_exactly_five_keys():
+    """Guard against accidental add/remove of entries (refresh-token-cleanup
+    was added by M79 without updating this guard)."""
     keys = list(celery_app.celery_app.conf.beat_schedule)
     assert keys == [
         "alert-threshold-check",
         "hourly-aggregation",
         "forecast-model-retraining",
         "data-retention-cleanup",
+        "refresh-token-cleanup",
     ]

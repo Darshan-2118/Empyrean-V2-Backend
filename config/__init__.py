@@ -13,7 +13,7 @@ import logging
 import os
 from pathlib import Path
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -247,6 +247,22 @@ class Config(BaseSettings):
             raise ValueError(f"MAX_CONTENT_LENGTH must be a positive byte count, got {v}")
         return v
 
+    # M98: operational numerics must be positive — zero/negative values fail
+    # silently downstream: dead-on-arrival JWT expiries (total auth outage),
+    # ``Queue(maxsize<=0)`` becoming unbounded (no MQTT backpressure), or
+    # exports truncating instantly.
+    @field_validator(
+        "JWT_ACCESS_TOKEN_EXPIRY_MINUTES",
+        "JWT_REFRESH_TOKEN_EXPIRY_DAYS",
+        "EXPORT_TIMEOUT_SECONDS",
+        "MQTT_QUEUE_MAX",
+    )
+    @classmethod
+    def _validate_positive_operational_values(cls, v: int, info: ValidationInfo) -> int:
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be a positive value, got {v}")
+        return v
+
     @field_validator("DATABASE_URL")
     @classmethod
     def _validate_database_url(cls, v: str) -> str:
@@ -260,10 +276,13 @@ class Config(BaseSettings):
         from urllib.parse import urlparse
 
         parsed = urlparse(v)
-        if parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg", "postgresql+asyncpg"}:
+        # M97: allow only schemes the installed sync driver can actually use —
+        # postgresql+psycopg needs the uninstalled psycopg v3 and
+        # postgresql+asyncpg breaks the sync engine with MissingGreenlet.
+        if parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg2"}:
             raise ValueError(
-                f"DATABASE_URL must be a postgresql:// URL, got scheme "
-                f"{parsed.scheme!r} in {v!r}"
+                "DATABASE_URL must use scheme postgresql://, postgres:// or "
+                f"postgresql+psycopg2://, got scheme {parsed.scheme!r} in {v!r}"
             )
         if not parsed.hostname:
             raise ValueError(f"DATABASE_URL must include a host, got {v!r}")
@@ -372,6 +391,13 @@ class Config(BaseSettings):
             )
             if _is_weak_secret(value, check_strength=check_strength)
         ]
+        # L66: a *set* bootstrap admin password gets the same gate — dev
+        # placeholders are rejected in all environments and the full strength
+        # check applies unless APP_ENV=test. Empty stays valid (the opt-out).
+        if self.BOOTSTRAP_ADMIN_PASSWORD and _is_weak_secret(
+            self.BOOTSTRAP_ADMIN_PASSWORD, check_strength=check_strength
+        ):
+            bad.append("BOOTSTRAP_ADMIN_PASSWORD")
         if bad:
             raise ValueError(
                 "Refusing to start with weak secrets: "

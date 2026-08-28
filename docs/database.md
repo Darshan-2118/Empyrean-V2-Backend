@@ -1,6 +1,6 @@
 # Empyrean — Database Schema
 
-This document is the concise runtime reference for the database tables and Redis keys. For the design rationale, table-by-table justifications, and the migration strategy, see [schema-plan.md](schema-plan.md).
+This document is the concise runtime reference for the database tables and Redis keys.
 
 Seven tables implemented via SQLAlchemy 2.0 + Alembic migrations:
 
@@ -25,12 +25,12 @@ Server-side storage enabling logout (set `revoked = True`) and refresh-token rot
 |--------|------|-------|
 | `id` | `INTEGER PK` | |
 | `user_id` | `INTEGER FK → users` | ON DELETE CASCADE |
-| `token_hash` | `VARCHAR(255)` | Hashed token (never store raw) |
+| `token_hash` | `VARCHAR(64)` | SHA-256 hex digest (never store raw) |
 | `expires_at` | `TIMESTAMPTZ` | Matches JWT claim |
 | `created_at` | `TIMESTAMPTZ` | |
 | `revoked` | `BOOLEAN` | TRUE on logout/rotation |
 
-Indexed on `(user_id)` and `(token_hash)`.
+Indexed on `(user_id)`, `(token_hash)`, and `(expires_at)` (migration `0007` — keeps the expiry sweep off a seq scan).
 
 ## `nodes` — sensor devices
 | Column | Type | Notes |
@@ -104,7 +104,7 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 
 ## Redis Key Schema
 
-> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. Phase 9 added `alerts:unacked` (30s TTL). Phase 10 added `celery:heartbeat:beat`. The remaining keys land with their phases.
+> **Status:** Live since Phase 5: `readings:latest`, `readings:latest:{node_id}`, and `ratelimit:{endpoint}:{ip}:{minute}`. Phase 7 added `celery:forecast:{node_id}:{version}` and `forecast:model:{node_id}`. Phase 8 added `nodes:all`. Phase 9 added `alerts:unacked` (30s TTL). Phase 10 added `celery:heartbeat:beat`. The auth hardening waves added `cache:user:{user_id}` (JWT user cache) and `jwt:blocklist:{jti}` (access-token revocation).
 
 | Key Pattern | TTL | Value |
 |---|---|---|
@@ -114,7 +114,9 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 | `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — added in Phase 9; written by `GET /alerts`, invalidated by `PATCH /alerts/:alert_id/acknowledge` |
 | `celery:heartbeat:beat` | 3600s | ISO-8601 UTC timestamp of the last beat tick — written by `tasks.alerts.check_thresholds` (the 60s beat task, so this doubles as beat liveness); read by `GET /admin/health`, which reports `celery_beat` healthy while the stamp is ≤180s old (3× the schedule) |
 | `ratelimit:{endpoint}:{ip}:{minute}` | 60s | Request count (int) — per endpoint, per IP, per UTC minute (e.g. `ratelimit:auth.login:192.0.2.10:202608051530`); each endpoint has its own per-IP budget, so one endpoint cannot exhaust another's |
-| `celery:forecast:{node_id}` | 3600s | AQI forecast array (JSON) — read/written by the `/forecast` endpoint & `generate_forecast` |
+| `cache:user:{user_id}` | 30s | Cached user row for JWT authentication (JSON) — read-through on every authenticated request; `password_hash` is **never** cached (H37); invalidated on password change / account deactivation |
+| `jwt:blocklist:{jti}` | remaining token lifetime | `1` — set when an access token is revoked (logout, password change, account deactivation); self-cleaning since the TTL matches the token's remaining validity |
+| `celery:forecast:{node_id}:{version}` | 3600s | AQI forecast array (JSON) — versioned by the model's `trained_at` (M50) so a retrain invalidates stale forecasts; read/written by the `/forecast` endpoint & `generate_forecast` |
 | `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `empyrean.tasks.forecast.retrain_model` |
 
 TTLs are tuned per data volatility, not a single blanket value: live readings never go stale beyond 60s, while less time-sensitive data (node metadata, forecasts) uses a longer TTL to cut down on recomputation.

@@ -25,13 +25,14 @@ from config import get_config
 
 logger = logging.getLogger("empyrean.auth")
 
-cfg = get_config()
-JWT_SECRET = cfg.JWT_SECRET
 # H4/M66: the algorithm is pinned literally, never read from config. Even
 # though Config now validates JWT_ALGORITHM == "HS256", defense in depth says
 # the security-critical decode path must not depend on a mutable knob at all.
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRY_MINUTES = cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES
+
+# L52: JWT_SECRET and the access-token expiry are resolved via get_config()
+# inside each call (no module-level snapshot), so a reset_config_cache() is
+# never left serving a stale secret/expiry.
 
 # M12: short-TTL Redis cache for the authenticated User row, so most requests
 # avoid a DB round-trip. ~30s TTL bounds deactivation/role-change staleness;
@@ -51,7 +52,9 @@ def _serialise_user_for_cache(user) -> dict:
         "id": user.id,
         "username": user.username,
         "email": user.email,
-        "password_hash": user.password_hash,
+        # H37: password_hash is deliberately never cached — a stale cached hash
+        # would let the old password validate after a change; consumers must
+        # fetch the hash fresh from the DB.
         "role": user.role,
         "is_active": bool(user.is_active),
         "notification_prefs": prefs,
@@ -84,11 +87,13 @@ def _cache_hit_to_user(payload: dict):
         except (TypeError, ValueError):
             return None
 
+    # H37: password_hash is never cached, so the reconstructed user carries no
+    # hash (legacy payloads that still contain the key are tolerated/ignored) —
+    # any password verification must read the current hash from the DB.
     return User(
         id=payload["id"],
         username=payload["username"],
         email=payload["email"],
-        password_hash=payload["password_hash"],
         role=payload["role"],
         is_active=payload["is_active"],
         notification_prefs=payload.get("notification_prefs") or {},
@@ -179,8 +184,10 @@ def create_access_token(user_id: int, role: str) -> str:
     """Create a short-lived JWT access token (HS256).
 
     The token carries a unique ``jti`` claim so it can be individually
-    revoked via the Redis blocklist (H7) — e.g. on logout or password change.
+    revoked via the per-jti Redis blocklist (H7/L51) — on logout or password
+    change.
     """
+    cfg = get_config()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
@@ -188,19 +195,21 @@ def create_access_token(user_id: int, role: str) -> str:
         "type": "access",
         "jti": secrets.token_urlsafe(16),
         "iat": now,
-        "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRY_MINUTES),
+        "exp": now + timedelta(minutes=cfg.JWT_ACCESS_TOKEN_EXPIRY_MINUTES),
     }
-    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return pyjwt.encode(payload, cfg.JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 # ── Access-token revocation (H7/H16) ──────────────────────────────────────────
-# A Redis SET of revoked ``jti`` values. Each entry's TTL equals the token's
-# remaining lifetime, so the blocklist self-cleans and never grows unboundedly.
+# L51: one Redis key per revoked ``jti`` (``jwt:blocklist:{jti}``), written
+# atomically with ``SET ... EX <ttl>`` where the TTL is the token's remaining
+# lifetime — every entry expires itself, so the blocklist self-cleans and can
+# never grow unboundedly.
 # When Redis is unavailable the check fails *open* (matching the rate limiter's
 # documented posture): a 15-minute access token is still bounded by its expiry,
 # and revocation is best-effort rather than a hard dependency.
 
-_BLOCKLIST_KEY = "jwt:blocklist"
+_BLOCKLIST_KEY_PREFIX = "jwt:blocklist:"
 
 
 async def revoke_access_token(payload: dict[str, Any]) -> None:
@@ -222,10 +231,8 @@ async def revoke_access_token(payload: dict[str, Any]) -> None:
             return
         exp = payload.get("exp")
         ttl = max(int(exp - datetime.now(timezone.utc).timestamp()), 1) if exp else 3600
-        await client.sadd(_BLOCKLIST_KEY, jti)
-        # Keep the whole set alive at least as long as this entry needs to be;
-        # individual entries are pruned by _is_token_revoked's lazy cleanup.
-        await client.expire(_BLOCKLIST_KEY, max(ttl, 3600))
+        # L51: single atomic SET with the remaining-lifetime TTL.
+        await client.set(_BLOCKLIST_KEY_PREFIX + jti, 1, ex=ttl)
     except Exception:
         logger.exception("Failed to blocklist access-token jti %r", jti)
 
@@ -240,7 +247,7 @@ async def _is_token_revoked(jti: str | None) -> bool:
         client = get_client()
         if client is None:
             return False
-        return bool(await client.sismember(_BLOCKLIST_KEY, jti))
+        return bool(await client.exists(_BLOCKLIST_KEY_PREFIX + jti))
     except Exception:
         logger.exception("Blocklist lookup failed for jti %r — failing open", jti)
         return False
@@ -254,7 +261,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
     """
     payload = pyjwt.decode(
         token,
-        JWT_SECRET,
+        get_config().JWT_SECRET,
         algorithms=[JWT_ALGORITHM],  # pinned to ["HS256"] — see H4
         options={"require": ["sub", "exp"]},
     )
