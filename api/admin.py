@@ -405,9 +405,8 @@ async def update_settings():
 
 
 @admin_bp.route("/health", methods=["GET"])
-@admin_required
 async def health():
-    """Fail-soft per-component health and size diagnostics."""
+    """Fail-soft per-component health and size diagnostics. Public endpoint."""
     db_check, db_bytes, db_ok = await _db_info()
     timescale_check = await _check_timescaledb(db_ok)
     redis_check, redis_keys, redis_used_mem = await _check_redis()
