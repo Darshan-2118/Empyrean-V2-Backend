@@ -195,6 +195,22 @@ COMPONENTS: dict[str, dict[str, object]] = {
             "",
         ],
     },
+    "tunnel": {
+        "color": "1;33",  # bold bright orange/yellow
+        "lines": [
+            "",
+            "☁  C L O U D F L A R E   T U N N E L  ☁",
+            "",
+            "Boring a secure tunnel through the internet.",
+            "",
+            "> Tunnel      →  empyrean",
+            "> Provider    →  Cloudflare (cloudflared)",
+            "> Exposes     →  localhost:8000 to the world",
+            "",
+            "Your API, publicly reachable — securely",
+            "",
+        ],
+    },
 }
 
 _BOX_WIDTH = 70

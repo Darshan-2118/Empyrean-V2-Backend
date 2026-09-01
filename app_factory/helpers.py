@@ -176,12 +176,13 @@ def register_error_handlers(app: Quart, app_logger: logging.Logger) -> None:
 
 
 def register_health(app: Quart, cfg, app_logger: logging.Logger) -> None:
-    """Register the unauthenticated /health liveness endpoint.
+    """Register the unauthenticated /health liveness endpoint and root redirect."""
+    from quart import redirect
 
-    H3: the response intentionally carries no environment information — an
-    unauthenticated caller must not learn whether a host is production.
-    Component-level diagnostics live behind admin auth (GET /api/v1/admin/health).
-    """
+    @app.route("/", methods=["GET"])
+    async def root():
+        return redirect("/api/v1/admin/health", code=302)
+
     @app.route("/health", methods=["GET"])
     async def health_check():
         return jsonify({"status": "ok"}), 200

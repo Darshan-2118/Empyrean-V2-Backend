@@ -91,14 +91,15 @@ if %errorlevel% equ 0 goto :launch_wt
 :launch_separate
 echo Windows Terminal (wt.exe) not found; launching in separate windows...
 start "empyrean-wsl-instance" cmd /k "scripts\wsl-instance.bat"
+start "empyrean-tunnel" cmd /k "cd /d "%CD%" && title empyrean-tunnel && python scripts\banner.py tunnel && cloudflared tunnel run empyrean"
 start "empyrean-celery-worker" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && title empyrean-celery-worker && python scripts\banner.py worker && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info"
 start "empyrean-celery-beat" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && title empyrean-celery-beat && python scripts\banner.py beat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info"
 start "empyrean-server" cmd /k "cd /d "%CD%" && call .venv\Scripts\activate.bat && title empyrean-server && python scripts\banner.py server && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
 goto :done
 
 :launch_wt
-echo Launching WSL Instance, Celery Worker, Beat, and Server in a single Windows Terminal with tabs...
-wt -d "%CD%" --title "WSL Instance" cmd /k "scripts\wsl-instance.bat" ; new-tab -d "%CD%" --title "Celery Worker" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-worker && python scripts\banner.py worker && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info" ; new-tab -d "%CD%" --title "Celery Beat" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-beat && python scripts\banner.py beat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info" ; new-tab -d "%CD%" --title "Empyrean Server" cmd /k "call .venv\Scripts\activate.bat && title empyrean-server && python scripts\banner.py server && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
+echo Launching WSL Instance, Tunnel, Celery Worker, Beat, and Server in a single Windows Terminal with tabs...
+wt -d "%CD%" --title "WSL Instance" cmd /k "scripts\wsl-instance.bat" ; new-tab -d "%CD%" --title "Cloudflare Tunnel" cmd /k "title empyrean-tunnel && python scripts\banner.py tunnel && cloudflared tunnel run empyrean" ; new-tab -d "%CD%" --title "Celery Worker" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-worker && python scripts\banner.py worker && .venv\Scripts\celery.exe -A celery_app.celery_app worker --pool=solo --loglevel=info" ; new-tab -d "%CD%" --title "Celery Beat" cmd /k "call .venv\Scripts\activate.bat && title empyrean-celery-beat && python scripts\banner.py beat && .venv\Scripts\celery.exe -A celery_app.celery_app beat --loglevel=info" ; new-tab -d "%CD%" --title "Empyrean Server" cmd /k "call .venv\Scripts\activate.bat && title empyrean-server && python scripts\banner.py server && .venv\Scripts\hypercorn.exe app:create_app() --bind 0.0.0.0:8000"
 
 :done
 
