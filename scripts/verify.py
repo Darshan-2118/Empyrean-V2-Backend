@@ -18,6 +18,8 @@ Exit codes:
     1  - one or more checks failed
 """
 
+import argparse
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -72,7 +74,10 @@ def check_migrations() -> bool:
         from sqlalchemy import text as sa_text
         from scripts.db_utils import make_engine
 
-        alembic_cfg = Config(PROJECT_ROOT / "alembic.ini")
+        alembic_cfg = Config(str(PROJECT_ROOT / "alembic.ini"))
+        # alembic.ini keeps script_location relative; pin it to the repo so the
+        # check works from any CWD.
+        alembic_cfg.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
         head = ScriptDirectory.from_config(alembic_cfg).get_current_head()
 
         engine = make_engine()
@@ -113,13 +118,23 @@ def check_health() -> bool:
 # ── 4. pytest ────────────────────────────────────────────────────────────────
 def check_tests() -> bool:
     header("4/4  Tests")
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=short"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    if importlib.util.find_spec("pytest") is None:
+        fail_msg(
+            "pytest is not installed — run `pip install -r requirements.txt` "
+            "inside the venv, or omit --full to skip the test suite"
+        )
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=short"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        fail_msg("pytest timed out after 900s")
+        return False
     for line in result.stdout.strip().split("\n"):
         if line.strip():
             print(f"    {line}")
@@ -139,7 +154,20 @@ def check_tests() -> bool:
 def main():
     # Run pytest only when explicitly requested via --full.
     # Default is a quick liveness check (infrastructure + app factory).
-    run_tests = "--full" in sys.argv
+    parser = argparse.ArgumentParser(
+        description="Run the Empyrean verification checks (PostgreSQL, "
+        "migrations, health check; optionally the pytest suite).",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="also run the pytest suite",
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="alias for the default (backwards compat)",
+    )
+    args = parser.parse_args()
+    run_tests = args.full
     results: list[tuple[str, bool | None]] = []
 
     results.append(("PostgreSQL", check_postgresql()))
@@ -174,4 +202,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted")
+        sys.exit(130)

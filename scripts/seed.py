@@ -33,6 +33,9 @@ sys.path.insert(0, _PROJECT_ROOT)
 from config import get_config
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+
+from pydantic import ValidationError
 
 from models import (
     Node,
@@ -231,6 +234,30 @@ if __name__ == "__main__":
 
     try:
         seed(force=args.force)
+    except KeyboardInterrupt:
+        print()
+        logger.error("Aborted.")
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except ValidationError as e:
+        # Missing/invalid .env — actionable message, not a pydantic traceback.
+        logger.error(
+            "Configuration error — copy .env.example to .env and set the "
+            "required values (see docs/configuration.md):"
+        )
+        for err in e.errors():
+            logger.error("  %s: %s", ".".join(str(loc) for loc in err["loc"]), err["msg"])
+        sys.exit(1)
+    except SQLAlchemyError as e:
+        # DB down / bad DATABASE_URL — report plainly instead of dumping the
+        # driver traceback.
+        logger.error("Database error: %s", e)
+        logger.error(
+            "Check that PostgreSQL is running and that DATABASE_URL in .env "
+            "points at it (then run `alembic upgrade head` on a fresh DB)."
+        )
+        sys.exit(1)
     except Exception as e:
         logger.exception("Seed failed: %s", e)
         sys.exit(1)

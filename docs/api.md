@@ -323,7 +323,7 @@ Revoke a refresh token. If a Bearer access token is also presented in the `Autho
 
 ### POST `/auth/forgot-password`
 
-Request a password-reset email. This endpoint is **deliberately opaque** against account enumeration: it returns `202 Accepted` with the same generic message whether or not the email belongs to a registered account, and only mints a token (and emails) when the account actually exists.
+Request a password-reset email. This endpoint is **deliberately opaque** against account enumeration: it returns `202 Accepted` with the same generic message whether or not the email belongs to a registered account, and only mints a token (and emails) when the account actually exists. Both paths are padded to the same minimum response duration so latency cannot leak which one ran.
 
 **Request body:**
 
@@ -366,7 +366,7 @@ Set a new password using a single-use reset token from the `forgot-password` ema
 }
 ```
 
-The raw token is SHA-256 hashed and matched against the stored digest. On success the password is bcrypt-hashed, **all** of the user's refresh tokens are revoked, the Redis user cache is invalidated, and the token is marked used (single-use). A successful reset invalidates every existing session — the user must log in again.
+The raw token is SHA-256 hashed and matched against the stored digest (the token row is locked during redemption, so a replayed token can never be redeemed twice even under concurrent requests). On success the password is bcrypt-hashed, **all** of the user's refresh tokens are revoked, the Redis user cache is invalidated, and the token is marked used (single-use). Existing sessions stop working once their (≤ 15 min) access tokens expire — the user must log in again.
 
 **Success response** `200 OK`:
 

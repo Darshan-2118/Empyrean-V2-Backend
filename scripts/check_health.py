@@ -31,14 +31,22 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from sqlalchemy import inspect, text as sa_text  # noqa: E402
-
-from config import get_config  # noqa: E402
-
 PASS = "[OK]"
 FAIL = "[FAIL]"
 SKIP = "[SKIP]"
 SEP = "-" * 60
+
+# A missing dependency is an expected failure for a fresh clone — report it
+# actionably instead of dumping an ImportError traceback.
+try:
+    from sqlalchemy import inspect, text as sa_text  # noqa: E402
+
+    from config import get_config  # noqa: E402
+except ImportError as e:
+    print(f"{FAIL}  Missing dependency: {e}")
+    print("Install the requirements first (e.g. `pip install -r requirements.txt` "
+          "inside the .venv).")
+    sys.exit(1)
 
 
 def check(description: str, ok: bool, detail: str = ""):
@@ -52,7 +60,18 @@ def check(description: str, ok: bool, detail: str = ""):
 
 
 def main() -> bool:
-    cfg = get_config()
+    # A missing/invalid .env must produce a friendly message, not a raw
+    # pydantic traceback before any section output is printed.
+    try:
+        cfg = get_config()
+    except Exception as e:
+        print(f"\n{FAIL}  Configuration error")
+        print(SEP)
+        print(f"  {e}")
+        print("  Fix: copy .env.example to .env in the project root and set the "
+              "required values (see docs/configuration.md).")
+        return False
+
     is_dev = cfg.APP_ENV == "development"
     all_ok = True
     total = 9
@@ -110,24 +129,30 @@ def main() -> bool:
     if not db_ok:
         print(f"  {SKIP}  Table checks skipped (database connection failed)")
     else:
-        inspector = inspect(engine)
-        existing_tables = set(inspector.get_table_names())
-
         expected_tables = {
             "users",
             "refresh_tokens",
+            "password_reset_tokens",
             "nodes",
             "sensor_readings",
             "hourly_agg",
             "alerts",
             "system_settings",
+            "audit_logs",
         }
-        missing_tables = expected_tables - existing_tables
+        try:
+            inspector = inspect(engine)
+            existing_tables = set(inspector.get_table_names())
 
-        if missing_tables:
-            all_ok &= check("All tables exist", False, f"missing: {', '.join(sorted(missing_tables))}")
-        else:
-            all_ok &= check("All tables exist", True, f"{len(expected_tables)} of {len(expected_tables)} present")
+            missing_tables = expected_tables - existing_tables
+
+            if missing_tables:
+                all_ok &= check("All tables exist", False, f"missing: {', '.join(sorted(missing_tables))}")
+            else:
+                all_ok &= check("All tables exist", True, f"{len(expected_tables)} of {len(expected_tables)} present")
+        except Exception as e:
+            all_ok &= check("All tables exist", False, f"could not inspect tables: {e}")
+            missing_tables = expected_tables  # degrade dependents to SKIP/FAIL, not crash
 
     # -- 4. Indexes exist -----------------------------------------------------
     print(f"\n[4/{total}] Indexes")
@@ -136,14 +161,17 @@ def main() -> bool:
         reason = "database connection failed" if not db_ok else "tables missing"
         print(f"  {SKIP}  Sensor reading index checks skipped ({reason})")
     else:
-        inspector = inspect(engine)
-        sensor_indexes = {idx["name"] for idx in inspector.get_indexes("sensor_readings")}
-        required_sensor_indexes = {"idx_readings_node_time", "idx_readings_time"}
-        missing_sensor_indexes = required_sensor_indexes - sensor_indexes
-        if missing_sensor_indexes:
-            all_ok &= check("Sensor reading indexes", False, f"missing: {', '.join(sorted(missing_sensor_indexes))}")
-        else:
-            all_ok &= check("Sensor reading indexes", True, "idx_readings_node_time, idx_readings_time")
+        try:
+            inspector = inspect(engine)
+            sensor_indexes = {idx["name"] for idx in inspector.get_indexes("sensor_readings")}
+            required_sensor_indexes = {"idx_readings_node_time", "idx_readings_time"}
+            missing_sensor_indexes = required_sensor_indexes - sensor_indexes
+            if missing_sensor_indexes:
+                all_ok &= check("Sensor reading indexes", False, f"missing: {', '.join(sorted(missing_sensor_indexes))}")
+            else:
+                all_ok &= check("Sensor reading indexes", True, "idx_readings_node_time, idx_readings_time")
+        except Exception as e:
+            all_ok &= check("Sensor reading indexes", False, f"could not inspect indexes: {e}")
 
     # -- 5. Alembic migration -------------------------------------------------
     print(f"\n[5/{total}] Alembic Migration")
@@ -157,6 +185,12 @@ def main() -> bool:
 
             alembic_cfg = AlembicConfig(
                 str(Path(__file__).resolve().parents[1] / "alembic.ini")
+            )
+            # alembic.ini keeps script_location relative; pin it to the repo so
+            # the check works from any CWD.
+            alembic_cfg.set_main_option(
+                "script_location",
+                str(Path(__file__).resolve().parents[1] / "migrations"),
             )
             head = ScriptDirectory.from_config(alembic_cfg).get_current_head()
 
@@ -194,19 +228,34 @@ def main() -> bool:
         print(f"  {SKIP}  Hypertable check skipped (database connection failed)")
     else:
         try:
+            # Distinguish "extension not installed" from "table not converted":
+            # querying timescaledb_information.* without the extension raises,
+            # which previously produced a misleading "run alembic upgrade head".
             with engine.connect() as conn:
-                hypertable = conn.execute(
-                    sa_text(
-                        "SELECT hypertable_name FROM timescaledb_information.hypertables "
-                        "WHERE hypertable_name = 'sensor_readings'"
-                    )
+                ext_installed = conn.execute(
+                    sa_text("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'")
                 ).scalar()
-            all_ok &= check(
-                "sensor_readings is a hypertable",
-                hypertable == "sensor_readings",
-                "sensor_readings" if hypertable == "sensor_readings"
-                else "not a hypertable (run `alembic upgrade head`)",
-            )
+            if not ext_installed:
+                all_ok &= check(
+                    "sensor_readings is a hypertable", False,
+                    "timescaledb extension is not installed in this database — "
+                    "install it (CREATE EXTENSION timescaledb), then run "
+                    "`alembic upgrade head`",
+                )
+            else:
+                with engine.connect() as conn:
+                    hypertable = conn.execute(
+                        sa_text(
+                            "SELECT hypertable_name FROM timescaledb_information.hypertables "
+                            "WHERE hypertable_name = 'sensor_readings'"
+                        )
+                    ).scalar()
+                all_ok &= check(
+                    "sensor_readings is a hypertable",
+                    hypertable == "sensor_readings",
+                    "sensor_readings" if hypertable == "sensor_readings"
+                    else "not a hypertable (run `alembic upgrade head`)",
+                )
         except Exception as e:
             all_ok &= check(
                 "sensor_readings is a hypertable", False,
@@ -246,36 +295,50 @@ def main() -> bool:
     elif not db_ok:
         print(f"  {SKIP}  Seed checks skipped (database connection failed)")
     else:
-        with engine.connect() as conn:
-            # Check admin user exists
-            admin_count = conn.execute(
-                sa_text("SELECT COUNT(*) FROM users WHERE username = 'admin' AND role = 'admin'")
-            ).scalar()
-            all_ok &= check(
-                "Admin user exists",
-                admin_count > 0,
-                f"found {admin_count} admin user(s)" if admin_count else "not found",
+        seed_tables = {"users", "nodes", "system_settings"}
+        missing_seed_tables = seed_tables & missing_tables
+        if missing_seed_tables:
+            print(
+                f"  {SKIP}  Seed checks skipped (missing tables: "
+                f"{', '.join(sorted(missing_seed_tables))})"
             )
-
-            # Check sample node exists
-            node_count = conn.execute(
-                sa_text("SELECT COUNT(*) FROM nodes WHERE node_id = 'ESP32-01'")
-            ).scalar()
-            all_ok &= check(
-                "Sample node exists",
-                node_count > 0,
-                f"found node ESP32-01" if node_count else "not found",
-            )
-
-            # Check default settings exist
-            setting_count = conn.execute(
-                sa_text("SELECT COUNT(*) FROM system_settings")
-            ).scalar()
-            all_ok &= check(
-                "Default settings seeded",
-                setting_count >= 3,
-                f"found {setting_count} setting(s)" if setting_count else "not found",
-            )
+        else:
+            try:
+                with engine.connect() as conn:
+                    # Check admin user exists
+                    admin_count = conn.execute(
+                        sa_text("SELECT COUNT(*) FROM users WHERE username = 'admin' AND role = 'admin'")
+                    ).scalar()
+                    # Check sample node exists
+                    node_count = conn.execute(
+                        sa_text("SELECT COUNT(*) FROM nodes WHERE node_id = 'ESP32-01'")
+                    ).scalar()
+                    # Check default settings exist
+                    setting_count = conn.execute(
+                        sa_text("SELECT COUNT(*) FROM system_settings")
+                    ).scalar()
+            except Exception as e:
+                all_ok &= check(
+                    "Seed data queries", False,
+                    f"could not query seed data: {e} (run `alembic upgrade head` "
+                    "and `python scripts/seed.py`)",
+                )
+            else:
+                all_ok &= check(
+                    "Admin user exists",
+                    admin_count > 0,
+                    f"found {admin_count} admin user(s)" if admin_count else "not found",
+                )
+                all_ok &= check(
+                    "Sample node exists",
+                    node_count > 0,
+                    f"found node ESP32-01" if node_count else "not found",
+                )
+                all_ok &= check(
+                    "Default settings seeded",
+                    setting_count >= 3,
+                    f"found {setting_count} setting(s)" if setting_count else "not found",
+                )
 
     if engine is not None:
         engine.dispose()
@@ -305,5 +368,9 @@ def main() -> bool:
 
 
 if __name__ == "__main__":
-    success = main()
+    try:
+        success = main()
+    except KeyboardInterrupt:
+        print("\nAborted")
+        sys.exit(130)
     sys.exit(0 if success else 1)

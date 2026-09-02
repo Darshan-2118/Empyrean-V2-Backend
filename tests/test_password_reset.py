@@ -275,6 +275,111 @@ def test_reset_password_success_and_token_one_time(monkeypatch):
     _run(scenario())
 
 
+def test_reset_password_concurrent_redeem_only_one_succeeds(monkeypatch):
+    """Regression (TOCTOU): two simultaneous redeems of one token — exactly one wins.
+
+    Without the FOR UPDATE lock on the token row both requests could read
+    ``used_at IS NULL`` before either commits and both would reset the password.
+    """
+
+    async def scenario():
+        app = create_app()
+        username = _unique("race")
+        await _create_user(username, password="original-pass")
+        captured: list[str] = []
+        monkeypatch.setattr("api.auth._send_password_reset_email", _capture_reset_url(captured))
+
+        async with app.test_client() as client:
+            await client.post(
+                f"{API}/auth/forgot-password", json={"email": f"{username}@example.com"}
+            )
+            raw = captured[-1].split("token=")[1]
+
+            first, second = await asyncio.gather(
+                client.post(
+                    f"{API}/auth/reset-password",
+                    json={"token": raw, "new_password": "winner-pass"},
+                ),
+                client.post(
+                    f"{API}/auth/reset-password",
+                    json={"token": raw, "new_password": "loser-pass"},
+                ),
+            )
+            assert sorted([first.status_code, second.status_code]) == [200, 401]
+
+        # The winner's password is the one that stuck.
+        async with app.test_client() as client:
+            win = await client.post(
+                f"{API}/auth/login", json={"username": username, "password": "winner-pass"}
+            )
+            lose = await client.post(
+                f"{API}/auth/login", json={"username": username, "password": "loser-pass"}
+            )
+            assert win.status_code == 201
+            assert lose.status_code == 401
+
+    _run(scenario())
+
+
+def test_reset_link_appends_to_base_with_query_string(monkeypatch):
+    """Regression: a PASSWORD_RESET_LINK_BASE carrying a query gets `&`, not `?`."""
+    import api.auth
+    from urllib.parse import parse_qs, urlsplit
+
+    real_cfg = api.auth.get_config()
+
+    class _Cfg:
+        def __getattr__(self, name):
+            return getattr(real_cfg, name)
+
+    cfg = _Cfg()
+    cfg.PASSWORD_RESET_LINK_BASE = "http://localhost:5173/reset-password?lang=en"
+    monkeypatch.setattr(api.auth, "get_config", lambda: cfg)
+
+    async def scenario():
+        app = create_app()
+        username = _unique("link")
+        await _create_user(username)
+        captured: list[str] = []
+        monkeypatch.setattr("api.auth._send_password_reset_email", _capture_reset_url(captured))
+
+        async with app.test_client() as client:
+            await client.post(
+                f"{API}/auth/forgot-password", json={"email": f"{username}@example.com"}
+            )
+
+        url = captured[-1]
+        assert url.count("?") == 1  # no second '?' from naive concatenation
+        parts = urlsplit(url)
+        assert parts.path == "/reset-password"
+        assert parse_qs(parts.query) == {"lang": ["en"], "token": [url.split("token=")[1]]}
+
+    _run(scenario())
+
+
+def test_forgot_password_pads_response_time(monkeypatch):
+    """Regression: the unknown-account path is held to the same minimum duration."""
+    import time as _time
+
+    async def scenario():
+        app = create_app()
+        async with app.test_client() as client:
+            started = _time.perf_counter()
+            resp = await client.post(
+                f"{API}/auth/forgot-password", json={"email": "nobody@example.com"}
+            )
+            elapsed = _time.perf_counter() - started
+            assert resp.status_code == 202
+            assert elapsed >= api_auth_floor() - 0.01
+
+    def api_auth_floor():
+        from api.auth import _FORGOT_PASSWORD_MIN_DURATION_S
+
+        return _FORGOT_PASSWORD_MIN_DURATION_S
+
+    _run(scenario())
+
+
 def test_reset_password_rejects_expired_token(monkeypatch):
     """A token past its expiry cannot be redeemed."""
 

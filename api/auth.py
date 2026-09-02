@@ -10,8 +10,10 @@ import asyncio
 import hashlib
 import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import bcrypt
 from quart import Blueprint, jsonify, request
@@ -477,18 +479,31 @@ def hash_password_reset_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode()).hexdigest()
 
 
+# Strong references to in-flight fire-and-forget email tasks. The event loop
+# only holds weak references to tasks, so a create_task() result that is never
+# stored can be garbage-collected mid-send — the email silently never goes out.
+_pending_email_tasks: set[asyncio.Task] = set()
+
+
 def _send_password_reset_email(email: str, reset_url: str) -> None:
     """Best-effort outbound reset email (fail-soft, off the event loop).
 
     Runs the shared SMTP helper in a worker thread so the blocking handshake
     can never stall the HTTP request. Any failure is swallowed inside
     ``api.emailer.send_emails`` — the endpoint still answers 202, and the
-    token simply expires unused.
+    token simply expires unused. The Task is kept in ``_pending_email_tasks``
+    until it completes so the GC cannot collect it mid-flight.
     """
     try:
-        asyncio.create_task(asyncio.to_thread(_email_reset, email, reset_url))
+        task = asyncio.create_task(asyncio.to_thread(_email_reset, email, reset_url))
+    except RuntimeError:  # no running event loop in this thread
+        logger.warning("No running event loop — skipping password-reset email send")
+        return
     except Exception:  # noqa: BLE001 — email must never break the request
         logger.warning("Could not schedule password-reset email send")
+        return
+    _pending_email_tasks.add(task)
+    task.add_done_callback(_pending_email_tasks.discard)
 
 
 def _email_reset(email: str, reset_url: str) -> None:
@@ -514,9 +529,23 @@ def _email_reset(email: str, reset_url: str) -> None:
 
 
 def _reset_link(raw_token: str) -> str:
-    """Build the frontend reset URL embedding the (single-use) token."""
+    """Build the frontend reset URL embedding the (single-use) token.
+
+    The naive ``f"{base}?token=..."`` form produced a malformed URL (a second
+    ``?``) when PASSWORD_RESET_LINK_BASE already carried a query string —
+    urlsplit picks the correct ``?`` vs ``&`` separator instead. The raw token
+    is ``secrets.token_urlsafe`` output, so it needs no percent-encoding.
+    """
     base = get_config().PASSWORD_RESET_LINK_BASE.rstrip("/")
-    return f"{base}?token={raw_token}"
+    sep = "&" if urlsplit(base).query else "?"
+    return f"{base}{sep}token={raw_token}"
+
+
+# Minimum wall-clock duration for forgot-password responses. The existing-
+# account path does extra DB writes (supersede + insert), so an unpadded
+# response is measurably slower and leaks account existence through latency
+# even though the body is identical. Both paths are held to this floor.
+_FORGOT_PASSWORD_MIN_DURATION_S = 0.05
 
 
 @auth_bp.route("/forgot-password", methods=["POST"])
@@ -531,6 +560,7 @@ async def forgot_password():
     unredeemed tokens for that user are invalidated) and the reset link is
     emailed. Email is best-effort and fail-soft.
     """
+    started = time.perf_counter()
     data = validated_body()
     cfg = get_config()
 
@@ -565,7 +595,11 @@ async def forgot_password():
 
             _send_password_reset_email(user.email, _reset_link(raw))
 
-    # Same response either way (no account enumeration).
+    # Same response either way (no account enumeration), and both paths are
+    # padded to the same minimum duration so latency cannot leak which ran.
+    remaining = _FORGOT_PASSWORD_MIN_DURATION_S - (time.perf_counter() - started)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
     return (
         jsonify(
             {
@@ -597,11 +631,15 @@ async def reset_password():
     now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as session:
+        # Lock the token row until commit: without FOR UPDATE two concurrent
+        # redeems could both read used_at IS NULL and both pass the one-time
+        # check (TOCTOU). The loser blocks here and then sees the committed
+        # used_at, falling through to the same generic 401.
         token = (
             await session.execute(
-                select(PasswordResetToken).where(
-                    PasswordResetToken.token_hash == token_hash
-                )
+                select(PasswordResetToken)
+                .where(PasswordResetToken.token_hash == token_hash)
+                .with_for_update()
             )
         ).scalar_one_or_none()
 
