@@ -64,9 +64,10 @@ def test_retention_cleanup_is_daily_cron_0323():
     assert sched["data-retention-cleanup"]["schedule"] == crontab(hour=3, minute=23)
 
 
-def test_beat_schedule_has_exactly_five_keys():
+def test_beat_schedule_has_exactly_six_keys():
     """Guard against accidental add/remove of entries (refresh-token-cleanup
-    was added by M79 without updating this guard)."""
+    was added by M79 without updating this guard; password-reset-token-cleanup
+    by the forgot-password flow)."""
     keys = list(celery_app.celery_app.conf.beat_schedule)
     assert keys == [
         "alert-threshold-check",
@@ -74,4 +75,5 @@ def test_beat_schedule_has_exactly_five_keys():
         "forecast-model-retraining",
         "data-retention-cleanup",
         "refresh-token-cleanup",
+        "password-reset-token-cleanup",
     ]

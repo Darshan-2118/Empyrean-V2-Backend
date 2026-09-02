@@ -2,7 +2,7 @@
 
 This document is the concise runtime reference for the database tables and Redis keys.
 
-Seven tables implemented via SQLAlchemy 2.0 + Alembic migrations:
+Eight tables implemented via SQLAlchemy 2.0 + Alembic migrations:
 
 ## `users` — who logs in
 | Column | Type | Notes |
@@ -31,6 +31,20 @@ Server-side storage enabling logout (set `revoked = True`) and refresh-token rot
 | `revoked` | `BOOLEAN` | TRUE on logout/rotation |
 
 Indexed on `(user_id)`, `(token_hash)`, and `(expires_at)` (migration `0007` — keeps the expiry sweep off a seq scan).
+
+## `password_reset_tokens` — forgot/reset-password flow
+Server-side storage for single-use password-reset tokens (migration `0008`). Only the SHA-256 digest is stored — the raw token appears once in the reset email and is never persisted.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER PK` | Auto-increment |
+| `user_id` | `INTEGER FK → users` | ON DELETE CASCADE |
+| `token_hash` | `VARCHAR(64)` | SHA-256 hex digest (never store raw) |
+| `expires_at` | `TIMESTAMPTZ` | Default `PASSWORD_RESET_TOKEN_EXPIRY_MINUTES` (60) from creation |
+| `used_at` | `TIMESTAMPTZ` | NULL = unredeemed / still active |
+| `created_at` | `TIMESTAMPTZ` | |
+
+Indexed on `(token_hash)` and `(expires_at)`. A user may have at most one **unredeemed** (active) token — requesting a new reset invalidates any prior unredeemed one (single active reset link per account). Used and/or expired rows are swept by the daily `password-reset-token-cleanup` Celery beat task (`tasks.aggregation.password_reset_token_cleanup`).
 
 ## `nodes` — sensor devices
 | Column | Type | Notes |
@@ -114,7 +128,7 @@ Default settings seeded: `aqi_warning_threshold=100`, `aqi_critical_threshold=15
 | `alerts:unacked` | 30s | Unacknowledged alerts (JSON array) — added in Phase 9; written by `GET /alerts`, invalidated by `PATCH /alerts/:alert_id/acknowledge` |
 | `celery:heartbeat:beat` | 3600s | ISO-8601 UTC timestamp of the last beat tick — written by `tasks.alerts.check_thresholds` (the 60s beat task, so this doubles as beat liveness); read by `GET /admin/health`, which reports `celery_beat` healthy while the stamp is ≤180s old (3× the schedule) |
 | `ratelimit:{endpoint}:{ip}:{minute}` | 60s | Request count (int) — per endpoint, per IP, per UTC minute (e.g. `ratelimit:auth.login:192.0.2.10:202608051530`); each endpoint has its own per-IP budget, so one endpoint cannot exhaust another's |
-| `cache:user:{user_id}` | 30s | Cached user row for JWT authentication (JSON) — read-through on every authenticated request; `password_hash` is **never** cached (H37); invalidated on password change / account deactivation |
+| `cache:user:{user_id}` | 30s | Cached user row for JWT authentication (JSON) — read-through on every authenticated request; `password_hash` is **never** cached (H37); invalidated on password change, **password reset**, or account deactivation |
 | `jwt:blocklist:{jti}` | remaining token lifetime | `1` — set when an access token is revoked (logout, password change, account deactivation); self-cleaning since the TTL matches the token's remaining validity |
 | `celery:forecast:{node_id}:{version}` | 3600s | AQI forecast array (JSON) — versioned by the model's `trained_at` (M50) so a retrain invalidates stale forecasts; read/written by the `/forecast` endpoint & `generate_forecast` |
 | `forecast:model:{node_id}` | 3600s | Trained linear model `{"slope", "intercept", "trained_at"}` (JSON) — written by `empyrean.tasks.forecast.retrain_model` |

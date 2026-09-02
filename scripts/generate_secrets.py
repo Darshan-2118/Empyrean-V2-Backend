@@ -45,8 +45,10 @@ def main():
     env_path = root_dir / ".env"
 
     if env_path.exists() and "--force" not in sys.argv:
-        print(".env is already present")
+        print(".env is already present — pass --force to overwrite it.")
         return
+    if env_path.exists():
+        print("WARNING: --force given — the existing .env will be overwritten.")
 
     secret_key = generate_secure_secret(48)
     jwt_secret = generate_secure_secret(48)

@@ -7,9 +7,13 @@ Every endpoint returns RFC 7807 ``application/problem+json`` on error.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import bcrypt
 from quart import Blueprint, jsonify, request
@@ -23,11 +27,20 @@ from api.jwt import (
     hash_refresh_token,
 )
 from api.rate_limit import rate_limit
-from api.schemas import AuthResponse, LoginRequest, RefreshRequest, RegisterRequest, UserBrief
+from api.schemas import (
+    AuthResponse,
+    ForgotPasswordRequest,
+    LoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+    ResetPasswordRequest,
+    UserBrief,
+)
 from api.validation import validate_body, validated_body
 from config import get_config
 from models.base import AsyncSessionLocal
 from models.helpers import hash_password
+from models.password_reset_token import PasswordResetToken
 from models.refresh_token import RefreshToken
 from models.user import User
 
@@ -445,3 +458,237 @@ async def logout():
 
     # Always return 204 — don't reveal whether the token existed
     return "", 204
+
+
+# ── Password reset (forgot-password flow) ─────────────────────────────────────
+
+
+def make_password_reset_token() -> tuple[str, str]:
+    """Return ``(raw_token, sha256_hash)`` — the raw token is emailed once.
+
+    Mirrors refresh-token storage: only the digest is persisted, so a DB leak
+    cannot be replayed to reset an account (see ``models.password_reset_token``).
+    """
+    raw = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    return raw, token_hash
+
+
+def hash_password_reset_token(raw_token: str) -> str:
+    """Hash a raw reset token for DB lookup."""
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+# Strong references to in-flight fire-and-forget email tasks. The event loop
+# only holds weak references to tasks, so a create_task() result that is never
+# stored can be garbage-collected mid-send — the email silently never goes out.
+_pending_email_tasks: set[asyncio.Task] = set()
+
+
+def _send_password_reset_email(email: str, reset_url: str) -> None:
+    """Best-effort outbound reset email (fail-soft, off the event loop).
+
+    Runs the shared SMTP helper in a worker thread so the blocking handshake
+    can never stall the HTTP request. Any failure is swallowed inside
+    ``api.emailer.send_emails`` — the endpoint still answers 202, and the
+    token simply expires unused. The Task is kept in ``_pending_email_tasks``
+    until it completes so the GC cannot collect it mid-flight.
+    """
+    try:
+        task = asyncio.create_task(asyncio.to_thread(_email_reset, email, reset_url))
+    except RuntimeError:  # no running event loop in this thread
+        logger.warning("No running event loop — skipping password-reset email send")
+        return
+    except Exception:  # noqa: BLE001 — email must never break the request
+        logger.warning("Could not schedule password-reset email send")
+        return
+    _pending_email_tasks.add(task)
+    task.add_done_callback(_pending_email_tasks.discard)
+
+
+def _email_reset(email: str, reset_url: str) -> None:
+    """Synchronous worker: send one password-reset email (fail-soft)."""
+    from api.emailer import send_emails
+
+    send_emails(
+        [
+            (
+                "[Empyrean] Reset your password",
+                (
+                    "We received a request to reset your Empyrean password.\n\n"
+                    f"Open the link below within the next {get_config().PASSWORD_RESET_TOKEN_EXPIRY_MINUTES} "
+                    "minutes to choose a new one:\n\n"
+                    f"{reset_url}\n\n"
+                    "If you did not request this, you can safely ignore this email — "
+                    "the link will expire on its own and your password is unchanged."
+                ),
+                email,
+            )
+        ]
+    )
+
+
+def _reset_link(raw_token: str) -> str:
+    """Build the frontend reset URL embedding the (single-use) token.
+
+    The naive ``f"{base}?token=..."`` form produced a malformed URL (a second
+    ``?``) when PASSWORD_RESET_LINK_BASE already carried a query string —
+    urlsplit picks the correct ``?`` vs ``&`` separator instead. The raw token
+    is ``secrets.token_urlsafe`` output, so it needs no percent-encoding.
+    """
+    base = get_config().PASSWORD_RESET_LINK_BASE.rstrip("/")
+    sep = "&" if urlsplit(base).query else "?"
+    return f"{base}{sep}token={raw_token}"
+
+
+# Minimum wall-clock duration for forgot-password responses. The existing-
+# account path does extra DB writes (supersede + insert), so an unpadded
+# response is measurably slower and leaks account existence through latency
+# even though the body is identical. Both paths are held to this floor.
+_FORGOT_PASSWORD_MIN_DURATION_S = 0.05
+
+
+@auth_bp.route("/forgot-password", methods=["POST"])
+@rate_limit(5, 60)  # brute-force / enumeration throttle (5/min per IP)
+@validate_body(ForgotPasswordRequest)
+async def forgot_password():
+    """Request a password-reset email for an account, without leaking its existence.
+
+    Always returns ``202 Accepted`` with a generic message — whether or not the
+    email has an account — so a caller can never learn which addresses are
+    registered. If an account exists, a one-time reset token is minted (old
+    unredeemed tokens for that user are invalidated) and the reset link is
+    emailed. Email is best-effort and fail-soft.
+    """
+    started = time.perf_counter()
+    data = validated_body()
+    cfg = get_config()
+
+    async with AsyncSessionLocal() as session:
+        user = (
+            await session.execute(select(User).where(User.email == data.email))
+        ).scalar_one_or_none()
+
+        if user is not None and user.is_active:
+            # Invalidate any previously-issued, unredeemed tokens so an older
+            # reset link cannot be used after a new request supersedes it.
+            await session.execute(
+                sa_update(PasswordResetToken)
+                .where(
+                    PasswordResetToken.user_id == user.id,
+                    PasswordResetToken.used_at.is_(None),
+                )
+                .values(used_at=datetime.now(timezone.utc))
+            )
+            raw, token_hash = make_password_reset_token()
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=cfg.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES
+            )
+            session.add(
+                PasswordResetToken(
+                    user_id=user.id,
+                    token_hash=token_hash,
+                    expires_at=expires_at,
+                )
+            )
+            await session.commit()
+
+            _send_password_reset_email(user.email, _reset_link(raw))
+
+    # Same response either way (no account enumeration), and both paths are
+    # padded to the same minimum duration so latency cannot leak which ran.
+    remaining = _FORGOT_PASSWORD_MIN_DURATION_S - (time.perf_counter() - started)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+    return (
+        jsonify(
+            {
+                "message": (
+                    "If an account exists for that email, a password reset link "
+                    "has been sent."
+                )
+            }
+        ),
+        202,
+    )
+
+
+@auth_bp.route("/reset-password", methods=["POST"])
+@rate_limit(10, 60)  # bruteforce throttle mirroring /login (10/min per IP)
+@validate_body(ResetPasswordRequest)
+async def reset_password():
+    """Redeem a one-time reset token and set a new password.
+
+    Requires the token emailed by ``forgot-password``. Enforces one-time use
+    and expiry; on success the password is bcrypt-hashed, **all** of the user's
+    refresh tokens are revoked (every session must re-authenticate), the user
+    cache is invalidated, and the reset token is marked used. Any invalid,
+    expired, or already-used token yields the same generic 401 so the endpoint
+    cannot be used to probe token validity.
+    """
+    data = validated_body()
+    token_hash = hash_password_reset_token(data.token)
+    now = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as session:
+        # Lock the token row until commit: without FOR UPDATE two concurrent
+        # redeems could both read used_at IS NULL and both pass the one-time
+        # check (TOCTOU). The loser blocks here and then sees the committed
+        # used_at, falling through to the same generic 401.
+        token = (
+            await session.execute(
+                select(PasswordResetToken)
+                .where(PasswordResetToken.token_hash == token_hash)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+
+        # Generic 401 for any invalid / expired / already-used token (never
+        # distinguish the three — L-26 class).
+        invalid = (
+            token is None
+            or token.used_at is not None
+            or token.expires_at <= now
+        )
+        if invalid:
+            return problem_json(
+                401, "Unauthorized", "Reset token is invalid or has expired"
+            )
+
+        user = (
+            await session.execute(
+                select(User).where(User.id == token.user_id)
+            )
+        ).scalar_one_or_none()
+        if user is None or not user.is_active:
+            return problem_json(
+                401, "Unauthorized", "Reset token is invalid or has expired"
+            )
+
+        user.password_hash = await asyncio.to_thread(hash_password, data.new_password)
+
+        # Revoke every outstanding refresh token — a reset is a credential
+        # change, so any live session must re-authenticate (mirrors
+        # change-password / delete-account).
+        result = await session.execute(
+            select(RefreshToken).where(
+                RefreshToken.user_id == user.id,
+                RefreshToken.revoked == False,  # noqa: E712
+            )
+        )
+        for rt in result.scalars().all():
+            rt.revoked = True
+
+        # One-time contract: mark the token used (also supersedes within this
+        # same request so a replayed token can never be redeemed twice).
+        token.used_at = now
+        await session.commit()
+
+        # Evict the cached user row so the new password hash is effective
+        # immediately (mirrors change-password's H37 invalidation).
+        from api.jwt import invalidate_user_cache
+
+        await invalidate_user_cache(user.id)
+
+    logger.info("Password reset for user %s via reset token", user.username)
+    return jsonify({"message": "Password reset successfully"}), 200

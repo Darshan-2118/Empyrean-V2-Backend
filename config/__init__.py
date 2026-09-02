@@ -146,6 +146,12 @@ class Config(BaseSettings):
     SMTP_FROM: str = ""
     SMTP_USE_TLS: bool = True
 
+    # Password reset (forgot-password flow). The expiry bounds how long a
+    # one-time reset token stays valid; the link base is the frontend URL the
+    # reset email points to (the backend has no HTML views of its own).
+    PASSWORD_RESET_TOKEN_EXPIRY_MINUTES: int = 60
+    PASSWORD_RESET_LINK_BASE: str = "http://localhost:5173/reset-password"
+
     # L9: fallback recipient for critical alert emails when no DB setting
     # exists (mirrors the other settings' config fallbacks in api/admin.py).
     ALERT_EMAIL: str = ""
@@ -254,6 +260,7 @@ class Config(BaseSettings):
     @field_validator(
         "JWT_ACCESS_TOKEN_EXPIRY_MINUTES",
         "JWT_REFRESH_TOKEN_EXPIRY_DAYS",
+        "PASSWORD_RESET_TOKEN_EXPIRY_MINUTES",
         "EXPORT_TIMEOUT_SECONDS",
         "MQTT_QUEUE_MAX",
     )

@@ -274,3 +274,28 @@ def refresh_token_cleanup() -> dict:
         n, _REFRESH_TOKEN_RETENTION_PER_USER, _REFRESH_TOKEN_GRACE_DAYS,
     )
     return {"deleted": n}
+
+
+@celery_app.task(name="empyrean.tasks.aggregation.password_reset_token_cleanup", **_TASK_AUTORETRY)
+def password_reset_token_cleanup() -> dict:
+    """Delete expired / used password-reset tokens to prevent database bloat.
+
+    Password-reset tokens are short-lived and single-use; they leave DB rows
+    whether redeemed (``used_at`` set) or abandoned (expired). The daily sweep
+    removes every row that is either used or past its ``expires_at`` — used and
+    expired tokens are never needed again, so unlike refresh tokens there is no
+    keep-last-N carve-out.
+
+    Returns ``{"deleted": n}`` where ``n`` is the number of rows removed.
+    """
+    with get_sync_db() as session:
+        result = session.execute(
+            text(
+                "DELETE FROM password_reset_tokens "
+                "WHERE used_at IS NOT NULL OR expires_at < now()"
+            )
+        )
+        n = result.rowcount
+
+    logger.info("Password-reset-token cleanup removed %s expired/used token(s)", n)
+    return {"deleted": n}

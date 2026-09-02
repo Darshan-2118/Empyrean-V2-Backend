@@ -132,6 +132,33 @@ class RefreshRequest(BaseModel):
     refresh_token: str = Field(..., min_length=1, max_length=256)
 
 
+class ForgotPasswordRequest(BaseModel):
+    """Body for POST /auth/forgot-password.
+
+    The email is lower-cased (mirroring register/update-profile) so the
+    look-up is deterministic regardless of how the client typed it.
+    """
+
+    email: EmailStr = Field(..., max_length=255)
+
+    @field_validator("email")
+    @classmethod
+    def _lower_email(cls, v: str) -> str:
+        return str(v).lower()
+
+
+class ResetPasswordRequest(BaseModel):
+    """Body for POST /auth/reset-password — the one-time reset token + new password."""
+
+    token: str = Field(..., min_length=8, max_length=512)
+    new_password: str = Field(..., min_length=6, max_length=MAX_PASSWORD_LEN)
+
+    @field_validator("new_password")
+    @classmethod
+    def _new_password_within_bcrypt_bytes(cls, v: str) -> str:
+        return _validate_password_bytes(v)
+
+
 class AuthResponse(BaseModel):
     access_token: str
     refresh_token: str
