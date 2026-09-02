@@ -17,9 +17,7 @@ fallback to config.
 from __future__ import annotations
 
 import logging
-import smtplib
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -210,64 +208,34 @@ def _send_alert_emails(
     """Send all critical-breach alert emails over ONE SMTP connection (M52).
 
     ``alerts`` is a list of ``(node_id, aqi, severity, message)`` tuples. The
-    old per-alert helper opened a fresh SMTP connection for each message —
-    10 connects/min worst case with a noisy fleet; now one connection per beat
-    run carries every message. Fail-soft (#11): any failure (unconfigured,
-    auth error, network) is logged and swallowed so a beat task can never fail
-    on email — the alert rows and MQTT/WS broadcasts are committed
-    independently. A single message that fails mid-session is skipped without
-    aborting the rest.
+    transport is delegated to the shared fail-soft ``api.emailer.send_emails``
+    so one connection carries every message. Fail-soft (#11): any failure
+    (unconfigured, auth error, network) is logged and swallowed so a beat task
+    can never fail on email — the alert rows and MQTT/WS broadcasts are
+    committed independently. A single message that fails mid-session is
+    skipped without aborting the rest.
     """
     if not recipient or not alerts:
         return
-    host, port, user, password, sender, use_tls = (
-        cfg.SMTP_HOST,
-        cfg.SMTP_PORT,
-        cfg.SMTP_USERNAME,
-        cfg.SMTP_PASSWORD,
-        cfg.SMTP_FROM or recipient,
-        cfg.SMTP_USE_TLS,
-    )
-    if not host:
-        logger.debug(
-            "SMTP_HOST not configured — skipping %d email alert(s)", len(alerts)
-        )
-        return
-    try:
-        with smtplib.SMTP(host, port, timeout=10) as smtp:
-            if use_tls:
-                smtp.starttls()
-            if user:
-                smtp.login(user, password)
-            sent = 0
-            for node_id, aqi, severity, message in alerts:
-                msg = EmailMessage()
-                msg["Subject"] = f"[Empyrean] {severity.title()} AQI alert — node {node_id}"
-                msg["From"] = sender
-                msg["To"] = recipient
-                msg.set_content(
+    sender = cfg.SMTP_FROM or recipient
+    from api.emailer import send_emails
+
+    send_emails(
+        [
+            (
+                f"[Empyrean] {severity.title()} AQI alert — node {node_id}",
+                (
                     f"AQI threshold breach on node {node_id}.\n\n"
                     f"Severity: {severity}\n"
                     f"AQI: {aqi:.0f}\n"
                     f"{message}\n\n"
                     f"Generated at {datetime.now(timezone.utc).isoformat()}"
-                )
-                try:
-                    smtp.send_message(msg)
-                    sent += 1
-                except Exception:
-                    logger.warning(
-                        "Failed to send alert email for node %s to %s — skipped",
-                        node_id, recipient,
-                    )
-        logger.info(
-            "Sent %d/%d alert email(s) to %s", sent, len(alerts), recipient
-        )
-    except Exception:
-        logger.warning(
-            "Failed to send alert email batch (%d message(s)) to %s — skipped",
-            len(alerts), recipient,
-        )
+                ),
+                recipient,
+            )
+            for node_id, aqi, severity, message in alerts
+        ]
+    )
 
 
 @celery_app.task(name="empyrean.tasks.alerts.check_thresholds", **_TASK_AUTORETRY)

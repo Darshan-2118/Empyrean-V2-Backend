@@ -60,6 +60,9 @@ class User(Base):
     refresh_tokens = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan",
     )
+    password_reset_tokens = relationship(
+        "PasswordResetToken", back_populates="user", cascade="all, delete-orphan",
+    )
     acknowledged_alerts = relationship(
         "Alert", back_populates="acknowledger",
         foreign_keys="Alert.acknowledged_by",

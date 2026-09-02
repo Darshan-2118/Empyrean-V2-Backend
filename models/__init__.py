@@ -18,6 +18,7 @@ from models.base import (
 # forward references lazily the first time models are used).
 from models.user import User
 from models.refresh_token import RefreshToken
+from models.password_reset_token import PasswordResetToken
 from models.node import Node
 from models.reading import SensorReading
 from models.aggregate import HourlyAgg
@@ -28,6 +29,7 @@ __all__ = [
     "Base",
     "User",
     "RefreshToken",
+    "PasswordResetToken",
     "Node",
     "SensorReading",
     "HourlyAgg",

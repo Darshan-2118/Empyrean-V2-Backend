@@ -350,6 +350,14 @@ celery_app.conf.update(
             "task": "empyrean.tasks.aggregation.refresh_token_cleanup",
             "schedule": crontab(hour=3, minute=41),
         },
+        # ── Daily at 03:47 ───────────────────────────────
+        # Sweep used/expired password-reset tokens so the short-lived,
+        # single-use rows donated by the forgot-password flow cannot bloat
+        # the table. Offset from the other two purges.
+        "password-reset-token-cleanup": {
+            "task": "empyrean.tasks.aggregation.password_reset_token_cleanup",
+            "schedule": crontab(hour=3, minute=47),
+        },
     },
 )
 

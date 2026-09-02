@@ -2,7 +2,7 @@
 
 Base URL: `/api/v1`
 
-REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/register`, `POST /auth/login`, and `POST /auth/refresh` are unauthenticated. All responses are JSON **except `GET /export`, which streams a CSV attachment, and `GET /metrics`, which returns Prometheus text exposition format (`text/plain`)**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
+REST endpoints are prefixed with `/api/v1/` (the `/health` liveness check sits at root). Authentication uses **JWT HS256 Bearer tokens** (`Authorization: Bearer <access_token>`); only `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/forgot-password`, and `POST /auth/reset-password` are unauthenticated (the latter two by design — a user who forgot their password has no token). All responses are JSON **except `GET /export`, which streams a CSV attachment, and `GET /metrics`, which returns Prometheus text exposition format (`text/plain`)**. Errors follow **RFC 7807 Problem JSON** (`Content-Type: application/problem+json`).
 
 ---
 
@@ -20,6 +20,8 @@ In the `Auth` column: `No` = public, `Yes` = valid JWT access token required, `A
 | `/auth/login` | POST | No | Returns `access_token`, `refresh_token`, `expires_in`, `role` |
 | `/auth/refresh` | POST | No | Exchanges a refresh token for a new access token |
 | `/auth/logout` | POST | No | Revokes a refresh token **and** the presented access token (jti blocklist) |
+| `/auth/forgot-password` | POST | No | Emails a single-use password-reset link (always `202`, no account-enumeration leak) |
+| `/auth/reset-password` | POST | No | Sets a new password with a single-use reset token |
 
 ### Sensor Readings
 
@@ -319,6 +321,65 @@ Revoke a refresh token. If a Bearer access token is also presented in the `Autho
 
 ---
 
+### POST `/auth/forgot-password`
+
+Request a password-reset email. This endpoint is **deliberately opaque** against account enumeration: it returns `202 Accepted` with the same generic message whether or not the email belongs to a registered account, and only mints a token (and emails) when the account actually exists.
+
+**Request body:**
+
+```json
+{
+  "email": "john@example.com"
+}
+```
+
+The email is lowercased before being looked up. When the account exists:
+
+1. Any **prior unredeemed** reset tokens for that user are invalidated (only one active reset link at a time).
+2. A **single-use** token is minted, SHA-256 hashed, and stored in `password_reset_tokens` (only the digest is persisted — never the raw token).
+3. The reset email is sent to `PASSWORD_RESET_LINK_BASE` (default `http://localhost:5173/reset-password`) with the raw token as a `token` query param, e.g. `http://localhost:5173/reset-password?token=<raw>`.
+
+Email delivery is **fail-soft** (SMTP is reused from the existing `SMTP_*` config and sent without blocking the request; a send failure raises no error to the caller) — the caller still receives `202`.
+
+**Success response** `202 Accepted` (identical for known and unknown accounts):
+
+```json
+{
+  "message": "If an account exists for that email, a password reset link has been sent."
+}
+```
+
+**Errors:** `422` (validation), `429` (rate limited).
+
+---
+
+### POST `/auth/reset-password`
+
+Set a new password using a single-use reset token from the `forgot-password` email.
+
+**Request body:**
+
+```json
+{
+  "token": "<raw_token_from_email>",
+  "new_password": "newpass456"
+}
+```
+
+The raw token is SHA-256 hashed and matched against the stored digest. On success the password is bcrypt-hashed, **all** of the user's refresh tokens are revoked, the Redis user cache is invalidated, and the token is marked used (single-use). A successful reset invalidates every existing session — the user must log in again.
+
+**Success response** `200 OK`:
+
+```json
+{
+  "message": "Password reset successfully"
+}
+```
+
+**Errors:** `400` (missing body), `401` (invalid, expired, or already-used token — all generic to avoid token-guessing feedback), `422` (validation), `429` (rate limited).
+
+---
+
 ### Auth Token Lifecycle
 
 | Token | Type | Lifetime | Storage |
@@ -349,6 +410,8 @@ All request-body fields are validated server-side through the Phase 12 `@validat
 | `email` | register, PATCH `/profile` | valid email address, ≤255 chars, stored lowercase. |
 | `password` | register, `change-password` | 6–72 **bytes** UTF-8 (bcrypt limit — multi-byte characters count by byte, not by character). |
 | `current_password` / `new_password` | `change-password` | both required; `new_password` must satisfy the password rule above. |
+| `new_password` | `reset-password` | must satisfy the password rule above. |
+| `token` | `reset-password` | 8–512 chars; only the SHA-256 digest is stored/compared. |
 | `refresh_token` | `refresh`, `logout` | required opaque token string. |
 | `notification_prefs` | PATCH `/profile` | free-form JSON object, stored and echoed back verbatim. |
 
@@ -640,6 +703,8 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 | `POST /auth/login` | **10** |
 | `POST /auth/refresh` | **10** |
 | `POST /auth/logout` | **10** |
+| `POST /auth/forgot-password` | **5** |
+| `POST /auth/reset-password` | **10** |
 | `POST /profile/change-password` | **10** |
 | `GET /readings/latest` | 200 |
 | `GET /readings/history` | 200 |
@@ -651,7 +716,7 @@ Redis-backed fixed-window rate limiting is applied **per endpoint**, so each end
 | `GET /alerts` | 200 |
 | `PATCH /alerts/:alert_id/acknowledge` | 200 |
 
-`GET`/`PATCH`/`DELETE /profile` and `/admin/*` are **not** rate-limited (privileged, low-volume calls). The credential and session endpoints — `register`, `login`, `refresh`, `logout`, `change-password` — carry tight caps (brute-force defence); the read/mutation endpoints above use the default 200/min.
+`GET`/`PATCH`/`DELETE /profile` and `/admin/*` are **not** rate-limited (privileged, low-volume calls). The credential and session endpoints — `register`, `login`, `refresh`, `logout`, `forgot-password`, `reset-password`, `change-password` — carry tight caps (brute-force defence); the read/mutation endpoints above use the default 200/min.
 
 > Auth caps are deliberately tight (brute-force defence) — a frontend that retries login more than 10×/min (or refresh on every tab focus) will be answered `429`.
 
