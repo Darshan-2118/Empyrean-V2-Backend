@@ -307,7 +307,7 @@ def main() -> bool:
                 with engine.connect() as conn:
                     # Check admin user exists
                     admin_count = conn.execute(
-                        sa_text("SELECT COUNT(*) FROM users WHERE username = 'admin' AND role = 'admin'")
+                        sa_text("SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = true")
                     ).scalar()
                     # Check sample node exists
                     node_count = conn.execute(
